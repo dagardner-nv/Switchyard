@@ -13,6 +13,7 @@ use crate::codecs::common::{
 use crate::codecs::openai_media::{
     ImagePayload, file_payload, file_source_text, image_payload, image_source_text,
 };
+use crate::codecs::responses::prepare_mcp_request;
 use crate::codecs::structured_output::{decode_openai_schema_enforcement, encode_openai_format};
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
@@ -190,9 +191,15 @@ impl FormatCodec for OpenAiChatCodec {
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
         let mut diagnostics = Vec::new();
+        let mcp_prepared =
+            prepare_mcp_request(request, WireFormat::OpenAiChat, &mut diagnostics, policy)?;
         // Chat Completions cannot represent MCP server definitions; apply the loss policy.
-        let prepared =
-            prepare_request_tools(request, WireFormat::OpenAiChat, &mut diagnostics, policy)?;
+        let prepared = prepare_request_tools(
+            mcp_prepared.as_ref(),
+            WireFormat::OpenAiChat,
+            &mut diagnostics,
+            policy,
+        )?;
         let request = prepared.as_ref();
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiChat, policy)

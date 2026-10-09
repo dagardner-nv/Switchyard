@@ -5,13 +5,13 @@
 
 use std::borrow::Cow;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::codecs::common::is_anthropic_request;
+use crate::codecs::common::{is_anthropic_request, is_mcp_block, only_fields};
 use crate::util::push_lossy;
 use crate::{
-    ContentBlock, LlmRequest, PRESERVATION_METADATA_KEY, PreservationMetadata, Result, ToolChoice,
-    TranslationDiagnostic, TranslationPolicy, WireFormat,
+    ContentBlock, LlmRequest, Message, PRESERVATION_METADATA_KEY, PreservationMetadata, Result,
+    Role, ToolChoice, TranslationDiagnostic, TranslationPolicy, WireFormat,
 };
 
 mod buffered;
@@ -20,7 +20,7 @@ mod stream;
 pub use buffered::AnthropicMessagesCodec;
 pub use stream::AnthropicMessagesStreamCodec;
 
-const ANTHROPIC_TOOLS_KEY: &str = "switchyard_anthropic_tools";
+pub(super) const ANTHROPIC_TOOLS_KEY: &str = "switchyard_anthropic_tools";
 
 pub(crate) fn prepare_request_tools<'a>(
     request: &'a LlmRequest,
@@ -77,7 +77,7 @@ pub(crate) fn prepare_request_tools<'a>(
             drop_provider_tool_content(&mut message.content);
             !message.content.is_empty()
         });
-        if request.tools.is_empty()
+        if (request.tools.is_empty() && super::responses::mcp_tools(&request).is_none())
             || matches!(&request.tool_choice, Some(ToolChoice::Tool { name })
                 if !request.tools.iter().any(|tool| &tool.name == name))
         {
@@ -133,4 +133,123 @@ fn drop_provider_tool_content(content: &mut Vec<ContentBlock>) {
         }
         !is_provider_tool_content(block)
     });
+}
+
+pub(super) fn responses_mcp_tool_to_anthropic(tool: &Value) -> Option<(Value, Value)> {
+    if !only_fields(
+        tool,
+        &[
+            "type",
+            "server_label",
+            "server_url",
+            "authorization",
+            "allowed_tools",
+            "require_approval",
+        ],
+    ) || tool["require_approval"] != "never"
+    {
+        return None;
+    }
+    let label = tool["server_label"].as_str()?;
+    let url = tool["server_url"].as_str()?;
+    if !url.starts_with("https://") {
+        return None;
+    }
+    let mut server = json!({"type": "url", "name": label, "url": url});
+    if let Some(token) = tool.get("authorization") {
+        server["authorization_token"] = token.clone();
+    }
+    let mut toolset = json!({"type": "mcp_toolset", "mcp_server_name": label});
+    if !tool["allowed_tools"].is_null() {
+        let allowed = tool["allowed_tools"].as_array()?;
+        let mut configs = serde_json::Map::new();
+        for name in allowed {
+            configs.insert(name.as_str()?.to_string(), json!({"enabled": true}));
+        }
+        toolset["default_config"] = json!({"enabled": false});
+        toolset["configs"] = Value::Object(configs);
+    }
+    Some((server, toolset))
+}
+
+pub(super) fn responses_mcp_history_to_anthropic(
+    messages: &[Message],
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<Vec<Message>> {
+    let mut translated = Vec::new();
+    for message in messages {
+        let mut message = message.clone();
+        let mut content = Vec::new();
+        for block in message.content {
+            if !is_mcp_block(&block, WireFormat::OpenAiResponses) {
+                content.push(block);
+                continue;
+            }
+            let ContentBlock::Unknown { raw, .. } = block else {
+                unreachable!()
+            };
+            let input = raw["arguments"]
+                .as_str()
+                .and_then(|args| serde_json::from_str::<Value>(args).ok());
+            let is_error = raw["error"]["type"] == "mcp_tool_execution_error";
+            let result_content = if is_error {
+                raw["error"]["content"].clone()
+            } else {
+                json!([{"type": "text", "text": raw["output"]}])
+            };
+            if raw["type"] != "mcp_call"
+                || !only_fields(
+                    &raw,
+                    &[
+                        "type",
+                        "id",
+                        "name",
+                        "server_label",
+                        "arguments",
+                        "output",
+                        "error",
+                        "status",
+                        "approval_request_id",
+                    ],
+                )
+                || (!raw["status"].is_null()
+                    && raw["status"] != if is_error { "failed" } else { "completed" })
+                || (!raw["error"].is_null() && !is_error)
+                || !raw["approval_request_id"].is_null()
+                || !input.as_ref().is_some_and(Value::is_object)
+                || (!is_error && !raw["output"].is_string())
+                || (is_error && !raw["output"].is_null())
+                || !(result_content.is_string()
+                    || result_content.as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .all(|block| block["type"] == "text" && block["text"].is_string())
+                    }))
+            {
+                push_lossy(
+                    diagnostics,
+                    policy,
+                    "Responses MCP listing, approval, or call data has no Anthropic equivalent; item dropped",
+                )?;
+                continue;
+            }
+            message.role = Role::Assistant;
+            content.push(ContentBlock::Unknown {provider: WireFormat::AnthropicMessages.into(), raw: json!({
+                "type": "mcp_tool_use", "id": raw["id"], "name": raw["name"], "server_name": raw["server_label"], "input": input.unwrap()
+            })});
+            content.push(ContentBlock::Unknown {
+                provider: WireFormat::AnthropicMessages.into(),
+                raw: json!({
+                    "type": "mcp_tool_result", "tool_use_id": raw["id"], "is_error": is_error,
+                    "content": result_content
+                }),
+            });
+        }
+        message.content = content;
+        if !message.content.is_empty() {
+            translated.push(message);
+        }
+    }
+    Ok(translated)
 }

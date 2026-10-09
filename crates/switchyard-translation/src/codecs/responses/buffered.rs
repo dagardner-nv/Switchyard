@@ -9,9 +9,9 @@ use serde_json::{Map, Value, json};
 
 use crate::codecs::anthropic::prepare_request_tools;
 use crate::codecs::common::{
-    collect_responses_reasoning_text, encrypted_reasoning_data, encrypted_reasoning_item_id,
-    is_anthropic_request, is_known_role_name, provider_extensions, reasoning_text_from_blocks,
-    text_from_blocks,
+    RESPONSES_MCP_TOOLS_KEY, collect_responses_reasoning_text, encrypted_reasoning_data,
+    encrypted_reasoning_item_id, is_anthropic_request, is_known_role_name, provider_extensions,
+    reasoning_text_from_blocks, text_from_blocks,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
 use crate::codecs::openai_media::{
@@ -155,6 +155,20 @@ impl FormatCodec for OpenAiResponsesCodec {
                 "stream",
             ],
         );
+        let mcp_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|tool| tool["type"] == "mcp")
+            .cloned()
+            .collect::<Vec<_>>();
+        if !mcp_tools.is_empty() {
+            request
+                .extensions
+                .fields
+                .insert(RESPONSES_MCP_TOOLS_KEY.to_string(), json!(mcp_tools));
+        }
         crate::codex_namespaces::attach_tool_namespaces(&mut request.extensions, tool_namespaces);
         crate::codex_custom_tools::attach_custom_tools(&mut request.extensions, custom_tools);
         crate::codex_custom_tools::attach_custom_call_outputs(
@@ -177,9 +191,14 @@ impl FormatCodec for OpenAiResponsesCodec {
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
         let mut diagnostics = Vec::new();
-        // Responses supports MCP; unmapped Anthropic MCP definitions follow the loss policy.
-        let prepared = prepare_request_tools(
+        let mcp_prepared = super::prepare_mcp_request(
             request,
+            WireFormat::OpenAiResponses,
+            &mut diagnostics,
+            policy,
+        )?;
+        let prepared = prepare_request_tools(
+            mcp_prepared.as_ref(),
             WireFormat::OpenAiResponses,
             &mut diagnostics,
             policy,
@@ -248,6 +267,13 @@ impl FormatCodec for OpenAiResponsesCodec {
                     crate::codex_custom_tools::custom_tools(&request.extensions),
                 ),
             );
+        }
+        if let Some(mcp_tools) = super::mcp_tools(request) {
+            let mut tools = mcp_tools.clone();
+            if let Some(Value::Array(functions)) = body.remove("tools") {
+                tools.extend(functions);
+            }
+            body.insert("tools".to_string(), json!(tools));
         }
         if let Some(choice) = &request.tool_choice
             && let Some(choice) = encode_responses_tool_choice(
@@ -520,7 +546,9 @@ fn decode_responses_input(
                             &format!("$.input[{index}].role"),
                         )?;
                         let content_value = item.get("content").unwrap_or(&Value::Null);
-                        if is_responses_builtin_tool_item(content_value) {
+                        if is_responses_builtin_tool_item(content_value)
+                            || super::is_mcp_item(content_value)
+                        {
                             return Err(TranslationError::InvalidValue {
                                 path: format!("$.input[{index}].content.type"),
                                 message:
@@ -529,7 +557,9 @@ fn decode_responses_input(
                             });
                         }
                         if let Some(content_index) = content_value.as_array().and_then(|blocks| {
-                            blocks.iter().position(is_responses_builtin_tool_item)
+                            blocks.iter().position(|block| {
+                                is_responses_builtin_tool_item(block) || super::is_mcp_item(block)
+                            })
                         }) {
                             return Err(TranslationError::InvalidValue {
                                 path: format!("$.input[{index}].content[{content_index}].type"),
@@ -1052,6 +1082,9 @@ fn decode_responses_tools(
                 }
                 out.push(child);
             }
+        } else if tool.get("type").and_then(Value::as_str) == Some("mcp") {
+            // Server definitions are retained separately from client functions.
+            continue;
         } else if tool.get("type").and_then(Value::as_str) == Some("custom") {
             // A freeform tool takes a raw string, not JSON arguments. The IR sees it as a
             // function with a single `input` argument; the verbatim definition is kept so a
@@ -1189,6 +1222,9 @@ fn decode_responses_tool_choice(value: &Value) -> Option<ToolChoice> {
         {
             Some(ToolChoice::Raw(value.clone()))
         }
+        Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("mcp") => {
+            Some(ToolChoice::Raw(value.clone()))
+        }
         Value::Object(_) => None,
         _ => Some(ToolChoice::Raw(value.clone())),
     }
@@ -1299,10 +1335,10 @@ fn encode_responses_input(
     for message in messages {
         // The decoder carries each valid top-level built-in tool item as one
         // provider-qualified block, so replay that block in place.
-        if message.role == Role::User
-            && let [ContentBlock::Unknown { provider, raw }] = message.content.as_slice()
+        if let [ContentBlock::Unknown { provider, raw }] = message.content.as_slice()
             && provider.as_str() == WireFormat::OpenAiResponses.as_str()
-            && is_responses_builtin_tool_item(raw)
+            && ((message.role == Role::User && is_responses_builtin_tool_item(raw))
+                || super::is_mcp_item(raw))
         {
             encoded.push(raw.clone());
             continue;

@@ -6,10 +6,11 @@
 use serde_json::{Map, Value, json};
 
 use crate::codecs::common::{
-    ANTHROPIC_REQUEST_KEY, is_anthropic_request, is_known_role_name, provider_extensions,
-    text_from_blocks,
+    ANTHROPIC_REQUEST_KEY, RESPONSES_MCP_TOOLS_KEY, is_anthropic_request, is_known_role_name,
+    provider_extensions, text_from_blocks,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
+use crate::codecs::responses::{mcp_tools, prepare_mcp_request};
 use crate::codecs::structured_output::decode_openai_schema_enforcement;
 use crate::codecs::{
     DecodedRequest, DecodedResponse, EncodedRequest, EncodedResponse, FormatCodec,
@@ -214,15 +215,19 @@ impl FormatCodec for AnthropicMessagesCodec {
         request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
+        let mut diagnostics = Vec::new();
+        let prepared = prepare_mcp_request(
+            request,
+            WireFormat::AnthropicMessages,
+            &mut diagnostics,
+            policy,
+        )?;
+        let request = prepared.as_ref();
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::AnthropicMessages, policy)
         {
-            return Ok(EncodedRequest {
-                body,
-                diagnostics: Vec::new(),
-            });
+            return Ok(EncodedRequest { body, diagnostics });
         }
-        let mut diagnostics = Vec::new();
         validate_request_capabilities(request, &mut diagnostics, policy)?;
         let allowed = crate::codecs::common::allowed_function_tools(request)?;
         let (tools, tool_choice) = allowed.as_ref().map_or(
@@ -296,6 +301,11 @@ impl FormatCodec for AnthropicMessagesCodec {
                     body.insert(field.to_string(), value.clone());
                 }
             }
+        }
+        if mcp_tools(request).is_some()
+            && let Some(servers) = request.extensions.fields.get("mcp_servers")
+        {
+            body.insert("mcp_servers".to_string(), servers.clone());
         }
         if let Some(stop_sequences) =
             anthropic_stop_sequences_from_extensions(&request.extensions.fields)
@@ -1223,7 +1233,8 @@ fn ensure_anthropic_tool_input_object(arguments: Value) -> Value {
 fn encode_anthropic_tools(tools: &[ToolDefinition], extensions: &ProviderExtensions) -> Vec<Value> {
     let mut remaining = tools.iter().collect::<Vec<_>>();
     let mut encoded = Vec::new();
-    if extensions.fields.get(ANTHROPIC_REQUEST_KEY) == Some(&Value::Bool(true))
+    if (extensions.fields.get(ANTHROPIC_REQUEST_KEY) == Some(&Value::Bool(true))
+        || extensions.fields.contains_key(RESPONSES_MCP_TOOLS_KEY))
         && let Some(original) = extensions
             .fields
             .get(ANTHROPIC_TOOLS_KEY)

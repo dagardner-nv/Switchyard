@@ -497,11 +497,13 @@ impl TranslatingLlmClient {
             };
             metrics::record_upstream_attempt(Some(status.as_u16()));
             let mut body = body.to_vec();
-            // Anthropic can return an error envelope under HTTP 200. Successful model
+            // Anthropic and Responses can return errors under HTTP 200. Successful model
             // output stays unchanged, including tool results and signed content.
             if may_contain_mcp_tokens(&body, &mcp_patterns)
                 && let Ok(mut value) = serde_json::from_slice::<Value>(&body)
-                && value.get("type").and_then(Value::as_str) == Some("error")
+                && (value.get("type").and_then(Value::as_str) == Some("error")
+                    || (backend.wire_format() == WireFormat::OpenAiResponses
+                        && value.get("status").and_then(Value::as_str) == Some("failed")))
             {
                 redact_mcp_json(&mut value, &mcp_patterns);
                 body = value.to_string().into_bytes();
@@ -867,6 +869,14 @@ fn mcp_token_patterns(body: &Value) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|server| server.get("authorization_token").and_then(Value::as_str))
+        .chain(
+            body.get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|tool| tool["type"] == "mcp")
+                .filter_map(|tool| tool.get("authorization").and_then(Value::as_str)),
+        )
         .filter(|token| !token.is_empty())
     {
         if let Ok(escaped) = serde_json::to_string(token) {
@@ -3518,10 +3528,15 @@ mod tests {
 
     #[test]
     fn mcp_redaction_handles_escaped_and_short_tokens() {
-        for token in ["x", "synthetic-mcp-\"\\-secret"] {
-            let patterns = mcp_token_patterns(&json!({"mcp_servers": [{
-                "authorization_token": token
-            }]}));
+        for (token, body) in [
+            ("x", json!({"mcp_servers": [{"authorization_token": "x"}]})),
+            (
+                "synthetic-mcp-\"\\-secret",
+                json!({"tools": [{"type": "mcp",
+                "authorization": "synthetic-mcp-\"\\-secret"}]}),
+            ),
+        ] {
+            let patterns = mcp_token_patterns(&body);
             assert!(!may_contain_mcp_tokens(b"ordinary error detail", &patterns));
             let echo = json!({"authorization_token": token}).to_string();
             let mut value = json!({"type": "error", "error": {"message": echo}});
@@ -3601,5 +3616,44 @@ mod tests {
         }]}));
         let event = redact_mcp_event(event, &patterns);
         assert_eq!(event.preservation().expect("preserved event").raw(), &raw);
+    }
+
+    #[tokio::test]
+    async fn responses_mcp_failed_envelopes_mask_credentials()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "response", "status": "failed",
+                "error": {"message": "authorization synthetic-responses-token was rejected"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let backend = Backend::OpenAiResponses(config(&server.uri()));
+        let model = ModelId::from("gpt");
+        let client =
+            TranslatingLlmClient::new(&[ModelConfig::new(model.clone(), backend.clone(), None)])?;
+        let response = client
+            .send_once(
+                &backend.url(),
+                &backend,
+                &json!({"tools": [{"type": "mcp", "authorization": "synthetic-responses-token"}]}),
+                None,
+                &model,
+                false,
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        let EncodedResponse::Buffered { body, .. } = response else {
+            return Err("expected buffered response".into());
+        };
+        let value: Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            value["error"]["message"],
+            "authorization [REDACTED] was rejected"
+        );
+        server.verify().await;
+        Ok(())
     }
 }

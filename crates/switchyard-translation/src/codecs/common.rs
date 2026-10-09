@@ -5,15 +5,34 @@
 
 use serde_json::{Map, Value};
 
+use crate::codecs::anthropic::ANTHROPIC_TOOLS_KEY;
+use crate::codecs::responses::is_mcp_item;
 use crate::error::{Result, TranslationError};
+use crate::format::WireFormat;
 use crate::llm::{ContentBlock, LlmRequest, ToolChoice, ToolDefinition};
 
 // Internal provenance survives mutations that invalidate exact request replay.
 pub(crate) const ANTHROPIC_REQUEST_KEY: &str = "switchyard_anthropic_request";
+pub(crate) const RESPONSES_MCP_TOOLS_KEY: &str = "switchyard_responses_mcp_tools";
 
 /// Returns true when the request was decoded from an Anthropic Messages body.
 pub(crate) fn is_anthropic_request(request: &LlmRequest) -> bool {
     request.extensions.fields.get(ANTHROPIC_REQUEST_KEY) == Some(&Value::Bool(true))
+}
+
+pub(crate) fn is_mcp_block(block: &ContentBlock, source: WireFormat) -> bool {
+    matches!(block, ContentBlock::Unknown {provider, raw}
+    if provider.as_str() == source.as_str() && if source == WireFormat::OpenAiResponses {
+        is_mcp_item(raw)
+    } else {
+        matches!(raw["type"].as_str(), Some("mcp_tool_use" | "mcp_tool_result"))
+    })
+}
+
+pub(crate) fn only_fields(value: &Value, fields: &[&str]) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.keys().all(|key| fields.contains(&key.as_str())))
 }
 
 /// Converts an OpenAI allowed-tools policy to a restricted function list and mode.
@@ -216,7 +235,11 @@ pub(crate) fn provider_extensions(
 ) -> Map<String, Value> {
     let mut extensions = Map::new();
     for (key, value) in object {
-        if key != ANTHROPIC_REQUEST_KEY && !known.contains(&key.as_str()) {
+        if !matches!(
+            key.as_str(),
+            ANTHROPIC_REQUEST_KEY | RESPONSES_MCP_TOOLS_KEY | ANTHROPIC_TOOLS_KEY
+        ) && !known.contains(&key.as_str())
+        {
             extensions.insert(key.clone(), value.clone());
         }
     }
