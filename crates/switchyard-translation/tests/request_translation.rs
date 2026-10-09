@@ -4742,75 +4742,69 @@ fn anthropic_provider_tools_follow_loss_policy_in_other_request_encoders() -> Te
         }}),
     );
 
+    let target = WireFormat::OpenAiChat;
     for request in [&definitions, &history_only, &preserved_only] {
-        for target in [WireFormat::OpenAiChat, WireFormat::OpenAiResponses] {
-            let mut request = request.clone();
-            // Cached target bodies must not bypass the loss policy.
-            request
-                .preservation
-                .requests
-                .insert(target.into(), json!({"model": "cached"}));
-            let error = engine
-                .encode_request(target, &request, &strict)
-                .expect_err("provider tools must be rejected");
-            assert!(matches!(error, TranslationError::LossyConversion(_)));
-            assert!(!error.to_string().contains("synthetic-token"));
+        let mut request = request.clone();
+        // Cached target bodies must not bypass the loss policy.
+        request
+            .preservation
+            .requests
+            .insert(target.into(), json!({"model": "cached"}));
+        let error = engine
+            .encode_request(target, &request, &strict)
+            .expect_err("provider tools must be rejected");
+        assert!(matches!(error, TranslationError::LossyConversion(_)));
+        assert!(!error.to_string().contains("synthetic-token"));
 
-            let output = engine.encode_request(target, &request, &policy)?;
-            assert_eq!(output.body["model"], "route");
-            assert_eq!(
-                output.body["tools"]
-                    .as_array()
-                    .ok_or("expected tools")?
-                    .len(),
-                1
-            );
-            assert!(output.body.get("tool_choice").is_none());
-            assert!(
-                output
-                    .diagnostics
-                    .iter()
-                    .any(|d| d.code == "lossy_conversion")
-            );
-            let serialized = output.body.to_string();
-            assert!(serialized.contains("local_lookup"));
-            assert!(serialized.contains("There are 12 widgets in stock."));
-            for dropped in [
-                "synthetic-token",
-                "mcp_servers",
-                "mcp_toolset",
-                "web_search",
-                "server_tool_use",
-                "mcp_tool_use",
-                "mcp_tool_result",
-            ] {
-                assert!(!serialized.contains(dropped));
-            }
-            if request.extensions.fields.contains_key("metadata") {
-                assert_eq!(output.body["metadata"]["purpose"], "retained");
-            }
-            let messages_key = if target == WireFormat::OpenAiChat {
-                "messages"
-            } else {
-                "input"
-            };
-            let messages = output.body[messages_key]
+        let output = engine.encode_request(target, &request, &policy)?;
+        assert_eq!(output.body["model"], "route");
+        assert_eq!(
+            output.body["tools"]
                 .as_array()
-                .ok_or("expected messages")?;
-            assert_eq!(messages.len(), 4);
-            assert_eq!(messages[2]["role"], "user");
-            assert_eq!(messages[3]["role"], "user");
-            assert!(
-                messages[2]
-                    .to_string()
-                    .contains("Can we fulfill an order for 10 widgets?")
-            );
-            assert!(
-                messages[3]
-                    .to_string()
-                    .contains("Please confirm the stock count.")
-            );
+                .ok_or("expected tools")?
+                .len(),
+            1
+        );
+        assert!(output.body.get("tool_choice").is_none());
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "lossy_conversion")
+        );
+        let serialized = output.body.to_string();
+        assert!(serialized.contains("local_lookup"));
+        assert!(serialized.contains("There are 12 widgets in stock."));
+        for dropped in [
+            "synthetic-token",
+            "mcp_servers",
+            "mcp_toolset",
+            "web_search",
+            "server_tool_use",
+            "mcp_tool_use",
+            "mcp_tool_result",
+        ] {
+            assert!(!serialized.contains(dropped));
         }
+        if request.extensions.fields.contains_key("metadata") {
+            assert_eq!(output.body["metadata"]["purpose"], "retained");
+        }
+        let messages = output.body["messages"]
+            .as_array()
+            .ok_or("expected messages")?;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[3]["role"], "user");
+        assert!(
+            messages[2]
+                .to_string()
+                .contains("Can we fulfill an order for 10 widgets?")
+        );
+        assert!(
+            messages[3]
+                .to_string()
+                .contains("Please confirm the stock count.")
+        );
     }
     Ok(())
 }
@@ -4881,4 +4875,117 @@ fn anthropic_client_supplied_tool_preservation_is_ignored() -> TestResult {
         assert!(replay.diagnostics.is_empty());
     }
     Ok(())
+}
+
+#[test]
+fn responses_and_anthropic_preserve_mcp_tools_and_results() {
+    let responses = json!({
+        "model": "route", "max_output_tokens": 128,
+        "tools": [{
+            "type": "mcp", "server_label": "inventory",
+            "server_url": "https://example.invalid/mcp",
+            "authorization": "synthetic-inventory-token",
+            "allowed_tools": ["lookup"], "require_approval": "never"
+        }, {
+            "type": "function", "name": "local_lookup",
+            "description": "Read local stock", "parameters": {"type": "object"}
+        }],
+        "input": [
+            {"role": "user", "content": "Look up widget stock."},
+            {"type": "mcp_call", "id": "mcp_inventory_1",
+             "server_label": "inventory", "name": "lookup",
+             "arguments": "{\"sku\":\"widget\"}", "output": "12 widgets in stock.",
+             "approval_request_id": null, "error": null, "status": "completed"},
+            {"role": "assistant", "content": "There are 12 widgets in stock."},
+            {"role": "user", "content": "Can we fulfill an order for 10 widgets?"}
+        ]
+    });
+    let anthropic = json!({
+        "model": "route", "max_tokens": 128,
+        "mcp_servers": [{
+            "type": "url", "name": "inventory", "url": "https://example.invalid/mcp",
+            "authorization_token": "synthetic-inventory-token"
+        }],
+        "tools": [{
+            "type": "mcp_toolset", "mcp_server_name": "inventory",
+            "default_config": {"enabled": false}, "configs": {"lookup": {"enabled": true}}
+        }, {
+            "name": "local_lookup", "description": "Read local stock",
+            "input_schema": {"type": "object"}
+        }],
+        "messages": [
+            {"role": "user", "content": "Look up widget stock."},
+            {"role": "assistant", "content": [
+                {"type": "mcp_tool_use", "id": "mcp_inventory_1",
+                 "name": "lookup", "server_name": "inventory", "input": {"sku": "widget"}},
+                {"type": "mcp_tool_result", "tool_use_id": "mcp_inventory_1",
+                 "is_error": false, "content": [{"type": "text", "text": "12 widgets in stock."}]},
+                {"type": "text", "text": "There are 12 widgets in stock."}
+            ]},
+            {"role": "user", "content": "Can we fulfill an order for 10 widgets?"}
+        ]
+    });
+    let mcp_fields = |format, body: &Value| {
+        let history = if format == WireFormat::AnthropicMessages {
+            body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|message| message["content"].as_array().into_iter().flatten())
+                .filter(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("mcp_tool_use" | "mcp_tool_result")
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            body["input"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["type"] == "mcp_call")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        json!({"mcp_servers": body["mcp_servers"], "tools": body["tools"], "history": history})
+    };
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        lossy_conversion_policy: LossyConversionPolicy::Reject,
+        ..normalized_policy()
+    };
+    // Run both directions before asserting, so a failure reports both conversions.
+    let actual = [
+        (
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+            &responses,
+        ),
+        (
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiResponses,
+            &anthropic,
+        ),
+    ]
+    .map(|(source, target, body)| {
+        engine
+            .translate_request(source, target, body, &policy)
+            .map(|output| (mcp_fields(target, &output.body), output.diagnostics))
+            .map_err(|error| error.to_string())
+    });
+    assert_eq!(
+        actual,
+        [
+            Ok((
+                mcp_fields(WireFormat::AnthropicMessages, &anthropic),
+                Vec::new()
+            )),
+            Ok((
+                mcp_fields(WireFormat::OpenAiResponses, &responses),
+                Vec::new()
+            ))
+        ]
+    );
 }
