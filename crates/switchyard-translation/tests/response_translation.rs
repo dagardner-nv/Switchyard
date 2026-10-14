@@ -18,6 +18,104 @@ use common::{
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
+fn anthropic_mcp_listings_round_trip_in_responses_and_history() -> TestResult {
+    use switchyard_translation::{
+        ContentBlock, LossyConversionPolicy, McpContent, StopReason, TranslationError,
+    };
+
+    let engine = TranslationEngine::default();
+    let format = WireFormat::AnthropicMessages;
+    let policy = TranslationPolicy {
+        lossy_conversion_policy: LossyConversionPolicy::Reject,
+        ..normalized_policy()
+    };
+    let content = json!([
+        {"type": "mcp_tool_listing", "mcp_server_name": "inventory", "tools": [
+            {"name": "lookup", "description": "Read stock", "input_schema": {
+                "type": "object", "properties": {"sku": {"type": "string"}}, "required": ["sku"]
+            }},
+            {"name": "search", "input_schema": {"type": "object"}}
+        ]},
+        {"type": "mcp_tool_listing", "mcp_server_name": "empty", "tools": []},
+        {"type": "text", "text": "Tools discovered."}
+    ]);
+    let body = json!({
+        "id": "msg_listing", "type": "message", "role": "assistant", "model": "claude-test",
+        "content": content, "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let mut response = engine.decode_response(format, &body, &policy)?.response;
+    assert!(matches!(
+        &response.outputs[0].content[0],
+        ContentBlock::Mcp(McpContent::Listing { server_name, id: None, tools, error: None })
+            if server_name == "inventory" && tools.len() == 2 && tools[0].name == "lookup"
+    ));
+    assert_eq!(response.outputs[0].stop_reason, Some(StopReason::EndTurn));
+    let output = engine.encode_response(format, &response, &policy)?;
+    assert!(output.diagnostics.is_empty());
+    assert_eq!(output.body["content"], content);
+
+    let request_body = json!({
+        "model": "claude-test", "max_tokens": 128,
+        "messages": [{"role": "assistant", "content": content}, {"role": "user", "content": "Look up stock"}]
+    });
+    let mut request = engine
+        .decode_request(format, &request_body, &policy)?
+        .request;
+    assert_eq!(request.messages[0].content, response.outputs[0].content);
+    let output = engine.encode_request(format, &request, &policy)?;
+    assert!(output.diagnostics.is_empty());
+    assert_eq!(output.body["messages"][0]["content"], content);
+
+    let ContentBlock::Mcp(McpContent::Listing {
+        server_name, tools, ..
+    }) = &mut response.outputs[0].content[0]
+    else {
+        return Err("expected MCP listing".into());
+    };
+    *server_name = "renamed".into();
+    tools.remove(0);
+    request.messages[0].content = response.outputs[0].content.clone();
+    let expected = json!({"type": "mcp_tool_listing", "mcp_server_name": "renamed", "tools": [
+        {"name": "search", "input_schema": {"type": "object"}}
+    ]});
+    assert_eq!(
+        engine.encode_response(format, &response, &policy)?.body["content"][0],
+        expected
+    );
+    assert_eq!(
+        engine.encode_request(format, &request, &policy)?.body["messages"][0]["content"][0],
+        expected
+    );
+
+    // Provider-specific listing data must not disappear during encoding.
+    for field in ["id", "error", "annotations"] {
+        let mut response = response.clone();
+        let ContentBlock::Mcp(McpContent::Listing {
+            id, error, tools, ..
+        }) = &mut response.outputs[0].content[0]
+        else {
+            return Err("expected MCP listing".into());
+        };
+        match field {
+            "id" => *id = Some("listing_1".into()),
+            "error" => *error = Some("Server unavailable".into()),
+            _ => tools[0].annotations = Some(json!({"readOnlyHint": true})),
+        }
+        request.messages[0].content = response.outputs[0].content.clone();
+        assert!(matches!(
+            engine.encode_response(format, &response, &policy),
+            Err(TranslationError::LossyConversion(_))
+        ));
+        assert!(matches!(
+            engine.encode_request(format, &request, &policy),
+            Err(TranslationError::LossyConversion(_))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
 fn responses_native_output_is_preserved_or_rejected() -> TestResult {
     use switchyard_translation::{StreamTranslationState, TranslationError};
     let engine = TranslationEngine::default();
@@ -288,6 +386,7 @@ fn anthropic_message_response_translates_to_openai_chat_completion() -> TestResu
     );
     let mut mcp_body = body;
     mcp_body["content"] = json!([
+        {"type": "mcp_tool_listing", "mcp_server_name": "inventory", "tools": []},
         {"type": "mcp_tool_use", "id": "mcp_1", "server_name": "inventory", "name": "lookup", "input": {}},
         {"type": "mcp_tool_result", "tool_use_id": "mcp_1", "content": [{"type": "text", "text": "in stock"}]},
         {"type": "text", "text": "Hi there"}

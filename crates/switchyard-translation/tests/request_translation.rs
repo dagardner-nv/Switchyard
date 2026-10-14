@@ -4584,6 +4584,82 @@ fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
 }
 
 #[test]
+fn anthropic_mcp_loading_settings_follow_ir_edits() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::AnthropicMessages;
+    let policy = TranslationPolicy {
+        lossy_conversion_policy: LossyConversionPolicy::Reject,
+        ..normalized_policy()
+    };
+    for default in [None, Some(false), Some(true)] {
+        let mut body = json!({
+            "model": "claude-test", "max_tokens": 128,
+            "mcp_servers": [{"type": "url", "name": "inventory", "url": "https://example.invalid/mcp"}],
+            "tools": [{"type": "mcp_toolset", "mcp_server_name": "inventory"}],
+            "messages": [{"role": "user", "content": "Check stock"}]
+        });
+        if let Some(default) = default {
+            body["tools"][0]["default_config"] = json!({"defer_loading": default});
+            body["tools"][0]["configs"] = json!({
+                "lookup": {"enabled": true, "defer_loading": false},
+                "search": {"defer_loading": true},
+                "inherited": {"enabled": false}
+            });
+        }
+        let mut request = engine.decode_request(format, &body, &policy)?.request;
+        let Tool::Mcp(mcp) = &request.tools[0] else {
+            return Err("expected MCP toolset".into());
+        };
+        assert_eq!(mcp.defer_loading, default);
+        assert_eq!(
+            mcp.tool_defer_loading.get("lookup"),
+            default.map(|_| &false)
+        );
+        assert_eq!(mcp.tool_defer_loading.get("search"), default.map(|_| &true));
+        assert!(!mcp.tool_defer_loading.contains_key("inherited"));
+        let output = engine.encode_request(format, &request, &policy)?;
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(output.body["tools"], body["tools"]);
+
+        let Tool::Mcp(mcp) = &mut request.tools[0] else {
+            return Err("expected MCP toolset".into());
+        };
+        mcp.defer_loading = Some(true);
+        mcp.tool_defer_loading.clear();
+        mcp.tool_defer_loading.insert("lookup".into(), true);
+        mcp.tool_defer_loading.insert("new_tool".into(), false);
+        let output = engine.encode_request(format, &request, &policy)?.body;
+        assert_eq!(output["tools"][0]["default_config"]["defer_loading"], true);
+        assert_eq!(
+            output["tools"][0]["configs"]["lookup"]["defer_loading"],
+            true
+        );
+        assert_eq!(
+            output["tools"][0]["configs"]["new_tool"]["defer_loading"],
+            false
+        );
+        assert!(
+            output["tools"][0]["configs"]["search"]
+                .get("defer_loading")
+                .is_none()
+        );
+        if default.is_some() {
+            assert_eq!(output["tools"][0]["configs"]["lookup"]["enabled"], true);
+            assert_eq!(output["tools"][0]["configs"]["inherited"]["enabled"], false);
+        }
+
+        let Tool::Mcp(mcp) = &mut request.tools[0] else {
+            return Err("expected MCP toolset".into());
+        };
+        mcp.defer_loading = None;
+        mcp.tool_defer_loading.clear();
+        let output = engine.encode_request(format, &request, &policy)?.body;
+        assert!(!output["tools"].to_string().contains("defer_loading"));
+    }
+    Ok(())
+}
+
+#[test]
 fn anthropic_reconstruction_preserves_mcp_connections_provider_tools_and_results() -> TestResult {
     let mut body = json!({
         "model": "claude-test",

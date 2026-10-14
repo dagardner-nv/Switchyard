@@ -715,6 +715,23 @@ fn decode_anthropic_content_block(
                 .map(ToOwned::to_owned),
             details: Vec::new(),
         }],
+        Some("mcp_tool_listing") => vec![ContentBlock::Mcp(McpContent::Listing {
+            server_name: block
+                .get("mcp_server_name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| TranslationError::InvalidValue {
+                    path: "mcp_tool_listing.mcp_server_name".into(),
+                    message: "expected a server name".into(),
+                })?
+                .to_owned(),
+            id: None,
+            tools: serde_json::from_value(block.get("tools").cloned().unwrap_or(Value::Null))
+                .map_err(|_| TranslationError::InvalidValue {
+                    path: "mcp_tool_listing.tools".into(),
+                    message: "expected MCP tool definitions".into(),
+                })?,
+            error: None,
+        })],
         Some("mcp_tool_use") => vec![ContentBlock::Mcp(McpContent::Call {
             server_name: block
                 .get("server_name")
@@ -1074,10 +1091,24 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
             "signature": signature,
         })],
         ContentBlock::Reasoning { .. } => Vec::new(),
-        ContentBlock::Mcp(McpContent::Listing { .. }) => {
-            return Err(TranslationError::Other(
-                "Anthropic MCP listing encoding is not implemented".into(),
-            ));
+        ContentBlock::Mcp(McpContent::Listing {
+            server_name,
+            id,
+            tools,
+            error,
+        }) => {
+            if id.is_some()
+                || error.is_some()
+                || tools.iter().any(|tool| tool.annotations.is_some())
+            {
+                return Err(TranslationError::LossyConversion(
+                    "Anthropic MCP listings cannot represent IDs, errors, or tool annotations"
+                        .into(),
+                ));
+            }
+            vec![json!({
+                "type": "mcp_tool_listing", "mcp_server_name": server_name, "tools": tools,
+            })]
         }
         ContentBlock::Mcp(McpContent::Call { server_name, call }) => vec![json!({
             "type": "mcp_tool_use", "id": call.id, "name": call.name,
@@ -1497,8 +1528,21 @@ fn decode_mcp(server: &Value, toolset: Option<&Value>) -> Result<McpToolset> {
                     .map(|enabled| (name.clone(), enabled))
             })
             .collect(),
-        defer_loading: None,
-        tool_defer_loading: Default::default(),
+        defer_loading: toolset
+            .and_then(|tool| tool.pointer("/default_config/defer_loading"))
+            .and_then(Value::as_bool),
+        tool_defer_loading: toolset
+            .and_then(|tool| tool.get("configs"))
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, config)| {
+                config
+                    .get("defer_loading")
+                    .and_then(Value::as_bool)
+                    .map(|defer_loading| (name.clone(), defer_loading))
+            })
+            .collect(),
         // Anthropic's MCP connector executes calls without an approval exchange.
         require_approval: Some(false),
     })
@@ -1570,7 +1614,10 @@ fn encode_tools(
                 );
                 if let Some(mut toolset) = layout.toolset {
                     toolset["mcp_server_name"] = json!(mcp.name);
-                    if mcp.enabled.is_some() || toolset.get("default_config").is_some() {
+                    if mcp.enabled.is_some()
+                        || mcp.defer_loading.is_some()
+                        || toolset.get("default_config").is_some()
+                    {
                         let config = toolset.as_object_mut().and_then(|tool| {
                             tool.entry("default_config")
                                 .or_insert_with(|| json!({}))
@@ -1578,9 +1625,17 @@ fn encode_tools(
                         });
                         if let Some(config) = config {
                             set_optional(config, "enabled", mcp.enabled.map(|v| json!(v)));
+                            set_optional(
+                                config,
+                                "defer_loading",
+                                mcp.defer_loading.map(|v| json!(v)),
+                            );
                         }
                     }
-                    if !mcp.tool_enabled.is_empty() || toolset.get("configs").is_some() {
+                    if !mcp.tool_enabled.is_empty()
+                        || !mcp.tool_defer_loading.is_empty()
+                        || toolset.get("configs").is_some()
+                    {
                         let configs = toolset.as_object_mut().and_then(|tool| {
                             tool.entry("configs")
                                 .or_insert_with(|| json!({}))
@@ -1589,10 +1644,15 @@ fn encode_tools(
                         if let Some(configs) = configs {
                             for config in configs.values_mut().filter_map(Value::as_object_mut) {
                                 config.remove("enabled");
+                                config.remove("defer_loading");
                             }
                             for (name, enabled) in &mcp.tool_enabled {
                                 configs.entry(name).or_insert_with(|| json!({}))["enabled"] =
                                     json!(enabled);
+                            }
+                            for (name, defer_loading) in &mcp.tool_defer_loading {
+                                configs.entry(name).or_insert_with(|| json!({}))["defer_loading"] =
+                                    json!(defer_loading);
                             }
                         }
                     }
