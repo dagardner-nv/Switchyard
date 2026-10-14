@@ -26,7 +26,7 @@ use crate::format::{FormatId, WireFormat};
 use crate::llm::{
     AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
     MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
-    SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    SamplingParams, StopReason, Tool, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -114,7 +114,10 @@ impl FormatCodec for OpenAiResponsesCodec {
         let mut tool_namespaces = Map::new();
         let mut custom_tools = Map::new();
         request.tools =
-            decode_responses_tools(body.get("tools"), &mut tool_namespaces, &mut custom_tools);
+            decode_responses_tools(body.get("tools"), &mut tool_namespaces, &mut custom_tools)
+                .into_iter()
+                .map(Tool::from)
+                .collect();
         // Responses-lite clients (Codex with a GPT-5 model) carry the tool definitions inside
         // `input` as an `additional_tools` developer item instead of top-level `tools`. Those
         // definitions are the request's tools; the item itself is kept verbatim so the request
@@ -126,11 +129,15 @@ impl FormatCodec for OpenAiResponsesCodec {
                     && item.get("type").and_then(Value::as_str) == Some("additional_tools")
                     && let Some(tools) = item.get("tools").and_then(Value::as_array)
                 {
-                    request.tools.extend(decode_responses_tools(
-                        Some(&Value::Array(tools.clone())),
-                        &mut tool_namespaces,
-                        &mut custom_tools,
-                    ));
+                    request.tools.extend(
+                        decode_responses_tools(
+                            Some(&Value::Array(tools.clone())),
+                            &mut tool_namespaces,
+                            &mut custom_tools,
+                        )
+                        .into_iter()
+                        .map(Tool::from),
+                    );
                     additional_tools.extend(tools.iter().cloned());
                 }
             }
@@ -175,15 +182,21 @@ impl FormatCodec for OpenAiResponsesCodec {
         request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
+        let mut diagnostics = Vec::new();
+        // Responses supports MCP, but this codec does not yet encode typed MCP tools or history.
+        let prepared = crate::codecs::common::prepare_request_tools(
+            request,
+            WireFormat::OpenAiResponses,
+            &mut diagnostics,
+            policy,
+        )?;
+        let request = prepared.as_ref();
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiResponses, policy)
         {
-            return Ok(EncodedRequest {
-                body,
-                diagnostics: Vec::new(),
-            });
+            return Ok(EncodedRequest { body, diagnostics });
         }
-        let mut diagnostics = Vec::new();
+
         validate_request_capabilities(request, &mut diagnostics, policy)?;
         let mut body = Map::new();
         if let Some(model) = &request.model {
@@ -416,15 +429,20 @@ impl FormatCodec for OpenAiResponsesCodec {
     fn encode_response(
         &self,
         response: &AggLlmResponse,
-        _policy: &TranslationPolicy,
+        policy: &TranslationPolicy,
     ) -> Result<EncodedResponse> {
+        let mut diagnostics = Vec::new();
+        let prepared = crate::codecs::common::prepare_response_tools(
+            response,
+            WireFormat::OpenAiResponses,
+            &mut diagnostics,
+            policy,
+        )?;
+        let response = prepared.as_ref();
         if let Some(body) =
-            exact_preserved_response(&response.preservation, WireFormat::OpenAiResponses, _policy)
+            exact_preserved_response(&response.preservation, WireFormat::OpenAiResponses, policy)
         {
-            return Ok(EncodedResponse {
-                body,
-                diagnostics: Vec::new(),
-            });
+            return Ok(EncodedResponse { body, diagnostics });
         }
         let is_truncated = matches!(
             response
@@ -454,9 +472,9 @@ impl FormatCodec for OpenAiResponsesCodec {
                     "tools": [],
                 }),
                 &response.preservation,
-                _policy,
+                policy,
             ),
-            diagnostics: Vec::new(),
+            diagnostics,
         })
     }
 }
@@ -1631,6 +1649,13 @@ fn encode_responses_content(
                     blocks.push(json!({"type": "input_text", "text": file_source_text(source)}));
                 }
             },
+            ContentBlock::Mcp(_) => {
+                push_lossy(
+                    diagnostics,
+                    policy,
+                    "MCP history has no mapping in this codec",
+                )?;
+            }
             ContentBlock::Unknown { raw, .. } => {
                 push_lossy(
                     diagnostics,
@@ -1694,13 +1719,22 @@ fn responses_file_part(source: &FileSource) -> Option<Value> {
 // A Responses client understands Codex containers, so a tool whose name this
 // request qualified is regrouped under the container it came from.
 fn encode_responses_tools(
-    tools: &[ToolDefinition],
+    tools: &[Tool],
     namespaces: Option<&Map<String, Value>>,
     custom_tools: Option<&Map<String, Value>>,
 ) -> Value {
     let mut out: Vec<Value> = Vec::new();
     let mut containers: Vec<(String, Vec<Value>)> = Vec::new();
-    for tool in tools {
+    for entry in tools {
+        if let Tool::Provider { provider, raw } = entry
+            && provider.as_str() == WireFormat::OpenAiResponses.as_str()
+        {
+            out.push(raw.clone());
+            continue;
+        }
+        let Some(tool) = entry.function() else {
+            continue;
+        };
         // A freeform tool goes back out exactly as the client defined it.
         if let Some(custom) = custom_tools.and_then(|custom| custom.get(&tool.name)) {
             out.push(custom.clone());

@@ -22,7 +22,7 @@ use crate::format::{FormatId, WireFormat};
 use crate::llm::{
     AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
     MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
-    SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    SamplingParams, StopReason, Tool, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -158,7 +158,10 @@ impl FormatCodec for OpenAiChatCodec {
             }
         }
 
-        request.tools = decode_openai_tools(body.get("tools"), &mut diagnostics, policy)?;
+        request.tools = decode_openai_tools(body.get("tools"), &mut diagnostics, policy)?
+            .into_iter()
+            .map(Tool::from)
+            .collect();
         request.tool_choice = body.get("tool_choice").map(decode_openai_tool_choice);
         request.extensions.fields = provider_extensions(
             body,
@@ -188,15 +191,21 @@ impl FormatCodec for OpenAiChatCodec {
         request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
+        let mut diagnostics = Vec::new();
+        // MCP tools have no representation in Chat Completions.
+        let prepared = crate::codecs::common::prepare_request_tools(
+            request,
+            WireFormat::OpenAiChat,
+            &mut diagnostics,
+            policy,
+        )?;
+        let request = prepared.as_ref();
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiChat, policy)
         {
-            return Ok(EncodedRequest {
-                body,
-                diagnostics: Vec::new(),
-            });
+            return Ok(EncodedRequest { body, diagnostics });
         }
-        let mut diagnostics = Vec::new();
+
         validate_request_capabilities(request, &mut diagnostics, policy)?;
         let allowed = match &request.tool_choice {
             Some(ToolChoice::Raw(choice))
@@ -353,16 +362,21 @@ impl FormatCodec for OpenAiChatCodec {
     fn encode_response(
         &self,
         response: &AggLlmResponse,
-        _policy: &TranslationPolicy,
+        policy: &TranslationPolicy,
     ) -> Result<EncodedResponse> {
+        let mut diagnostics = Vec::new();
+        let prepared = crate::codecs::common::prepare_response_tools(
+            response,
+            WireFormat::OpenAiChat,
+            &mut diagnostics,
+            policy,
+        )?;
+        let response = prepared.as_ref();
         super::super::responses::validate_response_output(response, WireFormat::OpenAiChat)?;
         if let Some(body) =
-            exact_preserved_response(&response.preservation, WireFormat::OpenAiChat, _policy)
+            exact_preserved_response(&response.preservation, WireFormat::OpenAiChat, policy)
         {
-            return Ok(EncodedResponse {
-                body,
-                diagnostics: Vec::new(),
-            });
+            return Ok(EncodedResponse { body, diagnostics });
         }
         let output = response.first_output();
         let content = output
@@ -436,8 +450,8 @@ impl FormatCodec for OpenAiChatCodec {
             "usage": encode_openai_usage(&response.usage),
         });
         Ok(EncodedResponse {
-            body: embed_preservation(body, &response.preservation, _policy),
-            diagnostics: Vec::new(),
+            body: embed_preservation(body, &response.preservation, policy),
+            diagnostics,
         })
     }
 }
@@ -1096,6 +1110,13 @@ pub(crate) fn encode_openai_content(
                 )?;
                 blocks.push(openai_text_part(&media_source_text(source)));
             }
+            ContentBlock::Mcp(_) => {
+                push_lossy(
+                    diagnostics,
+                    policy,
+                    "MCP history has no mapping in this codec",
+                )?;
+            }
             ContentBlock::Unknown { provider, raw } => {
                 reject_responses_builtin_tool_item(provider, raw, WireFormat::OpenAiChat)?;
                 push_lossy(
@@ -1152,20 +1173,28 @@ fn media_source_text(source: &MediaSource) -> String {
 }
 
 /// Encodes normalized tool definitions into OpenAI tool JSON.
-pub(crate) fn encode_openai_tools(tools: &[ToolDefinition]) -> Value {
+pub(crate) fn encode_openai_tools(tools: &[Tool]) -> Value {
     Value::Array(
         tools
             .iter()
-            .map(|tool| {
-                let mut function = json!({
-                    "name": tool.name,
-                    "description": tool.description.clone().unwrap_or_default(),
-                    "parameters": tool.parameters,
-                });
-                if let Some(strict) = tool.strict {
-                    function["strict"] = Value::Bool(strict);
+            .filter_map(|tool| match tool {
+                Tool::Function(tool) => {
+                    let mut function = json!({
+                        "name": tool.name,
+                        "description": tool.description.clone().unwrap_or_default(),
+                        "parameters": tool.parameters,
+                    });
+                    if let Some(strict) = tool.strict {
+                        function["strict"] = json!(strict);
+                    }
+                    Some(json!({"type": "function", "function": function}))
                 }
-                json!({"type": "function", "function": function})
+                Tool::Provider { provider, raw }
+                    if provider.as_str() == WireFormat::OpenAiChat.as_str() =>
+                {
+                    Some(raw.clone())
+                }
+                _ => None,
             })
             .collect(),
     )

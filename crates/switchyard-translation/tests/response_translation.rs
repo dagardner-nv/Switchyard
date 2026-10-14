@@ -286,6 +286,41 @@ fn anthropic_message_response_translates_to_openai_chat_completion() -> TestResu
         output["usage"],
         json!({"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19})
     );
+    let mut mcp_body = body;
+    mcp_body["content"] = json!([
+        {"type": "mcp_tool_use", "id": "mcp_1", "server_name": "inventory", "name": "lookup", "input": {}},
+        {"type": "mcp_tool_result", "tool_use_id": "mcp_1", "content": [{"type": "text", "text": "in stock"}]},
+        {"type": "text", "text": "Hi there"}
+    ]);
+    let source = WireFormat::AnthropicMessages;
+    let strict = TranslationPolicy {
+        lossy_conversion_policy: switchyard_translation::LossyConversionPolicy::Reject,
+        ..normalized_policy()
+    };
+    assert_eq!(
+        engine
+            .translate_response(source, source, &mcp_body, &strict)?
+            .body["content"],
+        mcp_body["content"]
+    );
+    for target in [WireFormat::OpenAiChat, WireFormat::OpenAiResponses] {
+        assert!(matches!(
+            engine.translate_response(source, target, &mcp_body, &strict),
+            Err(switchyard_translation::TranslationError::LossyConversion(_))
+        ));
+        let output = engine.translate_response(
+            source,
+            target,
+            &mcp_body,
+            &TranslationPolicy {
+                preservation: PreservationPolicy::Embed,
+                ..TranslationPolicy::default()
+            },
+        )?;
+        assert!(!output.diagnostics.is_empty());
+        assert!(output.body.to_string().contains("Hi there"));
+        assert!(!output.body.to_string().contains("mcp_tool"));
+    }
     Ok(())
 }
 

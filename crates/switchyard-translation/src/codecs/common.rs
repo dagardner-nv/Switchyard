@@ -3,10 +3,15 @@
 
 //! Provider-agnostic helpers shared by wire-format codecs.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value};
 
 use crate::error::{Result, TranslationError};
-use crate::llm::{ContentBlock, LlmRequest, ToolChoice, ToolDefinition};
+use crate::llm::{ContentBlock, LlmRequest, McpContent, Tool, ToolChoice};
+use crate::{
+    AggLlmResponse, PreservationMetadata, TranslationDiagnostic, TranslationPolicy, WireFormat,
+};
 
 // Internal provenance survives mutations that invalidate exact request replay.
 pub(crate) const ANTHROPIC_REQUEST_KEY: &str = "switchyard_anthropic_request";
@@ -19,7 +24,7 @@ pub(crate) fn is_anthropic_request(request: &LlmRequest) -> bool {
 /// Converts an OpenAI allowed-tools policy to a restricted function list and mode.
 pub(crate) fn allowed_function_tools(
     request: &LlmRequest,
-) -> Result<Option<(Vec<ToolDefinition>, ToolChoice)>> {
+) -> Result<Option<(Vec<Tool>, ToolChoice)>> {
     let Some(ToolChoice::Raw(choice)) = &request.tool_choice else {
         return Ok(None);
     };
@@ -63,7 +68,12 @@ pub(crate) fn allowed_function_tools(
             }
             _ => name.to_string(),
         };
-        if !request.tools.iter().any(|tool| tool.name == name) {
+        if !request
+            .tools
+            .iter()
+            .filter_map(Tool::function)
+            .any(|tool| tool.name == name)
+        {
             return Err(error());
         }
         names.push(name);
@@ -73,7 +83,10 @@ pub(crate) fn allowed_function_tools(
     let tools = request
         .tools
         .iter()
-        .filter(|tool| names.contains(&tool.name))
+        .filter(|tool| {
+            tool.function()
+                .is_some_and(|definition| names.contains(&definition.name))
+        })
         .cloned()
         .collect();
     Ok(Some((tools, mode)))
@@ -216,11 +229,173 @@ pub(crate) fn provider_extensions(
 ) -> Map<String, Value> {
     let mut extensions = Map::new();
     for (key, value) in object {
-        if key != ANTHROPIC_REQUEST_KEY && !known.contains(&key.as_str()) {
+        if key != ANTHROPIC_REQUEST_KEY
+            && key != super::anthropic::MCP_LAYOUTS_KEY
+            && !known.contains(&key.as_str())
+        {
             extensions.insert(key.clone(), value.clone());
         }
     }
     extensions
+}
+
+// Remove unsupported tool data before exact replay or preservation embedding can restore it.
+pub(crate) fn prepare_request_tools<'a>(
+    request: &'a LlmRequest,
+    target: WireFormat,
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<Cow<'a, LlmRequest>> {
+    let unsupported_tool = |tool: &Tool| match tool {
+        Tool::Function(_) => false,
+        Tool::Mcp(mcp) => {
+            target != WireFormat::AnthropicMessages
+                || !super::anthropic::can_encode_mcp(mcp, request)
+        }
+        Tool::Provider { provider, .. } => provider.as_str() != target.as_str(),
+    };
+    let preserved_tools = target != WireFormat::AnthropicMessages
+        && (request
+            .extensions
+            .fields
+            .contains_key(super::anthropic::MCP_LAYOUTS_KEY)
+            || request
+                .preservation
+                .requests
+                .get(&WireFormat::AnthropicMessages.into())
+                .is_some_and(|body| {
+                    body.get("mcp_servers")
+                        .and_then(Value::as_array)
+                        .is_some_and(|v| !v.is_empty())
+                        || body
+                            .get("tools")
+                            .and_then(Value::as_array)
+                            .is_some_and(|tools| {
+                                tools
+                                    .iter()
+                                    .any(|tool| !super::anthropic::is_function_tool(tool))
+                            })
+                }));
+    if !request.tools.iter().any(unsupported_tool)
+        && !preserved_tools
+        && !request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .chain(
+                request
+                    .instructions
+                    .iter()
+                    .flat_map(|instruction| &instruction.content),
+            )
+            .any(|block| is_unsupported_tool_content(block, target))
+    {
+        return Ok(Cow::Borrowed(request));
+    }
+    crate::util::push_lossy(
+        diagnostics,
+        policy,
+        format!("unmapped MCP or provider tools and history are dropped for {target}"),
+    )?;
+    let mut request = request.clone();
+    request.tools.retain(|tool| !unsupported_tool(tool));
+    if target != WireFormat::AnthropicMessages {
+        request
+            .extensions
+            .fields
+            .remove(super::anthropic::MCP_LAYOUTS_KEY);
+    }
+    request.messages.retain_mut(|message| {
+        drop_unsupported_tool_content(&mut message.content, target);
+        !message.content.is_empty()
+    });
+    request.instructions.retain_mut(|instruction| {
+        drop_unsupported_tool_content(&mut instruction.content, target);
+        !instruction.content.is_empty()
+    });
+    if request.tools.is_empty()
+        || matches!(&request.tool_choice, Some(ToolChoice::Tool { name })
+        if !request.tools.iter().any(|tool| match tool {
+            Tool::Function(definition) => &definition.name == name,
+            Tool::Provider { raw, .. } => raw.get("name").and_then(Value::as_str) == Some(name),
+            Tool::Mcp(_) => false,
+        }))
+    {
+        request.tool_choice = None;
+    }
+    // Clear every format's cached body and embedded envelope: either could restore credentials.
+    request.preservation = PreservationMetadata::default();
+    if let Some(metadata) = request
+        .extensions
+        .fields
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+    {
+        metadata.remove(crate::PRESERVATION_METADATA_KEY);
+    }
+    Ok(Cow::Owned(request))
+}
+
+fn is_unsupported_tool_content(block: &ContentBlock, target: WireFormat) -> bool {
+    match block {
+        ContentBlock::Mcp(_) => target != WireFormat::AnthropicMessages,
+        ContentBlock::Unknown { provider, raw } => {
+            provider.as_str() == WireFormat::AnthropicMessages.as_str()
+                && target != WireFormat::AnthropicMessages
+                && super::anthropic::is_provider_tool_block(raw)
+        }
+        ContentBlock::ToolResult(result) => result
+            .content
+            .iter()
+            .any(|block| is_unsupported_tool_content(block, target)),
+        _ => false,
+    }
+}
+fn drop_unsupported_tool_content(content: &mut Vec<ContentBlock>, target: WireFormat) {
+    content.retain_mut(|block| {
+        match block {
+            ContentBlock::ToolResult(result) | ContentBlock::Mcp(McpContent::Result(result)) => {
+                drop_unsupported_tool_content(&mut result.content, target)
+            }
+            _ => {}
+        }
+        !is_unsupported_tool_content(block, target)
+    });
+}
+
+pub(crate) fn prepare_response_tools<'a>(
+    response: &'a AggLlmResponse,
+    target: WireFormat,
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<Cow<'a, AggLlmResponse>> {
+    if !response
+        .outputs
+        .iter()
+        .flat_map(|output| &output.content)
+        .any(|block| matches!(block, ContentBlock::Mcp(_)))
+    {
+        return Ok(Cow::Borrowed(response));
+    }
+    crate::util::push_lossy(
+        diagnostics,
+        policy,
+        "unmapped MCP or provider tool output is dropped",
+    )?;
+    let mut response = response.clone();
+    for output in &mut response.outputs {
+        drop_unsupported_tool_content(&mut output.content, target);
+    }
+    response.preservation = PreservationMetadata::default();
+    if let Some(metadata) = response
+        .extensions
+        .fields
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+    {
+        metadata.remove(crate::PRESERVATION_METADATA_KEY);
+    }
+    Ok(Cow::Owned(response))
 }
 
 #[cfg(test)]
