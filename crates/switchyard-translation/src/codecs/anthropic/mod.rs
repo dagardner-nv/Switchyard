@@ -49,23 +49,22 @@ fn source_mcp_layout<'a>(mcp: &McpToolset, request: &'a LlmRequest) -> Option<&'
 }
 
 pub(crate) fn can_encode_mcp(mcp: &McpToolset, request: &LlmRequest) -> bool {
-    let Some(source) = source_mcp_layout(mcp, request) else {
-        return false;
-    };
-    if mcp.require_approval == Some(true) {
+    // Anthropic's MCP connector requires HTTPS; plain HTTP is not supported.
+    // It also has no setting to require approval before tool calls.
+    if !mcp.url.starts_with("https://") || mcp.require_approval == Some(true) {
         return false;
     }
+    let Some(source) = source_mcp_layout(mcp, request) else {
+        return !super::common::is_anthropic_request(request)
+            && mcp.require_approval == Some(false);
+    };
     let Some(server) = source.get("server").and_then(Value::as_object) else {
         return false;
     };
     let has_toolset = source.get("toolset").is_some_and(Value::is_object);
     source.get("server_index").and_then(Value::as_u64).is_some()
         && server.get("type").and_then(Value::as_str) == Some("url")
-        && if has_toolset {
-            mcp.allowed_tools.is_none()
-        } else {
-            mcp.tool_enabled.is_empty()
-        }
+        && (has_toolset || mcp.tool_enabled.is_empty())
 }
 
 // Distinguishes tools we can normalize as functions from those that cannot be translated into other wire formats.

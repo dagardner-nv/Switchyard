@@ -448,15 +448,20 @@ impl FormatCodec for AnthropicMessagesCodec {
         _policy: &TranslationPolicy,
     ) -> Result<EncodedResponse> {
         super::super::responses::validate_response_output(response, WireFormat::AnthropicMessages)?;
+        let mut diagnostics = Vec::new();
+        let prepared = crate::codecs::common::prepare_response_tools(
+            response,
+            WireFormat::AnthropicMessages,
+            &mut diagnostics,
+            _policy,
+        )?;
+        let response = prepared.as_ref();
         if let Some(body) = exact_preserved_response(
             &response.preservation,
             WireFormat::AnthropicMessages,
             _policy,
         ) {
-            return Ok(EncodedResponse {
-                body,
-                diagnostics: Vec::new(),
-            });
+            return Ok(EncodedResponse { body, diagnostics });
         }
         let output = response.first_output();
         let content = output
@@ -483,7 +488,7 @@ impl FormatCodec for AnthropicMessagesCodec {
         });
         Ok(EncodedResponse {
             body: embed_preservation(body, &response.preservation, _policy),
-            diagnostics: Vec::new(),
+            diagnostics,
         })
     }
 }
@@ -1556,7 +1561,7 @@ fn encode_tools(
 ) -> Result<(Vec<Value>, Vec<Value>)> {
     let mut out = Vec::new();
     let mut servers = Vec::new();
-    for tool in tools {
+    for (index, tool) in tools.iter().enumerate() {
         match tool {
             Tool::Function(definition) => {
                 let mut item = Map::new();
@@ -1582,7 +1587,14 @@ fn encode_tools(
             )?,
             Tool::Mcp(mcp) => {
                 let layout = source_mcp_layout(mcp, request)
-                    .and_then(|raw| serde_json::from_value::<McpLayout>(raw.clone()).ok());
+                    .and_then(|raw| serde_json::from_value::<McpLayout>(raw.clone()).ok())
+                    .or_else(|| {
+                        (!is_anthropic_request(request)).then(|| McpLayout {
+                            server: json!({"type": "url"}),
+                            toolset: Some(json!({"type": "mcp_toolset"})),
+                            server_index: index,
+                        })
+                    });
                 let Some(mut layout) = layout else {
                     push_lossy(
                         diagnostics,
@@ -1593,7 +1605,6 @@ fn encode_tools(
                 };
                 if mcp.require_approval == Some(true)
                     || (layout.toolset.is_none() && !mcp.tool_enabled.is_empty())
-                    || (layout.toolset.is_some() && mcp.allowed_tools.is_some())
                 {
                     push_lossy(
                         diagnostics,
@@ -1613,6 +1624,24 @@ fn encode_tools(
                     mcp.authorization_token.as_ref().map(|v| json!(v)),
                 );
                 if let Some(mut toolset) = layout.toolset {
+                    // New connections use the toolset layout; callers must enable the
+                    // corresponding Anthropic MCP beta on the target backend.
+                    let mut mcp = mcp.clone();
+                    if let Some(allowed) = &mcp.allowed_tools {
+                        mcp.tool_enabled = allowed
+                            .iter()
+                            .map(|name| {
+                                (
+                                    name.clone(),
+                                    mcp.tool_enabled
+                                        .get(name)
+                                        .copied()
+                                        .unwrap_or(mcp.enabled.unwrap_or(true)),
+                                )
+                            })
+                            .collect();
+                        mcp.enabled = Some(false);
+                    }
                     toolset["mcp_server_name"] = json!(mcp.name);
                     if mcp.enabled.is_some()
                         || mcp.defer_loading.is_some()

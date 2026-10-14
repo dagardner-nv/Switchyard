@@ -867,6 +867,40 @@ fn mcp_token_patterns(body: &Value) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|server| server.get("authorization_token").and_then(Value::as_str))
+        .chain(
+            body.get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .chain(
+                    body.get("input")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| item["type"] == "additional_tools")
+                        .filter_map(|item| item["tools"].as_array())
+                        .flatten(),
+                )
+                .filter(|tool| tool["type"] == "mcp")
+                .flat_map(|tool| {
+                    tool.get("authorization")
+                        .and_then(Value::as_str)
+                        .into_iter()
+                        .chain(
+                            tool.get("headers")
+                                .and_then(Value::as_object)
+                                .into_iter()
+                                .flat_map(|headers| headers.values())
+                                .filter_map(Value::as_str),
+                        )
+                }),
+        )
+        // Providers may echo only the credential from an Authorization header.
+        .flat_map(|token| {
+            [Some(token), token.strip_prefix("Bearer ")]
+                .into_iter()
+                .flatten()
+        })
         .filter(|token| !token.is_empty())
     {
         if let Ok(escaped) = serde_json::to_string(token) {
@@ -3512,6 +3546,88 @@ mod tests {
             return Err("expected a buffered response".into());
         };
         assert_eq!(body, response_body.as_bytes());
+        server.verify().await;
+        Ok(())
+    }
+
+    #[test]
+    fn responses_mcp_credentials_are_redacted_from_errors() {
+        let body = json!({"tools": [
+            {"type": "mcp", "server_label": "remote", "server_url": "https://example.invalid/mcp",
+                "authorization": "synthetic-oauth-secret"},
+            {"type": "mcp", "server_label": "private", "tunnel_id": "tunnel_test",
+                "headers": {"X-Api-Key": "synthetic-header-secret", "Authorization": "Bearer synthetic-bearer-secret"}}
+        ]});
+        for body in [
+            body.clone(),
+            json!({"input": [{"type": "additional_tools", "tools": body["tools"]}]}),
+        ] {
+            let patterns = mcp_token_patterns(&body);
+            let mut error = json!({"error": {
+                "message": body.to_string(), "detail": "synthetic-bearer-secret"
+            }});
+            redact_mcp_json(&mut error, &patterns);
+            let error = error.to_string();
+            for secret in [
+                "synthetic-oauth-secret",
+                "synthetic-header-secret",
+                "synthetic-bearer-secret",
+            ] {
+                assert!(!error.contains(secret));
+            }
+            assert!(error.contains("remote"));
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_mcp_routes_to_anthropic_with_configured_beta()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::header("anthropic-beta", "mcp-client-2025-11-20"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "claude",
+                "mcp_servers": [{"type": "url", "name": "inventory", "url": "https://example.invalid/mcp", "authorization_token": "synthetic-token"}],
+                "tools": [{"type": "mcp_toolset", "mcp_server_name": "inventory", "default_config": {"defer_loading": true}}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "type": "message", "id": "msg_1", "model": "claude", "role": "assistant", "stop_reason": "end_turn",
+                "content": [
+                    {"type": "mcp_tool_use", "id": "mcp_1", "server_name": "inventory", "name": "lookup", "input": {}},
+                    {"type": "mcp_tool_result", "tool_use_id": "mcp_1", "content": [{"type": "text", "text": "12"}]},
+                    {"type": "text", "text": "12 widgets"}
+                ], "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut backend = config(&server.uri());
+        backend
+            .extra_headers
+            .insert("anthropic-beta".into(), "mcp-client-2025-11-20".into());
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(backend),
+            None,
+        )])?;
+        let raw = json!({"model": "route", "input": "Check stock", "max_output_tokens": 128,
+            "tools": [{"type": "mcp", "server_label": "inventory", "server_url": "https://example.invalid/mcp",
+                "authorization": "synthetic-token", "require_approval": "never", "defer_loading": true}]});
+        let RawResponse::Buffered(body) = client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("claude")),
+                WireFormat::OpenAiResponses,
+            )
+            .await?
+        else {
+            panic!("expected a buffered response")
+        };
+        assert_eq!(body["output"][0]["type"], "mcp_call");
+        assert_eq!(body["output"][0]["server_label"], "inventory");
+        assert_eq!(body["output"][0]["output"], "12");
+        assert_eq!(body["output"][1]["content"][0]["text"], "12 widgets");
         server.verify().await;
         Ok(())
     }
