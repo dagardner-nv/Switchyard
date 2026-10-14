@@ -1074,6 +1074,11 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
             "signature": signature,
         })],
         ContentBlock::Reasoning { .. } => Vec::new(),
+        ContentBlock::Mcp(McpContent::Listing { .. }) => {
+            return Err(TranslationError::Other(
+                "Anthropic MCP listing encoding is not implemented".into(),
+            ));
+        }
         ContentBlock::Mcp(McpContent::Call { server_name, call }) => vec![json!({
             "type": "mcp_tool_use", "id": call.id, "name": call.name,
             "server_name": server_name, "input": call.arguments,
@@ -1492,6 +1497,8 @@ fn decode_mcp(server: &Value, toolset: Option<&Value>) -> Result<McpToolset> {
                     .map(|enabled| (name.clone(), enabled))
             })
             .collect(),
+        defer_loading: None,
+        tool_defer_loading: Default::default(),
         // Anthropic's MCP connector executes calls without an approval exchange.
         require_approval: Some(false),
     })
