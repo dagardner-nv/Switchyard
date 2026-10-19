@@ -101,6 +101,8 @@ pub type RawEventStream =
 /// `target_model`); `None` falls back to the id observed on the source stream.
 /// The target stream codec is resolved once and reused per chunk; terminal events
 /// (`message_stop` / `response.completed`) come from `finish`.
+/// Error frames, including Responses `response.failed`, return
+/// [`LlmStreamError::Upstream`] with the original event and terminate the stream.
 pub fn encode_stream(
     chunks: LlmResponseStream,
     target: WireFormat,
@@ -156,7 +158,7 @@ pub fn encode_stream_with_extensions(
             }
             // Argument deltas for a freeform tool cannot be expressed on the wire; the
             // rewritten completed item carries the input instead.
-            let mut encoded: Vec<Value> = encoded
+            let encoded: Vec<Value> = encoded
                 .into_iter()
                 .filter_map(|mut value| {
                     crate::codex_custom_tools::restore_custom_tool_calls_in_event(
@@ -167,17 +169,17 @@ pub fn encode_stream_with_extensions(
                     .then_some(value)
                 })
                 .collect();
-            let terminal = encoded.pop();
             for value in encoded {
-                yield value;
+                if is_stream_error_event(target, &value) {
+                    Err(LlmStreamError::Upstream(value))?;
+                } else {
+                    yield value;
+                }
             }
-            match (state.errored, terminal) {
-                (false, Some(value)) => yield value,
-                (true, Some(value)) => Err(LlmStreamError::Upstream(value))?,
-                (true, None) => Err(LlmStreamError::Client(LlmClientError::ResponseTranslation(
+            if state.errored {
+                Err(LlmStreamError::Client(LlmClientError::ResponseTranslation(
                     "stream ended after an error without a terminal event".to_string(),
-                )))?,
-                _ => ()
+                )))?;
             }
         }
         for mut value in codec.finish(&mut state) {
@@ -192,12 +194,31 @@ pub fn encode_stream_with_extensions(
                 &custom_tools,
                 &mut custom_state,
             ) {
-                yield value;
+                if is_stream_error_event(target, &value) {
+                    Err(LlmStreamError::Upstream(value))?;
+                } else {
+                    yield value;
+                }
             }
+        }
+        if state.errored {
+            Err(LlmStreamError::Client(LlmClientError::ResponseTranslation(
+                "stream ended after an error without a terminal event".to_string(),
+            )))?;
         }
     };
 
     Ok(Box::pin(events))
+}
+
+fn is_stream_error_event(format: WireFormat, event: &Value) -> bool {
+    match format {
+        WireFormat::OpenAiChat => event["error"].is_object(),
+        WireFormat::OpenAiResponses => {
+            matches!(event["type"].as_str(), Some("error" | "response.failed"))
+        }
+        WireFormat::AnthropicMessages => event["type"] == "error",
+    }
 }
 
 // The raw-response helper promises that the caller sees the model that served the
@@ -611,6 +632,44 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn encode_stream_reports_a_tool_error_detected_at_eof() -> Result<(), BoxError> {
+        let chunks = stream::iter([
+            Ok(LlmResponseChunk::TextDelta {
+                index: 0,
+                text: "Before".into(),
+            }
+            .into()),
+            Ok(LlmResponseChunk::ToolCallDelta {
+                index: 1,
+                id: Some("call_1".into()),
+                name: None,
+                arguments_delta: Some("{}".into()),
+            }
+            .into()),
+        ])
+        .boxed();
+        let results = block_on(
+            encode_stream(chunks, WireFormat::AnthropicMessages, None)?.collect::<Vec<_>>(),
+        );
+        assert!(results.iter().any(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|event| event["delta"]["text"] == "Before")
+        }));
+        let Some(Err(LlmStreamError::Upstream(event))) = results.last() else {
+            return Err(format!("expected a terminal tool error, got {results:?}").into());
+        };
+        assert_eq!(event["type"], "error");
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(!results.iter().any(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|event| event["type"] == "message_stop")
+        }));
+        Ok(())
+    }
+
     // A clean stop stays entirely on the data channel, so a consumer that appends a
     // format-level success sentinel only does so for a turn that actually completed.
     #[test]
@@ -641,28 +700,34 @@ mod tests {
     // A replayed provider error ends the stream before the encoder polls the source again.
     #[test]
     fn encode_stream_stops_polling_after_a_replayed_error() -> Result<(), BoxError> {
-        let error = LlmResponseStreamEvent::preserved(
-            WireFormat::OpenAiResponses,
+        for raw in [
             json!({"type": "error", "message": "boom"}),
-            vec![LlmResponseChunk::StreamError {
-                message: "boom".to_string(),
-            }],
-        );
-        let chunks: LlmResponseStream = stream::iter([Ok(error)])
-            .chain(stream::poll_fn(|_| {
-                panic!("encode_stream polled the source after an in-band error")
-            }))
-            .boxed();
+            json!({"type": "response.failed", "response": {"error": {"message": "boom"}}}),
+        ] {
+            let error = LlmResponseStreamEvent::preserved(
+                WireFormat::OpenAiResponses,
+                raw.clone(),
+                vec![LlmResponseChunk::StreamError {
+                    message: "boom".to_string(),
+                }],
+            );
+            let chunks: LlmResponseStream = stream::iter([Ok(error)])
+                .chain(stream::poll_fn(|_| {
+                    panic!("encode_stream polled the source after an in-band error")
+                }))
+                .boxed();
 
-        let events =
-            block_on(encode_stream(chunks, WireFormat::OpenAiResponses, None)?.collect::<Vec<_>>());
+            let events = block_on(
+                encode_stream(chunks, WireFormat::OpenAiResponses, None)?.collect::<Vec<_>>(),
+            );
 
-        // The replayed provider event is the terminal frame, so it arrives verbatim on the
-        // error channel and nothing follows it.
-        let [Err(LlmStreamError::Upstream(event))] = events.as_slice() else {
-            return Err(format!("expected one in-band error, got {events:?}").into());
-        };
-        assert_eq!(*event, json!({"type": "error", "message": "boom"}));
+            // The replayed provider event is the terminal frame, so it arrives verbatim on the
+            // error channel and nothing follows it.
+            let [Err(LlmStreamError::Upstream(event))] = events.as_slice() else {
+                return Err(format!("expected one in-band error, got {events:?}").into());
+            };
+            assert_eq!(*event, raw);
+        }
         Ok(())
     }
 

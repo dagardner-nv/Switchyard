@@ -2586,26 +2586,50 @@ fn anthropic_max_tokens_stop_translates_to_responses_incomplete_event() -> TestR
 // Verifies a streamed response.incomplete from a Responses upstream reaches a Chat client.
 #[test]
 fn responses_incomplete_event_translates_to_chat_length_finish() -> TestResult {
-    let engine = TranslationEngine::default();
-    let mut state =
-        StreamTranslationState::new(WireFormat::OpenAiResponses, WireFormat::OpenAiChat);
-    let incomplete = json!({
-        "type": "response.incomplete",
-        "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
-    });
+    for prefix in ["", "Partial "] {
+        let engine = TranslationEngine::default();
+        let mut state =
+            StreamTranslationState::new(WireFormat::OpenAiResponses, WireFormat::OpenAiChat);
+        let incomplete = json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "incomplete",
+                    "content": [{"type": "output_text", "text": "Partial answer", "annotations": []}]}],
+                "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+            }
+        });
 
-    let mut events = engine.translate_event(
-        &mut state,
-        WireFormat::OpenAiResponses,
-        WireFormat::OpenAiChat,
-        &incomplete,
-    )?;
-    events.extend(engine.finish_stream(&mut state, WireFormat::OpenAiChat)?);
+        let mut events = Vec::new();
+        if !prefix.is_empty() {
+            events.extend(engine.translate_event(
+                &mut state,
+                WireFormat::OpenAiResponses,
+                WireFormat::OpenAiChat,
+                &json!({"type": "response.output_text.delta", "output_index": 0,
+                    "content_index": 0, "delta": prefix}),
+            )?);
+        }
+        events.extend(engine.translate_event(
+            &mut state,
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &incomplete,
+        )?);
+        events.extend(engine.finish_stream(&mut state, WireFormat::OpenAiChat)?);
 
-    let Some(terminal) = events.last() else {
-        return Err("finish should emit a terminal Chat chunk".into());
-    };
-    assert_eq!(terminal["choices"][0]["finish_reason"], "length");
+        let Some(terminal) = events.last() else {
+            return Err("finish should emit a terminal Chat chunk".into());
+        };
+        assert_eq!(terminal["choices"][0]["finish_reason"], "length");
+        assert_eq!(terminal["usage"]["prompt_tokens"], 7);
+        assert_eq!(terminal["usage"]["completion_tokens"], 3);
+        let text: String = events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(text, "Partial answer");
+    }
     Ok(())
 }
 
