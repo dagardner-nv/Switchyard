@@ -191,15 +191,19 @@ impl FormatCodec for OpenAiChatCodec {
         request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
+        let mut diagnostics = Vec::new();
+        let prepared = crate::codecs::common::prepare_request_tools(
+            request,
+            WireFormat::OpenAiChat,
+            &mut diagnostics,
+            policy,
+        )?;
+        let request = prepared.as_ref();
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiChat, policy)
         {
-            return Ok(EncodedRequest {
-                body,
-                diagnostics: Vec::new(),
-            });
+            return Ok(EncodedRequest { body, diagnostics });
         }
-        let mut diagnostics = Vec::new();
         validate_request_capabilities(request, &mut diagnostics, policy)?;
         let allowed = match &request.tool_choice {
             Some(ToolChoice::Raw(choice))

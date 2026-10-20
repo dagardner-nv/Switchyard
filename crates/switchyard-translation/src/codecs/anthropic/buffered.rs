@@ -205,15 +205,19 @@ impl FormatCodec for AnthropicMessagesCodec {
         request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
+        let mut diagnostics = Vec::new();
+        let prepared = crate::codecs::common::prepare_request_tools(
+            request,
+            WireFormat::AnthropicMessages,
+            &mut diagnostics,
+            policy,
+        )?;
+        let request = prepared.as_ref();
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::AnthropicMessages, policy)
         {
-            return Ok(EncodedRequest {
-                body,
-                diagnostics: Vec::new(),
-            });
+            return Ok(EncodedRequest { body, diagnostics });
         }
-        let mut diagnostics = Vec::new();
         validate_request_capabilities(request, &mut diagnostics, policy)?;
         let allowed = crate::codecs::common::allowed_function_tools(request)?;
         let (tools, tool_choice) = allowed.as_ref().map_or(

@@ -3,10 +3,13 @@
 
 //! Provider-agnostic helpers shared by wire-format codecs.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value};
 
 use crate::error::{Result, TranslationError};
 use crate::llm::{ContentBlock, LlmRequest, Tool, ToolChoice};
+use crate::{PreservationMetadata, TranslationDiagnostic, TranslationPolicy, WireFormat};
 
 // Internal provenance survives mutations that invalidate exact request replay.
 pub(crate) const ANTHROPIC_REQUEST_KEY: &str = "switchyard_anthropic_request";
@@ -229,6 +232,226 @@ pub(crate) fn provider_extensions(
         }
     }
     extensions
+}
+
+// Apply policy before saved bodies or embedded metadata can restore dropped tools.
+pub(crate) fn prepare_request_tools<'a>(
+    request: &'a LlmRequest,
+    target: WireFormat,
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<Cow<'a, LlmRequest>> {
+    let has_unsupported = request
+        .tools
+        .iter()
+        .any(|tool| !matches!(tool, Tool::Function(_)))
+        || request_content(request).any(is_mcp_content)
+        || matches!(&request.tool_choice, Some(ToolChoice::Raw(raw)) if raw["type"] == "mcp");
+    let has_preserved_mcp = request
+        .preservation
+        .requests
+        .values()
+        .any(preserved_request_has_mcp)
+        || request.extensions.fields.contains_key("mcp_servers")
+        || has_mcp_tools(
+            request
+                .extensions
+                .fields
+                .get(crate::codex_custom_tools::ADDITIONAL_TOOLS_KEY)
+                .unwrap_or(&Value::Null),
+        )
+        || request
+            .extensions
+            .fields
+            .get("metadata")
+            .and_then(|metadata| metadata.get(crate::PRESERVATION_METADATA_KEY))
+            .and_then(|envelope| envelope.get("requests"))
+            .and_then(Value::as_object)
+            .is_some_and(|requests| requests.values().any(preserved_request_has_mcp));
+    if !has_unsupported && !has_preserved_mcp {
+        return Ok(Cow::Borrowed(request));
+    }
+    // Native replay can retain opaque definitions that these codecs cannot rebuild.
+    if target != WireFormat::OpenAiChat
+        && policy.preservation != crate::PreservationPolicy::Disabled
+        && can_replay_mcp_request(request, target)
+    {
+        return Ok(Cow::Borrowed(request));
+    }
+    crate::util::push_lossy(
+        diagnostics,
+        policy,
+        format!("unmapped MCP or provider tools and history are dropped for {target}"),
+    )?;
+    let mut request = request.clone();
+    request
+        .tools
+        .retain(|tool| matches!(tool, Tool::Function(_)));
+    for message in &mut request.messages {
+        drop_mcp_content(&mut message.content);
+    }
+    request
+        .messages
+        .retain(|message| !message.content.is_empty());
+    for instruction in &mut request.instructions {
+        drop_mcp_content(&mut instruction.content);
+    }
+    request
+        .instructions
+        .retain(|instruction| !instruction.content.is_empty());
+    if request.tools.is_empty()
+        || matches!(&request.tool_choice, Some(ToolChoice::Raw(raw)) if raw["type"] == "mcp")
+        || matches!(&request.tool_choice, Some(ToolChoice::Tool { name })
+            if !request.tools.iter().filter_map(Tool::function).any(|tool| &tool.name == name))
+    {
+        request.tool_choice = None;
+    }
+    // All cached formats must be cleared; another snapshot can hold older credentials.
+    request.preservation = PreservationMetadata::default();
+    request.extensions.fields.remove("mcp_servers");
+    request
+        .extensions
+        .fields
+        .remove(crate::codex_custom_tools::ADDITIONAL_TOOLS_KEY);
+    if let Some(metadata) = request
+        .extensions
+        .fields
+        .get_mut("metadata")
+        .and_then(Value::as_object_mut)
+    {
+        metadata.remove(crate::PRESERVATION_METADATA_KEY);
+    }
+    Ok(Cow::Owned(request))
+}
+
+fn is_mcp_content(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Mcp(_) => true,
+        ContentBlock::Unknown { raw, .. } => raw["type"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("mcp_")),
+        ContentBlock::ToolResult(result) => result.content.iter().any(is_mcp_content),
+        _ => false,
+    }
+}
+
+fn drop_mcp_content(content: &mut Vec<ContentBlock>) {
+    content.retain_mut(|block| {
+        if let ContentBlock::ToolResult(result) = block {
+            drop_mcp_content(&mut result.content);
+        }
+        !is_mcp_content(block)
+    });
+}
+
+fn request_content(request: &LlmRequest) -> impl Iterator<Item = &ContentBlock> {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .chain(
+            request
+                .instructions
+                .iter()
+                .flat_map(|instruction| &instruction.content),
+        )
+}
+
+fn has_mcp_tools(tools: &Value) -> bool {
+    tools.as_array().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            matches!(tool["type"].as_str(), Some("mcp" | "mcp_toolset"))
+                || (tool["type"] == "namespace" && has_mcp_tools(&tool["tools"]))
+        })
+    })
+}
+
+fn has_mcp_history(items: &Value) -> bool {
+    items.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("mcp_"))
+        })
+    })
+}
+
+fn preserved_request_has_mcp(body: &Value) -> bool {
+    body.get("mcp_servers").is_some()
+        || has_mcp_tools(&body["tools"])
+        || has_mcp_history(&body["input"])
+        || body["input"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["type"] == "additional_tools" && has_mcp_tools(&item["tools"]))
+        })
+        || body["messages"].as_array().is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| has_mcp_history(&message["content"]))
+        })
+}
+
+// Multiple snapshots can contain stale credentials or history. Comparing only the
+// target snapshot cannot make the other snapshots safe to embed, so clear them all.
+fn can_replay_mcp_request(request: &LlmRequest, target: WireFormat) -> bool {
+    request.preservation.requests.len() == 1
+        && request
+            .preservation
+            .requests
+            .get(&target.into())
+            .is_some_and(|body| {
+                // An embedded envelope can carry snapshots beyond the one checked here.
+                body["metadata"][crate::PRESERVATION_METADATA_KEY].is_null()
+                    && preservation_codec(target)
+                        .decode_request(body, &preservation_check_policy())
+                        .is_ok_and(|original| {
+                            original.request.tools == request.tools
+                                && original.request.messages == request.messages
+                                && instructions_match(&original.request, request)
+                                && original.request.tool_choice == request.tool_choice
+                                && original.request.extensions.fields == request.extensions.fields
+                        })
+            })
+}
+
+fn instructions_match(original: &LlmRequest, request: &LlmRequest) -> bool {
+    if original.instructions == request.instructions {
+        return true;
+    }
+    // Target prompts create separate IR blocks, but the wire body may combine
+    // them into one system instruction. Compare the text those encoders emit.
+    let system_text = |request: &LlmRequest| {
+        let mut parts = Vec::new();
+        for instruction in &request.instructions {
+            if instruction.role != crate::llm::Role::System {
+                return None;
+            }
+            for block in &instruction.content {
+                let ContentBlock::Text { text } = block else {
+                    return None;
+                };
+                parts.push(text.as_str());
+            }
+        }
+        Some(parts.join("\n\n"))
+    };
+    system_text(original).is_some_and(|text| Some(text) == system_text(request))
+}
+
+fn preservation_codec(format: WireFormat) -> &'static dyn super::FormatCodec {
+    match format {
+        WireFormat::AnthropicMessages => &super::anthropic::AnthropicMessagesCodec,
+        WireFormat::OpenAiResponses => &super::responses::OpenAiResponsesCodec,
+        WireFormat::OpenAiChat => &super::openai_chat::OpenAiChatCodec,
+    }
+}
+
+fn preservation_check_policy() -> TranslationPolicy {
+    TranslationPolicy {
+        preservation: crate::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    }
 }
 
 #[cfg(test)]

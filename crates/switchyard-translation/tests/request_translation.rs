@@ -39,7 +39,7 @@ fn normalized_chat_requests_forward_logprobs_with_top_logprobs() -> TestResult {
 }
 
 #[test]
-fn openai_chat_rejects_mcp_history_before_text_only_returns() {
+fn openai_chat_mcp_history_obeys_loss_policy_before_text_only_returns() {
     use switchyard_translation::{LlmRequest, McpContent, Message, Role};
 
     let engine = TranslationEngine::default();
@@ -69,10 +69,23 @@ fn openai_chat_rejects_mcp_history_before_text_only_returns() {
                 lossy_conversion_policy,
                 ..TranslationPolicy::default()
             };
-            assert!(matches!(
-                engine.encode_request(WireFormat::OpenAiChat, &request, &policy),
-                Err(TranslationError::LossyConversion(_))
-            ));
+            let result = engine.encode_request(WireFormat::OpenAiChat, &request, &policy);
+            match lossy_conversion_policy {
+                LossyConversionPolicy::Reject => {
+                    assert!(matches!(result, Err(TranslationError::LossyConversion(_))));
+                }
+                LossyConversionPolicy::AllowWithDiagnostics => {
+                    let output = result.expect("permissive conversion should succeed");
+                    assert!(!output.diagnostics.is_empty());
+                    assert_eq!(
+                        output.body["messages"],
+                        json!([{
+                            "role": if role == Role::User { "user" } else { "assistant" },
+                            "content": "Keep this text"
+                        }])
+                    );
+                }
+            }
         }
     }
 }
@@ -4639,5 +4652,201 @@ fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
         )?
         .body;
     assert_eq!(output["input"], outputs);
+    Ok(())
+}
+
+// Request edits must take effect before native replay or metadata embedding.
+#[test]
+fn mcp_request_edits_invalidate_saved_bodies() -> TestResult {
+    use switchyard_translation::{InstructionBlock, PreservationPolicy, Role};
+
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "route", "input": "Check inventory", "instructions": "Original",
+        "tools": [
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {"type": "mcp", "server_label": "inventory", "server_url": "https://inventory.example/mcp",
+                "authorization": "synthetic-secret"}
+        ]
+    });
+    let format = WireFormat::OpenAiResponses;
+    let request = engine
+        .decode_request(format, &body, &TranslationPolicy::default())?
+        .request;
+    assert_eq!(
+        engine
+            .encode_request(format, &request, &TranslationPolicy::default())?
+            .body,
+        body
+    );
+    for preservation in [
+        PreservationPolicy::Disabled,
+        PreservationPolicy::InMemory,
+        PreservationPolicy::Embed,
+    ] {
+        let policy = TranslationPolicy {
+            preservation,
+            ..TranslationPolicy::default()
+        };
+        for remove_tools in [false, true] {
+            let mut edited = request.clone();
+            if remove_tools {
+                edited.tools.clear();
+            } else {
+                edited.instructions = vec![InstructionBlock {
+                    role: Role::System,
+                    content: vec![ContentBlock::Text {
+                        text: "Updated".into(),
+                    }],
+                }];
+            }
+            let encoded = engine.encode_request(format, &edited, &policy)?;
+            assert!(!encoded.body.to_string().contains("synthetic-secret"));
+            assert!(!encoded.diagnostics.is_empty());
+            if remove_tools {
+                assert!(encoded.body.get("tools").is_none());
+            } else {
+                assert_eq!(encoded.body["instructions"], "Updated");
+                assert_eq!(encoded.body["tools"][0]["name"], "lookup");
+            }
+        }
+    }
+    Ok(())
+}
+
+// Opaque MCP definitions cannot bypass policy through nested tool lists or snapshots.
+#[test]
+fn mcp_request_policy_covers_native_and_additional_definitions() -> TestResult {
+    use switchyard_translation::{PRESERVATION_METADATA_KEY, PreservationPolicy};
+
+    let engine = TranslationEngine::default();
+    let mcp = json!({"type": "mcp", "server_label": "inventory",
+        "server_url": "https://inventory.example/mcp", "authorization": "synthetic-secret"});
+    let function = json!({"type": "function", "name": "lookup", "parameters": {"type": "object"}});
+    for (source, body) in [
+        (
+            WireFormat::OpenAiResponses,
+            json!({"model": "route", "input": "Check inventory", "tools": [function.clone(), mcp.clone()]}),
+        ),
+        (
+            WireFormat::OpenAiResponses,
+            json!({"model": "route", "input": [
+                {"role": "user", "content": "Check inventory"},
+                {"type": "additional_tools", "tools": [function, {"type": "namespace", "name": "remote", "tools": [mcp]}]}
+            ]}),
+        ),
+        (
+            WireFormat::AnthropicMessages,
+            json!({"model": "route", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Check inventory"}],
+                "mcp_servers": [{"type": "url", "name": "inventory", "url": "https://inventory.example/mcp", "authorization_token": "synthetic-secret"}],
+                "tools": [{"name": "lookup", "input_schema": {"type": "object"}}, {"type": "mcp_toolset", "mcp_server_name": "inventory"}]
+            }),
+        ),
+    ] {
+        let request = engine
+            .decode_request(source, &body, &TranslationPolicy::default())?
+            .request;
+        assert_eq!(
+            engine
+                .encode_request(source, &request, &TranslationPolicy::default())?
+                .body,
+            body
+        );
+        for target in [
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+        ] {
+            let mut request = request.clone();
+            // A second saved body rules out exact replay, even for the native target.
+            request.preservation.requests.insert(
+                WireFormat::OpenAiChat.into(),
+                json!({"tools": [{"type": "mcp", "authorization": "older-secret"}]}),
+            );
+            request.extensions.fields.insert(
+                "metadata".into(),
+                json!({
+                    "label": "keep", PRESERVATION_METADATA_KEY: request.preservation
+                }),
+            );
+            for lossy_conversion_policy in [
+                LossyConversionPolicy::Reject,
+                LossyConversionPolicy::AllowWithDiagnostics,
+            ] {
+                let policy = TranslationPolicy {
+                    preservation: PreservationPolicy::Embed,
+                    lossy_conversion_policy,
+                    ..TranslationPolicy::default()
+                };
+                let result = engine.encode_request(target, &request, &policy);
+                if lossy_conversion_policy == LossyConversionPolicy::Reject {
+                    assert!(
+                        matches!(result, Err(TranslationError::LossyConversion(_))),
+                        "{source} -> {target}: {result:?}"
+                    );
+                } else {
+                    let output = result?;
+                    let serialized = output.body.to_string();
+                    assert!(!serialized.contains("synthetic-secret"), "{serialized}");
+                    assert!(!serialized.contains("older-secret"), "{serialized}");
+                    assert!(serialized.contains("lookup"), "{serialized}");
+                    assert!(!output.diagnostics.is_empty());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// Normalized MCP definitions remain unsupported until the provider codecs can rebuild them.
+#[test]
+fn normalized_mcp_request_tools_obey_loss_policy() -> TestResult {
+    use switchyard_translation::{LlmRequest, McpToolset, Tool, ToolChoice, ToolDefinition};
+
+    let engine = TranslationEngine::default();
+    let request = LlmRequest {
+        tools: vec![
+            Tool::Function(ToolDefinition {
+                name: "lookup".into(),
+                description: None,
+                parameters: json!({"type": "object"}),
+                strict: None,
+            }),
+            Tool::Mcp(McpToolset {
+                name: "inventory".into(),
+                url: "https://inventory.example/mcp".into(),
+                authorization_token: Some("synthetic-secret".into()),
+                default_config: Default::default(),
+                configs: Default::default(),
+                require_approval: None,
+            }),
+        ],
+        tool_choice: Some(ToolChoice::Raw(
+            json!({"type": "mcp", "server_label": "inventory"}),
+        )),
+        ..LlmRequest::default()
+    };
+    for target in [
+        WireFormat::OpenAiResponses,
+        WireFormat::AnthropicMessages,
+        WireFormat::OpenAiChat,
+    ] {
+        let strict = TranslationPolicy {
+            lossy_conversion_policy: LossyConversionPolicy::Reject,
+            ..TranslationPolicy::default()
+        };
+        assert!(matches!(
+            engine.encode_request(target, &request, &strict),
+            Err(TranslationError::LossyConversion(_))
+        ));
+        let encoded = engine.encode_request(target, &request, &TranslationPolicy::default())?;
+        assert_eq!(encoded.body["tools"].as_array().map(Vec::len), Some(1));
+        assert!(encoded.body.to_string().contains("lookup"));
+        assert!(!encoded.body.to_string().contains("synthetic-secret"));
+        assert!(encoded.body.get("tool_choice").is_none());
+        assert!(!encoded.diagnostics.is_empty());
+    }
+    assert_eq!(request.tools.len(), 2);
     Ok(())
 }

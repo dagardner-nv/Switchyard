@@ -36,10 +36,21 @@ pub fn decode_request(wire_format: WireFormat, body: &Value) -> Result<LlmReques
 }
 
 /// Encodes a normalized request into `wire_format`'s JSON body.
+/// Uses the default permissive policy and logs conversion diagnostics.
 pub fn encode_request(request: &LlmRequest, wire_format: WireFormat) -> Result<Value> {
-    Ok(DEFAULT_TRANSLATION_ENGINE
-        .encode_request(wire_format, request, &DEFAULT_TRANSLATION_POLICY)?
-        .body)
+    let encoded = DEFAULT_TRANSLATION_ENGINE.encode_request(
+        wire_format,
+        request,
+        &DEFAULT_TRANSLATION_POLICY,
+    )?;
+    if !encoded.diagnostics.is_empty() {
+        tracing::warn!(
+            target_format = %wire_format,
+            diagnostics = ?encoded.diagnostics,
+            "translation changed or dropped data"
+        );
+    }
+    Ok(encoded.body)
 }
 
 /// Decodes a buffered `wire_format` response body into the neutral aggregate.
