@@ -16,19 +16,13 @@ base_url = "https://chatgpt.com/backend-api/codex"
 forward_auth = true
 
 [targets.capable]
-id = "gpt-5.6-sol"
+id = "gpt-6-sol"
 llm_client = "chatgpt_backend"
 
+# The classifier and efficient route share Luna. The ChatGPT backend requires
+# store=false and stream=true, and rejects max_output_tokens.
 [targets.efficient]
-id = "gpt-5.6-luna"
-llm_client = "chatgpt_backend"
-
-# chatgpt.com/backend-api/codex is Codex CLI's own private endpoint, not the
-# public OpenAI Responses API. It 400s unless store=false and stream=true are
-# set explicitly, and it rejects max_output_tokens outright, so the
-# classifier's own token cap has to be dropped before the request goes out.
-[targets.terra]
-id = "gpt-5.6-terra"
+id = "gpt-6-luna"
 llm_client = "chatgpt_backend"
 extra_body = { store = false, stream = true }
 omit_body_fields = ["max_output_tokens"]
@@ -38,7 +32,7 @@ id = "switchyard"
 type = "composite"
 
 [routes.switchyard.classifier]
-target = "terra"
+target = "efficient"
 base_threshold = 0.5
 classify_trigger = "user_turn"
 
@@ -99,7 +93,6 @@ codex --profile composite_test
 # public OpenAI Responses API, and it only accepts requests shaped the way
 # the real Codex CLI sends them: store=false and stream=true set explicitly,
 # and no max_output_tokens field at all (it 400s on that one outright). The
-# terra target's extra_body/omit_body_fields above exist to make the
-# classifier's request match that shape; capable/efficient don't need them
-# because they forward the caller's own Responses body verbatim.
+# shared classifier/efficient target enforces those fields with extra_body
+# and omit_body_fields. The capable target uses the caller's Responses settings.
 

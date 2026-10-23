@@ -998,6 +998,11 @@ fn resolve_route(
     mut body: Value,
     wire_format: WireFormat,
 ) -> std::result::Result<(&Route, Request), Response> {
+    eprintln!(
+        "\n*************\n{}\n*************\n",
+        serde_json::to_string_pretty(&body).expect("JSON request body serializes")
+    );
+
     // Only trusted translation hops may supply exact request preservation state.
     // Strip it before decoding and retaining the raw body for upstream replay.
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
@@ -1263,6 +1268,13 @@ fn request_log_level(status: StatusCode) -> Level {
 }
 
 fn metadata_from_headers(headers: HeaderMap) -> Metadata {
+    let header_dump = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", String::from_utf8_lossy(value.as_bytes())))
+        .collect::<Vec<_>>()
+        .join("\n");
+    eprintln!("\n-----------------------\n{header_dump}\n-----------------------\n");
+
     let mut metadata = Metadata::from_headers(&headers);
     metadata.http_headers = Some(headers);
     metadata
