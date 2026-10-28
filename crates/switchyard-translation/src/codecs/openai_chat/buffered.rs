@@ -1076,6 +1076,11 @@ pub(crate) fn encode_openai_content(
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
 ) -> Result<Value> {
+    for block in content {
+        if let ContentBlock::Unknown { provider, raw } = block {
+            reject_responses_builtin_tool_item(provider, raw, WireFormat::OpenAiChat)?;
+        }
+    }
     if content
         .iter()
         .any(|block| matches!(block, ContentBlock::Mcp(_)))
@@ -1149,8 +1154,7 @@ pub(crate) fn encode_openai_content(
                     "MCP history encoding is not implemented".into(),
                 ));
             }
-            ContentBlock::Unknown { provider, raw } => {
-                reject_responses_builtin_tool_item(provider, raw, WireFormat::OpenAiChat)?;
+            ContentBlock::Unknown { raw, .. } => {
                 push_lossy(
                     diagnostics,
                     policy,

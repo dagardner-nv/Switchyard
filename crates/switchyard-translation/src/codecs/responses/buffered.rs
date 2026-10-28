@@ -25,7 +25,7 @@ use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
     AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
-    McpToolConfig, McpToolset, MediaSource, Message, OutputParams, ProviderExtensions,
+    McpContent, McpToolConfig, McpToolset, MediaSource, Message, OutputParams, ProviderExtensions,
     ReasoningParams, ResponseOutput, Role, SamplingParams, StopReason, Tool, ToolCall, ToolChoice,
     ToolDefinition, ToolResult, Usage,
 };
@@ -176,14 +176,6 @@ impl FormatCodec for OpenAiResponsesCodec {
         request: &LlmRequest,
         policy: &TranslationPolicy,
     ) -> Result<EncodedRequest> {
-        // Responses supports MCP history, but Switchyard does not yet encode it.
-        crate::codecs::common::reject_mcp_content(
-            request
-                .instructions
-                .iter()
-                .flat_map(|instruction| &instruction.content)
-                .chain(request.messages.iter().flat_map(|message| &message.content)),
-        )?;
         if let Some(body) =
             exact_preserved_request(&request.preservation, WireFormat::OpenAiResponses, policy)
         {
@@ -427,10 +419,6 @@ impl FormatCodec for OpenAiResponsesCodec {
         response: &AggLlmResponse,
         _policy: &TranslationPolicy,
     ) -> Result<EncodedResponse> {
-        // Responses supports MCP output, but Switchyard does not yet encode it.
-        crate::codecs::common::reject_mcp_content(
-            response.outputs.iter().flat_map(|output| &output.content),
-        )?;
         if let Some(body) =
             exact_preserved_response(&response.preservation, WireFormat::OpenAiResponses, _policy)
         {
@@ -582,6 +570,30 @@ fn decode_responses_input(
                             &mut deferred_messages,
                             &mut pending_reasoning,
                             Message { role, content },
+                        );
+                    }
+                    Some(kind) if super::is_mcp_item(kind) => {
+                        flush_unattached_responses_reasoning(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_tool_outputs,
+                            &mut deferred_messages,
+                            &mut pending_reasoning,
+                        );
+                        push_responses_non_tool_message(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_tool_outputs,
+                            &mut deferred_messages,
+                            &mut pending_reasoning,
+                            Message {
+                                role: if kind == "mcp_approval_response" {
+                                    Role::User
+                                } else {
+                                    Role::Assistant
+                                },
+                                content: decode_mcp_item(item),
+                            },
                         );
                     }
                     Some("reasoning") => {
@@ -1418,6 +1430,131 @@ fn encode_responses_text_format(response_format: &Value) -> Value {
     Value::Object(output)
 }
 
+fn decode_mcp_item(item: &Map<String, Value>) -> Vec<ContentBlock> {
+    let normalized = || -> Option<Vec<ContentBlock>> {
+        match item.get("type")?.as_str()? {
+            "mcp_list_tools" => Some(vec![ContentBlock::Mcp(McpContent::Listing {
+                server_name: item
+                    .get("server_label")
+                    .and_then(string_value)
+                    .unwrap_or_default(),
+                id: item.get("id").and_then(string_value),
+                tools: serde_json::from_value(item.get("tools")?.clone()).ok()?,
+                error: item.get("error").and_then(string_value),
+            })]),
+            "mcp_call" => {
+                let id = item.get("id").and_then(string_value).unwrap_or_default();
+                let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let arguments = arguments
+                    .as_str()
+                    .and_then(|text| serde_json::from_str(text).ok())
+                    .filter(|value: &Value| !value.is_string())
+                    .unwrap_or(arguments);
+                let mut content = vec![ContentBlock::Mcp(McpContent::Call {
+                    server_name: item
+                        .get("server_label")
+                        .and_then(string_value)
+                        .unwrap_or_default(),
+                    call: ToolCall {
+                        id: id.clone(),
+                        name: item.get("name").and_then(string_value).unwrap_or_default(),
+                        arguments,
+                    },
+                })];
+                let error = item.get("error").filter(|value| !value.is_null());
+                let output = item.get("output").filter(|value| !value.is_null());
+                if let Some(value) = error
+                    .map(|error| error.get("content").unwrap_or(error))
+                    .or(output)
+                {
+                    content.push(ContentBlock::Mcp(McpContent::Result(ToolResult {
+                        tool_call_id: id,
+                        content: vec![ContentBlock::Text {
+                            text: json_string(value),
+                        }],
+                        is_error: Some(error.is_some()),
+                    })));
+                }
+                Some(content)
+            }
+            _ => None,
+        }
+    };
+    normalized().unwrap_or_else(|| {
+        vec![ContentBlock::Unknown {
+            provider: WireFormat::OpenAiResponses.into(),
+            raw: Value::Object(item.clone()),
+        }]
+    })
+}
+
+fn is_raw_responses_mcp_block(block: &ContentBlock) -> bool {
+    matches!(block, ContentBlock::Unknown { provider, raw }
+        if provider.as_str() == WireFormat::OpenAiResponses.as_str()
+            && raw["type"].as_str().is_some_and(super::is_mcp_item))
+}
+
+fn collect_mcp_results(content: &[ContentBlock]) -> HashMap<&str, &ToolResult> {
+    let mut results = HashMap::new();
+    for block in content {
+        if let ContentBlock::Mcp(McpContent::Result(result)) = block {
+            results.insert(result.tool_call_id.as_str(), result);
+        }
+    }
+    results
+}
+
+fn encode_mcp_item(
+    block: &ContentBlock,
+    index: usize,
+    results: &mut HashMap<&str, &ToolResult>,
+) -> Option<Value> {
+    match block {
+        ContentBlock::Mcp(McpContent::Call { server_name, call }) => {
+            let (output, error) = if let Some(result) = results.remove(call.id.as_str()) {
+                let text = text_from_blocks(&result.content, " ");
+                if result.is_error == Some(true) {
+                    (
+                        Value::Null,
+                        json!({
+                            "type": "mcp_tool_execution_error",
+                            "content": text,
+                        }),
+                    )
+                } else {
+                    (json!(text), Value::Null)
+                }
+            } else {
+                (Value::Null, Value::Null)
+            };
+            Some(json!({
+                "type": "mcp_call",
+                "id": call.id,
+                "server_label": server_name,
+                "name": call.name,
+                "arguments": json_string(&call.arguments),
+                "output": output,
+                "error": error,
+                "approval_request_id": null,
+            }))
+        }
+        ContentBlock::Mcp(McpContent::Listing {
+            server_name,
+            id,
+            tools,
+            error,
+        }) => Some(json!({
+            "type": "mcp_list_tools",
+            "id": id.clone().unwrap_or_else(|| stable_id("mcpl_switchyard", index + 1)),
+            "server_label": server_name,
+            "tools": tools,
+            "error": error,
+        })),
+        ContentBlock::Unknown { raw, .. } if is_raw_responses_mcp_block(block) => Some(raw.clone()),
+        _ => None,
+    }
+}
+
 // Encodes normalized messages into the Responses `input` shape.
 fn encode_responses_input(
     messages: &[Message],
@@ -1479,23 +1616,31 @@ fn encode_responses_input(
         if content.is_empty() {
             continue;
         }
+        let mut mcp_results = collect_mcp_results(&content);
         if content.iter().any(|block| {
             matches!(
                 block,
-                ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
-            )
+                ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_) | ContentBlock::Mcp(_)
+            ) || is_raw_responses_mcp_block(block)
         }) {
             let mut visible_content = Vec::new();
-            for block in &content {
-                if let Some(item) = encode_responses_special_input(
-                    block,
-                    namespaces,
-                    &call_names,
-                    custom_tools,
-                    &mut custom_call_ids,
-                    diagnostics,
-                    policy,
-                )? {
+            for (index, block) in content.iter().enumerate() {
+                if matches!(block, ContentBlock::Mcp(McpContent::Result(_))) {
+                    continue;
+                }
+                let item = match encode_mcp_item(block, index, &mut mcp_results) {
+                    Some(item) => Some(item),
+                    None => encode_responses_special_input(
+                        block,
+                        namespaces,
+                        &call_names,
+                        custom_tools,
+                        &mut custom_call_ids,
+                        diagnostics,
+                        policy,
+                    )?,
+                };
+                if let Some(item) = item {
                     if !visible_content.is_empty() {
                         let content =
                             encode_responses_content(&visible_content, diagnostics, policy)?;
@@ -2047,6 +2192,12 @@ fn decode_responses_output_item(
         return Ok(None);
     };
     match item.get("type").and_then(Value::as_str) {
+        Some(kind) if super::is_mcp_item(kind) => Ok(Some(ResponseOutput {
+            url_citations: Vec::new(),
+            role: Role::Assistant,
+            content: decode_mcp_item(item),
+            stop_reason: None,
+        })),
         Some("message") => Ok(Some(ResponseOutput {
             url_citations: decode_responses_url_citations(item.get("content")),
             role: role_from_responses(item.get("role").and_then(Value::as_str)),
@@ -2150,8 +2301,15 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
         outputs
             .iter()
             .flat_map(|output| {
+                let mut mcp_results = collect_mcp_results(&output.content);
                 let has_output_items = output.content.iter().any(|block| {
-                    matches!(block, ContentBlock::ToolCall(_))
+                    matches!(
+                        block,
+                        ContentBlock::ToolCall(_)
+                            | ContentBlock::Mcp(
+                                McpContent::Call { .. } | McpContent::Listing { .. }
+                            )
+                    ) || is_raw_responses_mcp_block(block)
                         || matches!(block, ContentBlock::Unknown { provider, raw }
                             if provider.as_str() == WireFormat::OpenAiResponses.as_str()
                                 && raw["type"].as_str().is_some_and(super::is_native_output))
@@ -2231,21 +2389,33 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                     }));
                 }
 
-                items.extend(output.content.iter().filter_map(|block| match block {
-                    ContentBlock::ToolCall(call) => Some(json!({
-                        "type": "function_call",
-                        "call_id": call.id,
-                        "name": call.name,
-                        "arguments": json_string_python_style(&call.arguments),
-                    })),
-                    ContentBlock::Unknown { provider, raw }
-                        if provider.as_str() == WireFormat::OpenAiResponses.as_str()
-                            && raw["type"].as_str().is_some_and(super::is_native_output) =>
-                    {
-                        Some(raw.clone())
-                    }
-                    _ => None,
-                }));
+                items.extend(
+                    output
+                        .content
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, block)| match block {
+                            ContentBlock::Mcp(_) => encode_mcp_item(block, index, &mut mcp_results),
+                            block if is_raw_responses_mcp_block(block) => {
+                                encode_mcp_item(block, index, &mut mcp_results)
+                            }
+                            ContentBlock::ToolCall(call) => Some(json!({
+                                "type": "function_call",
+                                "call_id": call.id,
+                                "name": call.name,
+                                "arguments": json_string_python_style(&call.arguments),
+                            })),
+                            ContentBlock::Unknown { provider, raw }
+                                if provider.as_str() == WireFormat::OpenAiResponses.as_str()
+                                    && raw["type"]
+                                        .as_str()
+                                        .is_some_and(super::is_native_output) =>
+                            {
+                                Some(raw.clone())
+                            }
+                            _ => None,
+                        }),
+                );
 
                 items
             })

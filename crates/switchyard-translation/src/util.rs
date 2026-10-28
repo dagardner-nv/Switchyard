@@ -103,17 +103,20 @@ pub fn push_lossy(
 
 // These Responses history items are valid only as top-level `input` items.
 pub(crate) fn is_responses_builtin_tool_item(item: &Value) -> bool {
-    matches!(
-        item.get("type").and_then(Value::as_str),
-        Some(
-            "apply_patch_call"
-                | "apply_patch_call_output"
-                | "shell_call"
-                | "shell_call_output"
-                | "computer_call"
-                | "computer_call_output"
+    item.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(crate::codecs::responses::is_mcp_item)
+        || matches!(
+            item.get("type").and_then(Value::as_str),
+            Some(
+                "apply_patch_call"
+                    | "apply_patch_call_output"
+                    | "shell_call"
+                    | "shell_call_output"
+                    | "computer_call"
+                    | "computer_call_output"
+            )
         )
-    )
 }
 
 // Prevent provider-specific tool history from being downgraded to target-visible prose.

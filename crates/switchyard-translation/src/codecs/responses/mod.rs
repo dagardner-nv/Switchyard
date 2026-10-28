@@ -9,6 +9,13 @@ mod stream;
 pub use buffered::OpenAiResponsesCodec;
 pub use stream::OpenAiResponsesStreamCodec;
 
+pub(crate) fn is_mcp_item(kind: &str) -> bool {
+    matches!(
+        kind,
+        "mcp_call" | "mcp_list_tools" | "mcp_approval_request" | "mcp_approval_response"
+    )
+}
+
 pub(crate) fn is_native_output(kind: &str) -> bool {
     matches!(
         kind,
@@ -21,8 +28,11 @@ pub(crate) fn validate_response_output(
     target: crate::WireFormat,
 ) -> crate::Result<()> {
     for block in response.outputs.iter().flat_map(|output| &output.content) {
-        if let crate::ContentBlock::Unknown { provider, raw } = block
-            && provider.as_str() == crate::WireFormat::OpenAiResponses.as_str()
+        let crate::ContentBlock::Unknown { provider, raw } = block else {
+            continue;
+        };
+        crate::util::reject_responses_builtin_tool_item(provider, raw, target)?;
+        if provider.as_str() == crate::WireFormat::OpenAiResponses.as_str()
             && raw["type"].as_str().is_some_and(is_native_output)
         {
             return Err(crate::TranslationError::UnsupportedTranslation {
@@ -34,7 +44,7 @@ pub(crate) fn validate_response_output(
     Ok(())
 }
 
-// Native outputs have no neutral streaming representation; inspect them before discarding raw events.
+// Check unsupported output items before discarding raw events.
 pub(crate) fn validate_stream_output(
     source: &crate::FormatId,
     target: &crate::FormatId,
@@ -45,7 +55,12 @@ pub(crate) fn validate_stream_output(
             .get("item")
             .into_iter()
             .chain(event["response"]["output"].as_array().into_iter().flatten());
-        if items.any(|item| item["type"].as_str().is_some_and(is_native_output)) {
+        // MCP has a typed IR, but its streaming translation is not implemented.
+        if items.any(|item| {
+            item["type"]
+                .as_str()
+                .is_some_and(|kind| is_native_output(kind) || is_mcp_item(kind))
+        }) {
             return Err(crate::TranslationError::UnsupportedTranslation {
                 from: source.clone(),
                 to: target.clone(),

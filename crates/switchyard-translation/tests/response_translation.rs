@@ -1713,7 +1713,7 @@ mod anthropic_mcp_content {
     }
 
     #[test]
-    fn unsupported_targets_reject_mcp_before_replay() -> TestResult {
+    fn mcp_content_reconstruction_and_replay() -> TestResult {
         use LossyConversionPolicy::{AllowWithDiagnostics, Reject};
         use PreservationPolicy::{Disabled, InMemory};
 
@@ -1745,6 +1745,35 @@ mod anthropic_mcp_content {
                     lossy_conversion_policy,
                     ..Default::default()
                 };
+                // Responses follows the same exact-replay contract as function tools.
+                if target == WireFormat::OpenAiResponses && preservation == InMemory {
+                    assert_eq!(
+                        engine.encode_request(target, &request, &policy)?.body,
+                        json!({"cached": true})
+                    );
+                    assert_eq!(
+                        engine.encode_response(target, &response, &policy)?.body,
+                        json!({"cached": true})
+                    );
+                    continue;
+                }
+                if target == WireFormat::OpenAiResponses {
+                    for items in [
+                        engine.encode_request(target, &request, &policy)?.body["input"].clone(),
+                        engine.encode_response(target, &response, &policy)?.body["output"].clone(),
+                    ] {
+                        let call = items
+                            .as_array()
+                            .ok_or("items array")?
+                            .iter()
+                            .find(|item| item["type"] == "mcp_call")
+                            .ok_or("MCP call")?;
+                        assert_eq!(call["id"], "sy64_Y2FsbA");
+                        assert_eq!(call["output"], "12 widgets");
+                        assert_eq!(call["error"], Value::Null);
+                    }
+                    continue;
+                }
                 assert!(
                     matches!(
                         engine.encode_request(target, &request, &policy),
@@ -1823,6 +1852,527 @@ mod anthropic_mcp_content {
             policy.lossy_conversion_policy = LossyConversionPolicy::AllowWithDiagnostics;
             let encoded = engine.encode_request(ANTHROPIC, &request, &policy)?;
             assert_eq!(encoded.diagnostics.len(), 1);
+        }
+        Ok(())
+    }
+}
+
+mod responses_mcp_content {
+    use serde_json::{Value, json};
+    use switchyard_translation::{
+        ContentBlock, McpContent, PreservationPolicy, StopReason, TranslationEngine,
+        TranslationPolicy, WireFormat,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    const RESPONSES: WireFormat = WireFormat::OpenAiResponses;
+    const ANTHROPIC: WireFormat = WireFormat::AnthropicMessages;
+
+    fn call(id: &str) -> Value {
+        json!({"type": "mcp_call", "id": id, "server_label": "inventory", "name": "lookup",
+            "arguments": "{\"sku\":\"widget\"}", "output": "12 widgets", "error": null,
+            "approval_request_id": null})
+    }
+
+    fn response(output: Value) -> Value {
+        json!({"id": "resp_1", "model": "test", "status": "completed", "output": output,
+            "usage": {"input_tokens": 2, "output_tokens": 3}})
+    }
+
+    fn normalized() -> TranslationPolicy {
+        TranslationPolicy {
+            preservation: PreservationPolicy::Disabled,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn responses_mcp_normalizes_listings_pending_calls_and_failures() -> TestResult {
+        let engine = TranslationEngine::default();
+        let listing = json!({
+            "type": "mcp_list_tools",
+            "id": "list_1",
+            "server_label": "inventory",
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up stock",
+                "input_schema": {"type": "object"},
+                "annotations": {"read_only": true}
+            }],
+            "error": null
+        });
+        let mut pending = call("pending");
+        pending["output"] = Value::Null;
+        pending["status"] = json!("in_progress");
+        let mut failed = call("failed");
+        failed["output"] = Value::Null;
+        failed["error"] = json!({"type": "mcp_tool_execution_error", "content": "unavailable"});
+        let failed_listing = json!({
+            "type": "mcp_list_tools",
+            "id": "list_failed",
+            "server_label": "inventory",
+            "tools": [],
+            "error": "unavailable"
+        });
+        let items = json!([listing, pending, failed, failed_listing]);
+        let decoded = engine
+            .decode_response(RESPONSES, &response(items.clone()), &normalized())?
+            .response;
+        let request = engine
+            .decode_request(RESPONSES, &json!({"input": items}), &normalized())?
+            .request;
+        for content in [
+            decoded
+                .outputs
+                .iter()
+                .flat_map(|output| &output.content)
+                .collect::<Vec<_>>(),
+            request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .collect::<Vec<_>>(),
+        ] {
+            assert!(
+                content
+                    .iter()
+                    .all(|block| matches!(block, ContentBlock::Mcp(_)))
+            );
+            assert!(
+                matches!(content[0], ContentBlock::Mcp(McpContent::Listing { tools, .. })
+                if tools[0].annotations == Some(json!({"read_only": true})))
+            );
+            assert!(
+                matches!(content[1], ContentBlock::Mcp(McpContent::Call { call, .. }) if call.id == "pending")
+            );
+            assert!(
+                matches!(content[3], ContentBlock::Mcp(McpContent::Result(result)) if result.is_error == Some(true))
+            );
+        }
+        for encoded in [
+            engine
+                .encode_response(RESPONSES, &decoded, &normalized())?
+                .body["output"]
+                .clone(),
+            engine
+                .encode_request(RESPONSES, &request, &normalized())?
+                .body["input"]
+                .clone(),
+        ] {
+            assert_eq!(encoded[0], listing);
+            assert_eq!(encoded[1]["output"], Value::Null);
+            assert_eq!(encoded[2], failed);
+            assert_eq!(encoded[3], failed_listing);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_mcp_calls_round_trip_in_responses_and_history() -> TestResult {
+        let engine = TranslationEngine::default();
+        let items = json!([call("mcp_1"), call("mcp_2")]);
+        let body = response(items.clone());
+        let history = json!({"model": "test", "input": items});
+        for policy in [TranslationPolicy::default(), normalized()] {
+            let mut decoded = engine.decode_response(RESPONSES, &body, &policy)?.response;
+            assert!(
+                matches!(&decoded.outputs[0].content[0], ContentBlock::Mcp(McpContent::Call { call, .. })
+                if call.id == "mcp_1" && call.arguments == json!({"sku": "widget"}))
+            );
+            assert_ne!(decoded.outputs[0].stop_reason, Some(StopReason::ToolUse));
+            let mut request = engine.decode_request(RESPONSES, &history, &policy)?.request;
+            assert_eq!(
+                engine.encode_response(RESPONSES, &decoded, &policy)?.body["output"],
+                items
+            );
+            assert_eq!(
+                engine.encode_request(RESPONSES, &request, &policy)?.body["input"],
+                items
+            );
+            if policy.preservation == PreservationPolicy::InMemory {
+                assert_eq!(
+                    engine.encode_response(RESPONSES, &decoded, &policy)?.body,
+                    body
+                );
+                assert_eq!(
+                    engine.encode_request(RESPONSES, &request, &policy)?.body,
+                    history
+                );
+            }
+            let anthropic =
+                engine.translate_response(RESPONSES, ANTHROPIC, &body, &normalized())?;
+            assert_eq!(
+                engine
+                    .translate_response(ANTHROPIC, RESPONSES, &anthropic.body, &normalized())?
+                    .body["output"],
+                items
+            );
+            let anthropic =
+                engine.translate_request(RESPONSES, ANTHROPIC, &history, &normalized())?;
+            assert_eq!(
+                engine
+                    .translate_request(ANTHROPIC, RESPONSES, &anthropic.body, &normalized())?
+                    .body["input"],
+                items
+            );
+            for content in [
+                &mut decoded.outputs[0].content,
+                &mut request.messages[0].content,
+            ] {
+                let ContentBlock::Mcp(McpContent::Call { call, .. }) = &mut content[0] else {
+                    return Err("expected MCP call".into());
+                };
+                call.arguments = json!({"sku": "updated"});
+                let ContentBlock::Mcp(McpContent::Result(result)) = &mut content[1] else {
+                    return Err("expected MCP result".into());
+                };
+                result.content.clear();
+            }
+            decoded.preservation.responses.clear();
+            request.preservation.requests.clear();
+            for item in [
+                engine.encode_response(RESPONSES, &decoded, &policy)?.body["output"][0].clone(),
+                engine.encode_request(RESPONSES, &request, &policy)?.body["input"][0].clone(),
+            ] {
+                assert_eq!(item["arguments"], "{\"sku\":\"updated\"}");
+                assert_eq!(item["output"], "");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_mcp_encoding_does_not_validate_id_uniqueness() -> TestResult {
+        let engine = TranslationEngine::default();
+        let mut decoded = engine
+            .decode_response(RESPONSES, &response(json!([call("mcp_1")])), &normalized())?
+            .response;
+        decoded.outputs[0].content.extend_from_within(1..2);
+        assert_eq!(
+            engine
+                .encode_response(RESPONSES, &decoded, &normalized())?
+                .body["output"],
+            json!([call("mcp_1")])
+        );
+
+        let mut request = engine
+            .decode_request(RESPONSES, &json!({"input": [call("mcp_1")]}), &normalized())?
+            .request;
+        request.messages.push(request.messages[0].clone());
+        assert_eq!(
+            engine
+                .encode_request(RESPONSES, &request, &normalized())?
+                .body["input"],
+            json!([call("mcp_1"), call("mcp_1")])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn responses_mcp_preserves_opaque_items() -> TestResult {
+        let engine = TranslationEngine::default();
+        let approval = json!({"type": "mcp_approval_request", "id": "approval_1", "server_label": "inventory",
+            "name": "lookup", "arguments": "{}"});
+        let approved = json!({"type": "mcp_approval_response", "approval_request_id": "approval_1", "approve": true});
+        let items = json!([
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Before"}]},
+            call("mcp_1"),
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque", "summary": [{"type": "summary_text", "text": "Checking"}]},
+            approval, approved,
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "After"}]}
+        ]);
+        let history = json!({"input": items});
+        let encoded = engine
+            .translate_response(
+                RESPONSES,
+                RESPONSES,
+                &response(items.clone()),
+                &normalized(),
+            )?
+            .body["output"]
+            .clone();
+        assert_eq!(encoded.as_array().ok_or("expected array")?.len(), 5);
+        assert_eq!(encoded[0]["id"], "rs_1");
+        assert_eq!(encoded[1]["content"][0]["text"], "BeforeAfter");
+        assert_eq!(encoded[2], items[1]);
+        assert_eq!(encoded[3], approval);
+        assert_eq!(encoded[4], approved);
+
+        let encoded = engine
+            .translate_request(RESPONSES, RESPONSES, &history, &normalized())?
+            .body["input"]
+            .clone();
+        assert_eq!(encoded.as_array().ok_or("expected array")?.len(), 6);
+        for index in [1, 3, 4] {
+            assert_eq!(encoded[index], items[index]);
+        }
+        let text = |item: &Value| {
+            item["content"]
+                .as_str()
+                .or_else(|| item["content"][0]["text"].as_str())
+                .map(str::to_owned)
+        };
+        assert_eq!(text(&encoded[0]).as_deref(), Some("Before"));
+        assert_eq!(encoded[2]["id"], "rs_1");
+        assert_eq!(text(&encoded[5]).as_deref(), Some("After"));
+        for item in [approval, approved] {
+            let encoded = engine.translate_response(
+                RESPONSES,
+                RESPONSES,
+                &response(json!([item])),
+                &normalized(),
+            )?;
+            assert_eq!(encoded.body["output"], json!([item]));
+            for target in [ANTHROPIC, WireFormat::OpenAiChat] {
+                assert!(
+                    engine
+                        .translate_response(
+                            RESPONSES,
+                            target,
+                            &response(json!([item])),
+                            &normalized()
+                        )
+                        .is_err()
+                );
+                assert!(
+                    engine
+                        .translate_request(
+                            RESPONSES,
+                            target,
+                            &json!({"input": [item]}),
+                            &normalized()
+                        )
+                        .is_err()
+                );
+            }
+        }
+        for frame in [
+            json!({"type": "response.output_item.done", "output_index": 0, "item": call("mcp_1")}),
+            json!({"type": "response.completed", "response": response(json!([call("mcp_1")]))}),
+        ] {
+            use switchyard_translation::StreamTranslationState;
+            let mut decoder = StreamTranslationState::default();
+            let event = engine.decode_stream_event(&mut decoder, RESPONSES, frame.clone())?;
+            let mut encoder = StreamTranslationState::default();
+            assert_eq!(
+                engine.encode_stream_event(&mut encoder, RESPONSES, event.clone())?,
+                vec![frame.clone()]
+            );
+            for target in [ANTHROPIC, WireFormat::OpenAiChat] {
+                let mut encoder = StreamTranslationState::default();
+                let errors = engine.encode_stream_event(&mut encoder, target, event.clone())?;
+                assert!(encoder.errored && errors.len() == 1 && errors[0]["error"].is_object());
+                assert!(engine.finish_stream(&mut encoder, target)?.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_mcp_follows_function_tool_output_order() -> TestResult {
+        let engine = TranslationEngine::default();
+        let body = response(json!([call("mcp_1"), call("mcp_2")]));
+        let mut decoded = engine
+            .decode_response(RESPONSES, &body, &normalized())?
+            .response;
+        let blocks = decoded.outputs[0].content.clone();
+        let text = |text: &str| ContentBlock::Text { text: text.into() };
+        let reasoning = || ContentBlock::Reasoning {
+            text: "Check".into(),
+            signature: None,
+            details: vec![],
+        };
+        decoded.outputs[0].content = vec![
+            text("é😀"),
+            blocks[0].clone(),
+            text("中"),
+            reasoning(),
+            blocks[2].clone(),
+            ContentBlock::ToolCall(switchyard_translation::ToolCall {
+                id: "local_1".into(),
+                name: "local".into(),
+                arguments: json!({}),
+            }),
+            reasoning(),
+            blocks[3].clone(),
+            blocks[1].clone(),
+            text("Done"),
+        ];
+        decoded.outputs[0].url_citations = vec![switchyard_translation::UrlCitation {
+            start_index: 1,
+            end_index: 3,
+            url: "https://example.test".into(),
+            title: "Stock".into(),
+        }];
+        let encoded = engine
+            .encode_response(RESPONSES, &decoded, &normalized())?
+            .body;
+        let items = encoded["output"].as_array().ok_or("output array")?;
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            [
+                "reasoning",
+                "message",
+                "mcp_call",
+                "mcp_call",
+                "function_call"
+            ]
+        );
+        assert_eq!(items[0]["summary"][0]["text"], "Check\nCheck");
+        assert_eq!(items[1]["content"][0]["text"], "é😀中Done");
+        assert_eq!(items[1]["content"][0]["annotations"][0]["start_index"], 1);
+        assert_eq!(items[1]["content"][0]["annotations"][0]["end_index"], 3);
+        assert_eq!(items[2], call("mcp_1"));
+        assert_eq!(items[3], call("mcp_2"));
+        assert_eq!(items[4]["call_id"], "local_1");
+        let mut request = engine
+            .decode_request(RESPONSES, &json!({"input": [call("mcp_1")]}), &normalized())?
+            .request;
+        request.messages[0].content = decoded.outputs[0].content.clone();
+        let encoded = engine
+            .encode_request(RESPONSES, &request, &normalized())?
+            .body;
+        let history = encoded["input"].as_array().ok_or("input array")?;
+        assert_eq!(
+            history
+                .iter()
+                .map(|item| item["type"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            [
+                "message",
+                "mcp_call",
+                "message",
+                "reasoning",
+                "mcp_call",
+                "function_call",
+                "reasoning",
+                "message"
+            ]
+        );
+        let calls = history
+            .iter()
+            .filter(|item| item["type"] == "mcp_call")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(calls, [call("mcp_1"), call("mcp_2")]);
+        Ok(())
+    }
+
+    #[test]
+    fn responses_mcp_encodes_available_results_without_preflight_validation() -> TestResult {
+        let engine = TranslationEngine::default();
+        let mut decoded = engine
+            .decode_response(RESPONSES, &response(json!([call("mcp_1")])), &normalized())?
+            .response;
+        let mut request = engine
+            .decode_request(RESPONSES, &json!({"input": [call("mcp_1")]}), &normalized())?
+            .request;
+        let blocks = decoded.outputs[0].content.clone();
+        let mut failed = blocks[1].clone();
+        let ContentBlock::Mcp(McpContent::Result(result)) = &mut failed else {
+            return Err("result".into());
+        };
+        result.is_error = Some(true);
+        result.content = vec![ContentBlock::Text {
+            text: "unavailable".into(),
+        }];
+        let mut multiple = blocks[1].clone();
+        let ContentBlock::Mcp(McpContent::Result(result)) = &mut multiple else {
+            return Err("result".into());
+        };
+        result.content.push(ContentBlock::Refusal {
+            text: "more text".into(),
+        });
+        let mut unchecked = blocks[0].clone();
+        let ContentBlock::Mcp(McpContent::Call {
+            server_name, call, ..
+        }) = &mut unchecked
+        else {
+            return Err("call".into());
+        };
+        server_name.clear();
+        call.name.clear();
+        call.arguments = json!([1, 2]);
+        for (content, output, error, arguments) in [
+            (
+                vec![blocks[0].clone()],
+                Value::Null,
+                Value::Null,
+                json!("{\"sku\":\"widget\"}"),
+            ),
+            (
+                vec![blocks[1].clone(), blocks[0].clone()],
+                json!("12 widgets"),
+                Value::Null,
+                json!("{\"sku\":\"widget\"}"),
+            ),
+            (
+                vec![blocks[0].clone(), failed],
+                Value::Null,
+                json!({"type": "mcp_tool_execution_error", "content": "unavailable"}),
+                json!("{\"sku\":\"widget\"}"),
+            ),
+            (
+                vec![blocks[0].clone(), multiple],
+                json!("12 widgets more text"),
+                Value::Null,
+                json!("{\"sku\":\"widget\"}"),
+            ),
+            (
+                vec![unchecked, blocks[1].clone()],
+                json!("12 widgets"),
+                Value::Null,
+                json!("[1,2]"),
+            ),
+        ] {
+            decoded.outputs[0].content = content.clone();
+            request.messages[0].content = content;
+            for item in [
+                engine
+                    .encode_response(RESPONSES, &decoded, &normalized())?
+                    .body["output"][0]
+                    .clone(),
+                engine
+                    .encode_request(RESPONSES, &request, &normalized())?
+                    .body["input"][0]
+                    .clone(),
+            ] {
+                assert_eq!(item["output"], output);
+                assert_eq!(item["error"], error);
+                assert_eq!(item["arguments"], arguments);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_mcp_normalizes_call_fields() -> TestResult {
+        let engine = TranslationEngine::default();
+        for (field, value) in [
+            ("id", json!("")),
+            ("server_label", Value::Null),
+            ("name", json!(4)),
+            ("arguments", json!("[]")),
+            ("arguments", json!("{")),
+            ("output", Value::Null),
+            ("extra", json!(true)),
+        ] {
+            let mut item = call("mcp_1");
+            item[field] = value;
+            let decoded = engine
+                .decode_response(RESPONSES, &response(json!([item])), &normalized())?
+                .response;
+            assert!(matches!(
+                &decoded.outputs[0].content[0],
+                ContentBlock::Mcp(McpContent::Call { .. })
+            ));
+            let encoded = engine
+                .encode_response(RESPONSES, &decoded, &normalized())?
+                .body;
+            assert_eq!(encoded["output"][0]["type"], "mcp_call");
         }
         Ok(())
     }
