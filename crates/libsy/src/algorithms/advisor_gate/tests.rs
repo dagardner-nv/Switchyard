@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use switchyard_protocol::{ResponseOutput, ToolCall, ToolResult, completion_text};
+use switchyard_protocol::{
+    ContentBlockKind, ResponseOutput, ToolCall, ToolResult, completion_text,
+};
 
 use futures::StreamExt;
 use switchyard_protocol::{
@@ -85,7 +87,7 @@ fn tool_call_turn() -> Response {
         llm_response: LlmResponse::Agg(AggLlmResponse {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolCall(ToolCall {
+                content: vec![ContentBlock::tool_call(ToolCall {
                     id: "t1".to_string(),
                     name: "bash".to_string(),
                     arguments: serde_json::json!({}),
@@ -105,9 +107,7 @@ fn tool_use_stop_turn() -> Response {
         llm_response: LlmResponse::Agg(AggLlmResponse {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "calling a tool".to_string(),
-                }],
+                content: vec![ContentBlock::text("calling a tool".to_string())],
                 url_citations: Vec::new(),
                 stop_reason: Some(StopReason::ToolUse),
             }],
@@ -123,11 +123,11 @@ fn reasoning_only_turn() -> Response {
         llm_response: LlmResponse::Agg(AggLlmResponse {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Reasoning {
+                content: vec![ContentBlock::new(ContentBlockKind::Reasoning {
                     text: "thinking about it".to_string(),
                     signature: None,
                     details: Vec::new(),
-                }],
+                })],
                 url_citations: Vec::new(),
                 stop_reason: None,
             }],
@@ -472,8 +472,8 @@ async fn over_cap_consult_flags_truncation_to_the_reviewer() {
     let contract: String = consult.llm_request.instructions[0]
         .content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -915,10 +915,8 @@ async fn pattern_trigger_matches_on_tool_call_turns() {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
                 content: vec![
-                    ContentBlock::Text {
-                        text: "task_complete: true".to_string(),
-                    },
-                    ContentBlock::ToolCall(ToolCall {
+                    ContentBlock::text("task_complete: true".to_string()),
+                    ContentBlock::tool_call(ToolCall {
                         id: "t1".to_string(),
                         name: "bash".to_string(),
                         arguments: serde_json::json!({}),
@@ -960,11 +958,9 @@ async fn min_tool_results_defers_gate() {
         Message::text(Role::User, "build X"),
         Message {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: "t1".to_string(),
-                content: vec![ContentBlock::Text {
-                    text: "ok".to_string(),
-                }],
+                content: vec![ContentBlock::text("ok".to_string())],
                 is_error: None,
             })],
         },
@@ -984,11 +980,9 @@ async fn min_tool_results_counts_batched_result_blocks() {
         ..AdvisorGateConfig::default()
     });
     let tool_result = |id: &str| {
-        ContentBlock::ToolResult(ToolResult {
+        ContentBlock::tool_result(ToolResult {
             tool_call_id: id.to_string(),
-            content: vec![ContentBlock::Text {
-                text: "ok".to_string(),
-            }],
+            content: vec![ContentBlock::text("ok".to_string())],
             is_error: None,
         })
     };
@@ -1270,9 +1264,7 @@ async fn consult_request_shape() {
     assert_eq!(consult.instructions.len(), 1);
     assert_eq!(
         consult.instructions[0].content,
-        vec![ContentBlock::Text {
-            text: REVIEWER_SYSTEM_PROMPT.to_string()
-        }]
+        vec![ContentBlock::text(REVIEWER_SYSTEM_PROMPT.to_string())]
     );
     assert_eq!(consult.messages.len(), 1);
     assert_eq!(consult.messages[0].role, Role::User);
@@ -1295,9 +1287,9 @@ async fn consult_transcript_includes_system_instructions() {
     let mut gated = task_request();
     gated.llm_request.instructions = vec![InstructionBlock {
         role: Role::System,
-        content: vec![ContentBlock::Text {
-            text: "the deliverable must be a CSV".to_string(),
-        }],
+        content: vec![ContentBlock::text(
+            "the deliverable must be a CSV".to_string(),
+        )],
     }];
     test_drive(gate, gated, serve).await.expect("routes");
     // System content is normalized out of `messages`; the advisor still

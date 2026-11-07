@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use http::HeaderMap;
-use switchyard_protocol::{ContentBlock, LlmRequest, Message, Role};
+use switchyard_protocol::{ContentBlock, ContentBlockKind, LlmRequest, Message, Role};
 
 /// Normalizes current and historical compaction signals, preserving explicit IR annotations.
 pub fn normalize_compaction(request: &mut LlmRequest, headers: Option<&HeaderMap>) {
@@ -14,8 +14,8 @@ pub fn normalize_compaction(request: &mut LlmRequest, headers: Option<&HeaderMap
         .messages
         .iter()
         .flat_map(|message| &message.content)
-        .any(|block| match block {
-            ContentBlock::Text { text } => {
+        .any(|block| match &block.kind {
+            ContentBlockKind::Text { text } => {
                 let text = text.to_lowercase();
                 text.contains("session is being continued") || has_hermes_marker(&text)
             }
@@ -37,7 +37,7 @@ fn is_environment_update(message: &Message) -> bool {
     message.role == Role::User
         && !message.content.is_empty()
         && message.content.iter().all(|block| {
-            matches!(block, ContentBlock::Text { text } if text.trim()
+            matches!(&block.kind, ContentBlockKind::Text { text } if text.trim()
             .strip_prefix("<environment_context>")
             .and_then(|context| context.split_once("</environment_context>"))
             .is_some_and(|(_, rest)| rest.trim().is_empty()))
@@ -47,8 +47,8 @@ fn is_environment_update(message: &Message) -> bool {
 fn is_compaction_message(message: &Message) -> bool {
     let mut has_summary = false;
     for block in &message.content {
-        match block {
-            ContentBlock::Image { .. } => {}
+        match &block.kind {
+            ContentBlockKind::Image { .. } => {}
             _ if is_compaction_block(block) => has_summary = true,
             _ => return false,
         }
@@ -57,12 +57,12 @@ fn is_compaction_message(message: &Message) -> bool {
 }
 
 fn is_compaction_block(block: &ContentBlock) -> bool {
-    match block {
-        ContentBlock::Unknown { raw, .. } => matches!(
+    match &block.kind {
+        ContentBlockKind::Unknown { raw, .. } => matches!(
             raw.get("type").and_then(serde_json::Value::as_str),
             Some("compaction" | "context_compaction" | "compaction_trigger")
         ),
-        ContentBlock::Text { text } => {
+        ContentBlockKind::Text { text } => {
             let text = text.trim().to_ascii_lowercase();
             text.starts_with("another language model started to solve this problem and produced a summary of its thinking process.")
                 || text.starts_with("this session is being continued from a previous conversation that ran out of context.")

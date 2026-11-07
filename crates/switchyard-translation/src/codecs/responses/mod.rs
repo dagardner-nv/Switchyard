@@ -21,7 +21,7 @@ pub(crate) fn validate_response_output(
     target: crate::WireFormat,
 ) -> crate::Result<()> {
     for block in response.outputs.iter().flat_map(|output| &output.content) {
-        if let crate::ContentBlock::Unknown { provider, raw } = block
+        if let crate::ContentBlockKind::Unknown { provider, raw } = &block.kind
             && provider.as_str() == crate::WireFormat::OpenAiResponses.as_str()
             && raw["type"].as_str().is_some_and(is_native_output)
         {

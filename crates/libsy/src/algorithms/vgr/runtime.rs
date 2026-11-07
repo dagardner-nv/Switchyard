@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use switchyard_protocol::{
-    AggLlmResponse, ContentBlock, Message, ModelId, Request, Response, StopReason,
+    AggLlmResponse, ContentBlock, ContentBlockKind, Message, ModelId, Request, Response, StopReason,
 };
 
 use super::config::{ServingMode, VgrConfig};
@@ -678,7 +678,7 @@ fn tool_use_is_complete(response: &AggLlmResponse) -> bool {
     response.outputs.iter().all(|output| {
         output.stop_reason != Some(StopReason::MaxTokens)
             && output.content.iter().all(|block| {
-                !matches!(block, ContentBlock::ToolCall(call) if call.arguments.is_string())
+                !matches!(&block.kind, ContentBlockKind::ToolCall(call) if call.arguments.is_string())
             })
     })
 }
@@ -686,9 +686,9 @@ fn tool_use_is_complete(response: &AggLlmResponse) -> bool {
 /// Whether a request carries image content directly or inside a tool result.
 fn request_has_image(request: &Request) -> bool {
     fn has_image(block: &ContentBlock) -> bool {
-        match block {
-            ContentBlock::Image { .. } => true,
-            ContentBlock::ToolResult(result) => result.content.iter().any(has_image),
+        match &block.kind {
+            ContentBlockKind::Image { .. } => true,
+            ContentBlockKind::ToolResult(result) => result.content.iter().any(has_image),
             _ => false,
         }
     }

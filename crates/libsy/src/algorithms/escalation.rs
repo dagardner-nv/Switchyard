@@ -442,8 +442,8 @@ mod tests {
 
     use parking_lot::Mutex;
     use switchyard_protocol::{
-        ContentBlock, LlmClientError, LlmResponse, LlmResponseChunk, Metadata, ModelId, Request,
-        Response, completion_text, text_request, text_response,
+        ContentBlockKind, LlmClientError, LlmResponse, LlmResponseChunk, Metadata, ModelId,
+        Request, Response, completion_text, text_request, text_response,
     };
 
     use super::*;
@@ -673,10 +673,13 @@ mod tests {
                     .instructions
                     .first()
                     .and_then(|instruction| {
-                        instruction.content.iter().find_map(|block| match block {
-                            ContentBlock::Text { text } => Some(text.clone()),
-                            _ => None,
-                        })
+                        instruction
+                            .content
+                            .iter()
+                            .find_map(|block| match &block.kind {
+                                ContentBlockKind::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
                     });
                 recorded.lock().extend(prompt);
                 std::future::ready(Ok(reply(

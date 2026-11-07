@@ -519,9 +519,9 @@ impl AdvisorGate {
                 model: base.llm_request.model.clone(),
                 instructions: vec![InstructionBlock {
                     role: Role::System,
-                    content: vec![ContentBlock::Text {
-                        text: self.config.reviewer_system_prompt.clone(),
-                    }],
+                    content: vec![ContentBlock::text(
+                        self.config.reviewer_system_prompt.clone(),
+                    )],
                 }],
                 messages: vec![Message::text(Role::User, transcript)],
                 sampling: SamplingParams {

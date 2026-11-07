@@ -18,7 +18,7 @@ Responses, or Chat Completions.
 separates instructions from conversation turns. A
 <a href="../../rust/switchyard_protocol/llm/struct.Message.html"><code>Message</code></a>
 contains a role and ordered
-<a href="../../rust/switchyard_protocol/llm/enum.ContentBlock.html"><code>ContentBlock</code></a>
+<a href="../../rust/switchyard_protocol/llm/struct.ContentBlock.html"><code>ContentBlock</code></a>
 values. Content can include text, media, reasoning, tool calls, and tool results.
 
 This example constructs the neutral request passed to an algorithm. It
@@ -31,7 +31,7 @@ let request = Request {
     llm_request: LlmRequest {
         instructions: vec![InstructionBlock {
             role: Role::System,
-            content: vec![ContentBlock::Text { text: "Answer briefly.".into() }],
+            content: vec![ContentBlock::text("Answer briefly.")],
         }],
         messages: vec![Message::text(Role::User, "Explain tail latency.")],
         ..LlmRequest::default()

@@ -1134,8 +1134,8 @@ mod tests {
     use http::StatusCode;
     use switchyard_libsy::{Driver, RoutingOutcome};
     use switchyard_protocol::{
-        ContentBlock, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Message, Role,
-        ToolResult, completion_text, text_request, text_response,
+        ContentBlock, ContentBlockKind, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent,
+        Message, Role, ToolResult, completion_text, text_request, text_response,
     };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1542,8 +1542,8 @@ mod tests {
             .instructions
             .iter()
             .flat_map(|instruction| &instruction.content)
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+            .filter_map(|block| match &block.kind {
+                ContentBlockKind::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
@@ -2136,11 +2136,9 @@ mod tests {
             .insert("previous_response_id".to_string(), json!("msg_stream"));
         follow.llm_request.messages = vec![Message {
             role: Role::Tool,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: "toolu_stream".to_string(),
-                content: vec![ContentBlock::Text {
-                    text: "ready".to_string(),
-                }],
+                content: vec![ContentBlock::text("ready".to_string())],
                 is_error: None,
             })],
         }];
@@ -2161,11 +2159,11 @@ mod tests {
         assert_eq!(outcome.request.llm_request.messages.len(), 3);
         assert!(matches!(
             outcome.request.llm_request.messages[1].content.as_slice(),
-            [ContentBlock::ToolCall(call)] if call.id == "toolu_stream"
+            [ContentBlock { kind: ContentBlockKind::ToolCall(call), .. }] if call.id == "toolu_stream"
         ));
         assert!(matches!(
             outcome.request.llm_request.messages[2].content.as_slice(),
-            [ContentBlock::ToolResult(result)] if result.tool_call_id == "toolu_stream"
+            [ContentBlock { kind: ContentBlockKind::ToolResult(result), .. }] if result.tool_call_id == "toolu_stream"
         ));
         Ok(())
     }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use switchyard_protocol::{Category, ContentBlock, Message, Role};
+use switchyard_protocol::{Category, ContentBlock, ContentBlockKind, Message, Role};
 
 mod decision;
 pub use decision::{DecisionChoice, DecisionJudgeConfig, DirectClassifierConfig};
@@ -140,11 +140,11 @@ fn window_start(tail: &[&Message], recent_turn_window: usize) -> usize {
         // Blocks reverse too, so a call answers a result only when it precedes it inside
         // one message as well as across messages.
         for block in message.content.iter().rev() {
-            match block {
-                ContentBlock::ToolResult(result) => {
+            match &block.kind {
+                ContentBlockKind::ToolResult(result) => {
                     unpaired.insert(result.tool_call_id.as_str());
                 }
-                ContentBlock::ToolCall(call) => {
+                ContentBlockKind::ToolCall(call) => {
                     unpaired.remove(call.id.as_str());
                 }
                 _ => {}
@@ -163,10 +163,10 @@ fn task_messages(messages: &[Message]) -> Vec<Message> {
     // first, so a tool result cannot replace the opening task or latest follow-up.
     let is_task_content = |block: &ContentBlock| {
         !matches!(
-            block,
-            ContentBlock::ToolCall(_)
-                | ContentBlock::ToolResult(_)
-                | ContentBlock::Reasoning { .. }
+            &block.kind,
+            ContentBlockKind::ToolCall(_)
+                | ContentBlockKind::ToolResult(_)
+                | ContentBlockKind::Reasoning { .. }
         )
     };
     let mut user_messages = messages
@@ -211,7 +211,7 @@ impl TaskInput {
         for message in &mut messages {
             message
                 .content
-                .retain(|block| !matches!(block, ContentBlock::Reasoning { .. }));
+                .retain(|block| !matches!(&block.kind, ContentBlockKind::Reasoning { .. }));
         }
         messages.retain(|message| !message.content.is_empty());
         messages
@@ -930,8 +930,8 @@ mod tests {
 
     use super::*;
     use switchyard_protocol::{
-        ContentBlock, InstructionBlock, LlmClientError, LlmRequest, Metadata, ModelId, ToolCall,
-        ToolResult, completion_text, text_request, text_response,
+        ContentBlock, ContentBlockKind, InstructionBlock, LlmClientError, LlmRequest, Metadata,
+        ModelId, ToolCall, ToolResult, completion_text, text_request, text_response,
     };
 
     use crate::algorithms::util::llm_judge::Judge;
@@ -1053,7 +1053,7 @@ mod tests {
                                 .first()
                                 .and_then(|instruction| {
                                     instruction.content.iter().find_map(|b| {
-                                        if let ContentBlock::Text { text } = b {
+                                        if let ContentBlockKind::Text { text } = &b.kind {
                                             Some(text.clone())
                                         } else {
                                             None
@@ -1563,14 +1563,12 @@ mod tests {
         request.llm_request.messages.push(Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Reasoning {
+                ContentBlock::new(ContentBlockKind::Reasoning {
                     text: "private reasoning".into(),
                     signature: None,
                     details: vec![],
-                },
-                ContentBlock::Text {
-                    text: "visible progress".into(),
-                },
+                }),
+                ContentBlock::text("visible progress"),
             ],
         });
         request
@@ -2157,7 +2155,7 @@ mod tests {
     fn tool_call(id: &str) -> Message {
         Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: id.to_string(),
                 name: "search".to_string(),
                 arguments: Value::Null,
@@ -2168,11 +2166,9 @@ mod tests {
     fn tool_result(id: &str) -> Message {
         Message {
             role: Role::Tool,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: id.to_string(),
-                content: vec![ContentBlock::Text {
-                    text: "tool output".to_string(),
-                }],
+                content: vec![ContentBlock::text("tool output".to_string())],
                 is_error: None,
             })],
         }
@@ -2187,9 +2183,9 @@ mod tests {
         let mut result = tool_result("call-1");
         result.role = Role::User;
         let mut mixed = result.clone();
-        mixed.content.push(ContentBlock::Text {
-            text: "latest follow-up".to_string(),
-        });
+        mixed
+            .content
+            .push(ContentBlock::text("latest follow-up".to_string()));
         let input = TaskInput {
             recent_turn_window: None,
         };
@@ -2337,25 +2333,23 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![
-                    ContentBlock::Reasoning {
+                    ContentBlock::new(ContentBlockKind::Reasoning {
                         text: "private chain of thought".to_string(),
                         signature: None,
                         details: Vec::new(),
-                    },
-                    ContentBlock::Text {
-                        text: "visible answer".to_string(),
-                    },
+                    }),
+                    ContentBlock::text("visible answer".to_string()),
                 ],
             },
             tool_call("call-1"),
             tool_result("call-1"),
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Reasoning {
+                content: vec![ContentBlock::new(ContentBlockKind::Reasoning {
                     text: "reasoning-only turn".to_string(),
                     signature: None,
                     details: Vec::new(),
-                }],
+                })],
             },
             Message::text(Role::User, "follow-up"),
         ];
@@ -2377,7 +2371,7 @@ mod tests {
             !built
                 .iter()
                 .flat_map(|message| &message.content)
-                .any(|block| matches!(block, ContentBlock::Reasoning { .. })),
+                .any(|block| matches!(&block.kind, ContentBlockKind::Reasoning { .. })),
             "{built:?}"
         );
         assert!(

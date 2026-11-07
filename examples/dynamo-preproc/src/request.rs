@@ -88,7 +88,7 @@ fn validate_deployment(raw: &Value) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use switchyard_protocol::{ContentBlock, ToolChoice};
+    use switchyard_protocol::{ContentBlock, ContentBlockKind, ToolChoice};
 
     #[test]
     fn decodes_chat_controls_and_preserves_tool_error_flags() {
@@ -117,12 +117,20 @@ mod tests {
             ir.tools[0].function().map(|tool| tool.name.as_str()),
             Some("Bash")
         );
-        let ContentBlock::ToolCall(call) = &ir.messages[0].content[0] else {
+        let ContentBlock {
+            kind: ContentBlockKind::ToolCall(call),
+            ..
+        } = &ir.messages[0].content[0]
+        else {
             panic!("missing tool call")
         };
         assert_eq!(call.arguments, json!({"command": "pytest"}));
         for (index, flag) in [(1, true), (2, false)] {
-            let ContentBlock::ToolResult(result) = &ir.messages[index].content[0] else {
+            let ContentBlock {
+                kind: ContentBlockKind::ToolResult(result),
+                ..
+            } = &ir.messages[index].content[0]
+            else {
                 panic!("missing tool result")
             };
             assert_eq!(result.is_error, Some(flag));

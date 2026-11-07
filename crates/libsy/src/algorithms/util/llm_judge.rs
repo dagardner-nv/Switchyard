@@ -484,7 +484,9 @@ mod tests {
     use futures::StreamExt;
     use http::StatusCode;
     use serde::Deserialize;
-    use switchyard_protocol::{ContentBlock, LlmClientError, text_request, text_response};
+    use switchyard_protocol::{
+        ContentBlock, ContentBlockKind, LlmClientError, text_request, text_response,
+    };
 
     use crate::core::algorithm::Step;
     use crate::core::classifier::Score;
@@ -557,11 +559,11 @@ mod tests {
         if let Some(output) = response.outputs.first_mut() {
             output.content.insert(
                 0,
-                ContentBlock::Reasoning {
+                ContentBlock::new(ContentBlockKind::Reasoning {
                     text: r#"{"ok":false}"#.to_string(),
                     signature: None,
                     details: Vec::new(),
-                },
+                }),
             );
         }
         let parsed: TestVerdict = parse_json_verdict(&response)?;

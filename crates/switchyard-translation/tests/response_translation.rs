@@ -280,9 +280,9 @@ fn openai_chat_refusal_decodes_and_translates_to_anthropic() -> TestResult {
     let output = decoded.response.first_output().ok_or("missing output")?;
     assert_eq!(
         output.content,
-        vec![ContentBlock::Refusal {
-            text: "I cannot help with that request.".to_string()
-        }]
+        vec![ContentBlock::refusal(
+            "I cannot help with that request.".to_string()
+        )]
     );
     assert_eq!(output.stop_reason, Some(StopReason::ContentFilter));
 

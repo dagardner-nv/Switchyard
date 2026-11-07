@@ -527,8 +527,8 @@ mod tests {
     /// A clean write selects efficient without ending finite capable holds early.
     fn production_request() -> Request {
         let mut request = turn_request(false);
-        if let switchyard_protocol::ContentBlock::ToolCall(call) =
-            &mut request.llm_request.messages[1].content[0]
+        if let switchyard_protocol::ContentBlockKind::ToolCall(call) =
+            &mut request.llm_request.messages[1].content[0].kind
         {
             call.name = "Write".to_string();
         }
@@ -625,12 +625,12 @@ mod tests {
                 let mut no_signals = turn_request(false);
                 no_signals.llm_request.messages.truncate(1);
                 let mut passing = turn_request(false);
-                if let switchyard_protocol::ContentBlock::ToolResult(result) =
-                    &mut passing.llm_request.messages[2].content[0]
+                if let switchyard_protocol::ContentBlockKind::ToolResult(result) =
+                    &mut passing.llm_request.messages[2].content[0].kind
                 {
-                    result.content = vec![switchyard_protocol::ContentBlock::Text {
-                        text: "test result: ok. 1 passed; 0 failed".into(),
-                    }];
+                    result.content = vec![switchyard_protocol::ContentBlock::text(
+                        "test result: ok. 1 passed; 0 failed",
+                    )];
                 }
                 let mut child = initial.clone();
                 child.metadata.as_mut().unwrap().agent_id = Some("child".into());

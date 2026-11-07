@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
 use switchyard_protocol::{
-    AggLlmResponse, Category, ContentBlock, FormatId, LlmClientError, LlmResponse, Message,
-    Metadata, ModelId, Request, Response, ResponseOutput, Role, StopReason, ToolCall, WireFormat,
+    AggLlmResponse, Category, ContentBlock, ContentBlockKind, FormatId, LlmClientError,
+    LlmResponse, Message, Metadata, ModelId, Request, Response, ResponseOutput, Role, StopReason,
+    ToolCall, WireFormat,
 };
 
 use super::super::config::{ACTIVE_APPROVAL, ServingMode, VgrConfig};
@@ -52,7 +53,7 @@ fn tool_call(arguments: serde_json::Value, stop_reason: StopReason) -> Response 
     agg(AggLlmResponse {
         outputs: vec![ResponseOutput {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: "next".into(),
                 name: "bash".into(),
                 arguments,
@@ -254,8 +255,8 @@ async fn a_typed_follow_up_answer_is_judged_on_the_answer_itself() -> Result<()>
                         .instructions
                         .first()
                         .and_then(|block| block.content.first())
-                        .and_then(|block| match block {
-                            ContentBlock::Text { text } => Some(text.clone()),
+                        .and_then(|block| match &block.kind {
+                            ContentBlockKind::Text { text } => Some(text.clone()),
                             _ => None,
                         })
                         .unwrap_or_default();
@@ -384,12 +385,10 @@ async fn skipped_requests_leave_the_recovery_trial_available() -> Result<()> {
         let mut task = request(vec![Message::text(Role::User, "task")]);
         match skip {
             "image" => {
-                task.llm_request.messages[0].content = vec![ContentBlock::Image {
-                    source: ImageSource::Url {
-                        url: "https://example.test/image.png".into(),
-                        detail: None,
-                    },
-                }]
+                task.llm_request.messages[0].content = vec![ContentBlock::image(ImageSource::Url {
+                    url: "https://example.test/image.png".into(),
+                    detail: None,
+                })]
             }
             "latched" => {
                 state.extra.insert(
@@ -774,13 +773,12 @@ fn handoff_preserves_existing_messages_and_non_text_content() {
         Message::text(Role::User, "continue"),
         Message::text(Role::User, "then report the result"),
     ]);
-    if let ContentBlock::ToolResult(result) = &mut task.llm_request.messages[3].content[0] {
-        result.content.push(ContentBlock::Image {
-            source: ImageSource::Url {
-                url: "https://example.test/result.png".into(),
-                detail: None,
-            },
-        });
+    if let ContentBlockKind::ToolResult(result) = &mut task.llm_request.messages[3].content[0].kind
+    {
+        result.content.push(ContentBlock::image(ImageSource::Url {
+            url: "https://example.test/result.png".into(),
+            detail: None,
+        }));
     }
     let original = task.llm_request.messages.clone();
     let mut state = State::default();
@@ -1137,7 +1135,7 @@ async fn default_verification_asks_capable_evidence_then_answer() -> Result<()> 
                                 .iter()
                                 .flat_map(|block| &block.content)
                                 .any(|block| {
-                                    matches!(block, ContentBlock::Text { text }
+                                    matches!(&block.kind, ContentBlockKind::Text { text }
                                     if text.starts_with("You are a strict answer verifier"))
                                 });
                             seen.lock().push(is_answer);

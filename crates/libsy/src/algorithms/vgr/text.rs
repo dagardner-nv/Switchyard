@@ -9,7 +9,9 @@ use std::{borrow::Cow, sync::LazyLock};
 
 use regex::Regex;
 use serde_json::Value;
-use switchyard_protocol::{ContentBlock, InstructionBlock, Message, Request, Role, ToolResult};
+use switchyard_protocol::{
+    ContentBlock, ContentBlockKind, InstructionBlock, Message, Request, Role, ToolResult,
+};
 
 use crate::algorithms::util::affinity::{initiated_by_user, is_turn_context, is_user_turn};
 use crate::algorithms::util::tool_signals::classify_text;
@@ -56,11 +58,13 @@ pub(super) fn content_text(content: &[ContentBlock]) -> (String, bool) {
     let mut parts: Vec<&str> = Vec::new();
     let mut unsupported = false;
     for block in content {
-        match block {
-            ContentBlock::Text { text } | ContentBlock::Refusal { text } => parts.push(text),
-            ContentBlock::ToolCall(_)
-            | ContentBlock::ToolResult(_)
-            | ContentBlock::Reasoning { .. } => {}
+        match &block.kind {
+            ContentBlockKind::Text { text } | ContentBlockKind::Refusal { text } => {
+                parts.push(text)
+            }
+            ContentBlockKind::ToolCall(_)
+            | ContentBlockKind::ToolResult(_)
+            | ContentBlockKind::Reasoning { .. } => {}
             _ => unsupported = true,
         }
     }
@@ -105,8 +109,8 @@ pub(super) fn newest_prompt_is_blank(request: &Request) -> bool {
         .rev()
         .find(|message| message.role == Role::User)
         .is_none_or(|message| {
-            message.content.iter().all(|block| match block {
-                ContentBlock::Text { text } => text.chars().all(|c| {
+            message.content.iter().all(|block| match &block.kind {
+                ContentBlockKind::Text { text } => text.chars().all(|c| {
                     c.is_whitespace()
                         || matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}')
                 }),
@@ -142,7 +146,7 @@ pub(super) fn starts_user_turn(messages: &[Message], index: usize) -> bool {
         && !previous
             .content
             .iter()
-            .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+            .any(|block| matches!(&block.kind, ContentBlockKind::ToolCall(_)))
 }
 
 /// The current turn's start, using the initiator header for the newest message.
@@ -170,8 +174,8 @@ fn is_tool_step(message: &Message) -> bool {
     message.role == Role::Tool
         || message.content.iter().any(|block| {
             matches!(
-                block,
-                ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+                &block.kind,
+                ContentBlockKind::ToolCall(_) | ContentBlockKind::ToolResult(_)
             )
         })
 }
@@ -245,8 +249,8 @@ pub(super) fn tool_result_failed(result: &ToolResult) -> bool {
     let text = result
         .content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::Refusal { text } => Some(text),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Text { text } | ContentBlockKind::Refusal { text } => Some(text),
             _ => None,
         })
         .map(String::as_str)
@@ -275,8 +279,8 @@ impl ToolRecord {
             .messages
             .iter()
             .flat_map(|message| &message.content)
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult(result) => Some(result),
+            .filter_map(|block| match &block.kind {
+                ContentBlockKind::ToolResult(result) => Some(result),
                 _ => None,
             });
         for result in results {

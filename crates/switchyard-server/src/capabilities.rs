@@ -4,7 +4,7 @@
 //! Reject inputs that the selected route explicitly disables.
 
 use serde_json::Value;
-use switchyard_protocol::{ContentBlock, LlmRequest};
+use switchyard_protocol::{ContentBlock, ContentBlockKind, LlmRequest};
 use switchyard_runner::ModelCapabilities;
 
 /// Return the first explicitly disabled capability used by decoded or preserved input.
@@ -117,14 +117,14 @@ fn unsupported_content(
     capabilities: ModelCapabilities,
     content: &[ContentBlock],
 ) -> Option<&'static str> {
-    content.iter().find_map(|block| match block {
-        ContentBlock::Image { .. } if capabilities.vision == Some(false) => Some("vision"),
-        ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+    content.iter().find_map(|block| match &block.kind {
+        ContentBlockKind::Image { .. } if capabilities.vision == Some(false) => Some("vision"),
+        ContentBlockKind::ToolCall(_) | ContentBlockKind::ToolResult(_)
             if capabilities.tool_calling == Some(false) =>
         {
             Some("tool_calling")
         }
-        ContentBlock::ToolResult(result) => unsupported_content(capabilities, &result.content),
+        ContentBlockKind::ToolResult(result) => unsupported_content(capabilities, &result.content),
         _ => None,
     })
 }

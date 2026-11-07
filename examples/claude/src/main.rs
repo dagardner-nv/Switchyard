@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use switchyard_protocol::{
-    ContentBlock, LlmClientError, LlmRequest, LlmResponse, Metadata, ModelId, Request, Response,
-    RoutedLlmClient, text_response,
+    ContentBlockKind, LlmClientError, LlmRequest, LlmResponse, Metadata, ModelId, Request,
+    Response, RoutedLlmClient, text_response,
 };
 use switchyard_runner::Runner;
 use tokio::{
@@ -250,8 +250,8 @@ impl RoutedLlmClient for NativeClassifier {
             .instructions
             .iter()
             .flat_map(|b| &b.content)
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
+            .filter_map(|b| match &b.kind {
+                ContentBlockKind::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()

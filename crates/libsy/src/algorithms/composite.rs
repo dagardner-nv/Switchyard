@@ -368,8 +368,8 @@ mod tests {
                 let mut initial = turn_request(false);
                 initial.llm_request.messages.truncate(1);
                 let mut write = turn_request(false);
-                if let switchyard_protocol::ContentBlock::ToolCall(call) =
-                    &mut write.llm_request.messages[1].content[0]
+                if let switchyard_protocol::ContentBlockKind::ToolCall(call) =
+                    &mut write.llm_request.messages[1].content[0].kind
                 {
                     call.name = "Write".into();
                 }
@@ -475,8 +475,8 @@ mod tests {
             )?);
             let recorder = Arc::new(Recorder::default());
             let mut write = turn_request(false);
-            if let switchyard_protocol::ContentBlock::ToolCall(call) =
-                &mut write.llm_request.messages[1].content[0]
+            if let switchyard_protocol::ContentBlockKind::ToolCall(call) =
+                &mut write.llm_request.messages[1].content[0].kind
             {
                 call.name = "Write".into();
             }
@@ -513,9 +513,7 @@ mod tests {
                 assert_eq!(outcome.request.llm_request.instructions.len(), 1);
                 assert_eq!(
                     outcome.request.llm_request.instructions[0].content,
-                    vec![switchyard_protocol::ContentBlock::Text {
-                        text: prompt.into()
-                    }]
+                    vec![switchyard_protocol::ContentBlock::text(prompt)]
                 );
                 state = outcome.state;
             }

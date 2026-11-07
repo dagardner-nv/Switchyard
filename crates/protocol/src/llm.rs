@@ -55,7 +55,7 @@ impl Message {
     pub fn text(role: Role, text: impl Into<String>) -> Self {
         Self {
             role,
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::text(text)],
         }
     }
 
@@ -64,9 +64,9 @@ impl Message {
         let parts = self
             .content
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                ContentBlock::Refusal { text } => Some(text.as_str()),
+            .filter_map(|block| match &block.kind {
+                ContentBlockKind::Text { text } => Some(text.as_str()),
+                ContentBlockKind::Refusal { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -78,10 +78,76 @@ impl Message {
     }
 }
 
+/// Content and provider metadata carried by instructions, messages, and tool results.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContentBlock {
+    /// Normalized content.
+    #[serde(flatten)]
+    pub kind: ContentBlockKind,
+    /// Provider fields grouped by their codec's [`FormatId`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<ProviderExtensions>,
+}
+
+impl ContentBlock {
+    /// Creates a content block.
+    pub fn new(kind: ContentBlockKind) -> Self {
+        Self {
+            kind,
+            extensions: None,
+        }
+    }
+
+    /// Creates a text block.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::new(ContentBlockKind::Text { text: text.into() })
+    }
+
+    /// Creates a refusal block.
+    pub fn refusal(text: impl Into<String>) -> Self {
+        Self::new(ContentBlockKind::Refusal { text: text.into() })
+    }
+
+    /// Creates an image block.
+    pub fn image(source: ImageSource) -> Self {
+        Self::new(ContentBlockKind::Image { source })
+    }
+
+    /// Creates an audio block.
+    pub fn audio(source: MediaSource) -> Self {
+        Self::new(ContentBlockKind::Audio { source })
+    }
+
+    /// Creates a video block.
+    pub fn video(source: MediaSource) -> Self {
+        Self::new(ContentBlockKind::Video { source })
+    }
+
+    /// Creates a file block.
+    pub fn file(source: FileSource) -> Self {
+        Self::new(ContentBlockKind::File { source })
+    }
+
+    /// Creates a tool-call block.
+    pub fn tool_call(call: ToolCall) -> Self {
+        Self::new(ContentBlockKind::ToolCall(call))
+    }
+
+    /// Creates a tool-result block.
+    pub fn tool_result(result: ToolResult) -> Self {
+        Self::new(ContentBlockKind::ToolResult(result))
+    }
+
+    /// Creates an MCP block.
+    pub fn mcp(content: McpContent) -> Self {
+        Self::new(ContentBlockKind::Mcp(content))
+    }
+}
+
 /// Normalized content block variants carried by messages and tool results.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
+pub enum ContentBlockKind {
     /// Plain text content.
     Text {
         /// Text value.
@@ -232,6 +298,9 @@ pub struct ToolDefinition {
     pub parameters: Value,
     /// Whether the provider should enforce the schema strictly.
     pub strict: Option<bool>,
+    /// Provider fields grouped by their codec's [`FormatId`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<ProviderExtensions>,
 }
 
 /// A tool available to the model, in catalog order.
@@ -728,6 +797,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn content_blocks_preserve_legacy_json_shapes() -> Result<(), serde_json::Error> {
+        let blocks = json!([
+            {"type": "text", "text": "hello"},
+            {"type": "reasoning", "text": "thinking", "signature": null},
+            {"type": "image", "source": {"type": "url", "data": {"url": "https://example.invalid/image", "detail": null}}},
+            {"type": "audio", "source": {"type": "raw", "data": {"audio": "opaque"}}},
+            {"type": "video", "source": {"type": "raw", "data": {"video": "opaque"}}},
+            {"type": "file", "source": {"type": "file_id", "data": "file-1"}},
+            {"type": "tool_call", "id": "call-1", "name": "lookup", "arguments": {}},
+            {"type": "tool_result", "tool_call_id": "call-1", "content": [{"type": "text", "text": "found"}], "is_error": false},
+            {"type": "mcp", "kind": "listing", "server_name": "inventory", "tools": []},
+            {"type": "refusal", "text": "declined"},
+            {"type": "unknown", "provider": "custom", "raw": {"type": "custom_block", "extensions": {"opaque": true}}}
+        ]);
+        let content: Vec<ContentBlock> = serde_json::from_value(blocks.clone())?;
+        assert!(content.iter().all(|block| block.extensions.is_none()));
+        assert_eq!(serde_json::to_value(&content)?, blocks);
+        Ok(())
+    }
+
+    #[test]
+    fn content_extensions_follow_blocks_through_edits() -> Result<(), serde_json::Error> {
+        let extensions = json!({"fields": {
+            "anthropic_messages": {"cache_control": {"type": "ephemeral", "ttl": "1h"}},
+            "custom_codec": {"custom_field": "opaque"}
+        }});
+        let annotated = json!({"type": "text", "text": "duplicate", "extensions": extensions});
+        let block: ContentBlock = serde_json::from_value(annotated.clone())?;
+        assert_eq!(serde_json::to_value(&block)?, annotated);
+
+        let mut content = vec![ContentBlock::text("duplicate"), block.clone()];
+        content.swap(0, 1);
+        content[0].kind = ContentBlockKind::Text {
+            text: "edited".into(),
+        };
+        content.remove(1);
+        assert_eq!(
+            serde_json::to_value(&content)?,
+            json!([
+                {"type": "text", "text": "edited", "extensions": extensions}
+            ])
+        );
+        assert_eq!(serde_json::to_value(&block)?, annotated);
+
+        content[0].extensions = None;
+        assert_eq!(
+            serde_json::to_value(&content)?,
+            json!([
+                {"type": "text", "text": "edited"}
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn function_tool_extensions_round_trip() -> Result<(), serde_json::Error> {
+        let definition = json!({
+            "name": "lookup", "description": null, "parameters": {}, "strict": null,
+            "extensions": {"fields": {"custom_codec": {"custom_field": "opaque"}}}
+        });
+        let tool: Tool = serde_json::from_value(definition.clone())?;
+        assert!(
+            tool.function()
+                .and_then(|tool| tool.extensions.as_ref())
+                .is_some()
+        );
+        assert_eq!(serde_json::to_value(&tool)?, definition);
+        Ok(())
+    }
+
+    #[test]
     fn serde_uses_python_friendly_dictionary_shapes() -> Result<(), serde_json::Error> {
         let request: LlmRequest = serde_json::from_value(json!({
             "model": "auto",
@@ -738,7 +878,7 @@ mod tests {
         }))?;
         assert_eq!(request.messages[0], Message::text(Role::User, "hello"));
 
-        let tool_call = ContentBlock::ToolCall(ToolCall {
+        let tool_call = ContentBlock::tool_call(ToolCall {
             id: "call-1".to_string(),
             name: "lookup".to_string(),
             arguments: json!({"query": "rust"}),

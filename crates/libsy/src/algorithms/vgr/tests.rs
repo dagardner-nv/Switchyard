@@ -21,7 +21,7 @@ pub(super) fn request(messages: Vec<Message>) -> Request {
 pub(super) fn call(id: &str) -> Message {
     Message {
         role: Role::Assistant,
-        content: vec![ContentBlock::ToolCall(ToolCall {
+        content: vec![ContentBlock::tool_call(ToolCall {
             id: id.into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
@@ -32,9 +32,9 @@ pub(super) fn call(id: &str) -> Message {
 pub(super) fn result(id: &str, text: &str) -> Message {
     Message {
         role: Role::Tool,
-        content: vec![ContentBlock::ToolResult(ToolResult {
+        content: vec![ContentBlock::tool_result(ToolResult {
             tool_call_id: id.into(),
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::text(text)],
             is_error: None,
         })],
     }
@@ -159,12 +159,10 @@ fn missing_or_unrepresentable_evidence_fails_closed() {
 
     let image = request(vec![Message {
         role: Role::User,
-        content: vec![ContentBlock::Image {
-            source: ImageSource::Url {
-                url: "https://example.test/a.png".into(),
-                detail: None,
-            },
-        }],
+        content: vec![ContentBlock::image(ImageSource::Url {
+            url: "https://example.test/a.png".into(),
+            detail: None,
+        })],
     }]);
     assert_eq!(branch(&image, "done", None), Branch::Unknown);
 }
@@ -214,11 +212,9 @@ fn trajectory_labels_agree_with_tool_failure_counts() {
             call("c1"),
             Message {
                 role: Role::Tool,
-                content: vec![ContentBlock::ToolResult(ToolResult {
+                content: vec![ContentBlock::tool_result(ToolResult {
                     tool_call_id: "c1".into(),
-                    content: vec![ContentBlock::Text {
-                        text: output.into(),
-                    }],
+                    content: vec![ContentBlock::text(output)],
                     is_error,
                 })],
             },

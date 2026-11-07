@@ -20,9 +20,10 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
-    MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
-    SamplingParams, StopReason, Tool, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    AggLlmResponse, ContentBlock, ContentBlockKind, FileSource, ImageSource, InstructionBlock,
+    LlmRequest, MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams,
+    ResponseOutput, Role, SamplingParams, StopReason, Tool, ToolCall, ToolChoice, ToolDefinition,
+    ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -117,15 +118,15 @@ impl FormatCodec for OpenAiChatCodec {
                         if let Some(call) =
                             decode_openai_tool_call(tool_call, generated_id, policy)?
                         {
-                            content.push(ContentBlock::ToolCall(call));
+                            content.push(ContentBlock::tool_call(call));
                         }
                     }
                 }
                 if role == Role::Tool {
                     let text = content
                         .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text { text } => Some(text.as_str()),
+                        .filter_map(|block| match &block.kind {
+                            ContentBlockKind::Text { text } => Some(text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -137,9 +138,9 @@ impl FormatCodec for OpenAiChatCodec {
                         .to_string();
                     request.messages.push(Message {
                         role: Role::User,
-                        content: vec![ContentBlock::ToolResult(ToolResult {
+                        content: vec![ContentBlock::tool_result(ToolResult {
                             tool_call_id,
-                            content: vec![ContentBlock::Text { text }],
+                            content: vec![ContentBlock::text(text)],
                             is_error: message.get("is_error").and_then(Value::as_bool),
                         })],
                     });
@@ -334,9 +335,7 @@ impl FormatCodec for OpenAiChatCodec {
             };
             prepend_openai_reasoning_blocks(&mut content, &message);
             if let Some(text) = refusal {
-                content.push(ContentBlock::Refusal {
-                    text: text.to_string(),
-                });
+                content.push(ContentBlock::refusal(text.to_string()));
             }
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -345,7 +344,7 @@ impl FormatCodec for OpenAiChatCodec {
                         index + 1,
                         &TranslationPolicy::default(),
                     )? {
-                        content.push(ContentBlock::ToolCall(call));
+                        content.push(ContentBlock::tool_call(call));
                     }
                 }
             }
@@ -401,8 +400,8 @@ impl FormatCodec for OpenAiChatCodec {
                 output
                     .content
                     .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::ToolCall(call) => Some(json!({
+                    .filter_map(|block| match &block.kind {
+                        ContentBlockKind::ToolCall(call) => Some(json!({
                             "id": call.id,
                             "type": "function",
                             "function": {
@@ -492,11 +491,11 @@ fn prepend_openai_reasoning_blocks(content: &mut Vec<ContentBlock>, object: &Map
         });
         content.insert(
             0,
-            ContentBlock::Reasoning {
+            ContentBlock::new(ContentBlockKind::Reasoning {
                 text,
                 signature,
                 details: details.clone(),
-            },
+            }),
         );
         return;
     }
@@ -504,11 +503,11 @@ fn prepend_openai_reasoning_blocks(content: &mut Vec<ContentBlock>, object: &Map
     if let Some(text) = first_nonempty_string(object, &["reasoning_content", "reasoning"]) {
         content.insert(
             0,
-            ContentBlock::Reasoning {
+            ContentBlock::new(ContentBlockKind::Reasoning {
                 text: text.to_string(),
                 signature: None,
                 details: Vec::new(),
-            },
+            }),
         );
     }
 }
@@ -517,8 +516,8 @@ fn prepend_openai_reasoning_blocks(content: &mut Vec<ContentBlock>, object: &Map
 fn reasoning_details_from_blocks(content: &[ContentBlock]) -> Vec<Value> {
     content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Reasoning { details, .. } => Some(details.as_slice()),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Reasoning { details, .. } => Some(details.as_slice()),
             _ => None,
         })
         .flatten()
@@ -555,10 +554,8 @@ pub(crate) fn decode_openai_content(
 ) -> Result<Vec<ContentBlock>> {
     let path = path.into();
     match content {
-        Value::Null => Ok(vec![ContentBlock::Text {
-            text: String::new(),
-        }]),
-        Value::String(text) => Ok(vec![ContentBlock::Text { text: text.clone() }]),
+        Value::Null => Ok(vec![ContentBlock::text(String::new())]),
+        Value::String(text) => Ok(vec![ContentBlock::text(text.clone())]),
         Value::Array(blocks) => {
             let mut content = Vec::new();
             for (index, block) in blocks.iter().enumerate() {
@@ -572,53 +569,49 @@ pub(crate) fn decode_openai_content(
                 };
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") | Some("input_text") | Some("output_text") => {
-                        content.push(ContentBlock::Text {
-                            text: block
+                        content.push(ContentBlock::text(
+                            block
                                 .get("text")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                        });
+                        ));
                     }
                     Some("refusal") => {
-                        content.push(ContentBlock::Refusal {
-                            text: block
+                        content.push(ContentBlock::refusal(
+                            block
                                 .get("refusal")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                        });
+                        ));
                     }
                     Some("image_url") | Some("input_image") => {
                         if let Some(source) = decode_image_source(block) {
-                            content.push(ContentBlock::Image { source });
+                            content.push(ContentBlock::image(source));
                         }
                     }
-                    Some("input_audio") => content.push(ContentBlock::Audio {
-                        source: MediaSource::Raw(Value::Object(block.clone())),
-                    }),
+                    Some("input_audio") => content.push(ContentBlock::audio(MediaSource::Raw(
+                        Value::Object(block.clone()),
+                    ))),
                     Some("file") | Some("input_file") => {
-                        content.push(ContentBlock::File {
-                            source: decode_file_source(block),
-                        });
+                        content.push(ContentBlock::file(decode_file_source(block)));
                     }
-                    _ => content.push(ContentBlock::Unknown {
+                    _ => content.push(ContentBlock::new(ContentBlockKind::Unknown {
                         provider: provider.into(),
                         raw: Value::Object(block.clone()),
-                    }),
+                    })),
                 }
             }
             if content.is_empty() {
-                Ok(vec![ContentBlock::Text {
-                    text: String::new(),
-                }])
+                Ok(vec![ContentBlock::text(String::new())])
             } else {
                 Ok(content)
             }
         }
-        other => Ok(vec![ContentBlock::Text {
-            text: string_value(other).unwrap_or_default(),
-        }]),
+        other => Ok(vec![ContentBlock::text(
+            string_value(other).unwrap_or_default(),
+        )]),
     }
 }
 
@@ -786,6 +779,7 @@ pub(crate) fn decode_openai_tools(
             continue;
         }
         definitions.push(ToolDefinition {
+            extensions: None,
             name,
             description: function
                 .get("description")
@@ -847,7 +841,7 @@ fn encode_message_with_tool_results_to_openai(
     let mut pending_content = Vec::new();
 
     for block in &message.content {
-        if let ContentBlock::ToolResult(result) = block {
+        if let ContentBlockKind::ToolResult(result) = &block.kind {
             out.push(json!({
                 "role": "tool",
                 "tool_call_id": result.tool_call_id,
@@ -858,8 +852,8 @@ fn encode_message_with_tool_results_to_openai(
                 .iter()
                 .filter(|block| {
                     !matches!(
-                        block,
-                        ContentBlock::Text { .. } | ContentBlock::Refusal { .. }
+                        &block.kind,
+                        ContentBlockKind::Text { .. } | ContentBlockKind::Refusal { .. }
                     )
                 })
                 .cloned()
@@ -927,8 +921,8 @@ fn encode_message_without_tool_results_to_openai(
     let tool_calls = message
         .content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolCall(call) => Some(json!({
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::ToolCall(call) => Some(json!({
                 "id": call.id,
                 "type": "function",
                 "function": {
@@ -944,8 +938,8 @@ fn encode_message_without_tool_results_to_openai(
         .iter()
         .filter(|block| {
             !matches!(
-                block,
-                ContentBlock::ToolCall(_) | ContentBlock::Reasoning { .. }
+                &block.kind,
+                ContentBlockKind::ToolCall(_) | ContentBlockKind::Reasoning { .. }
             )
         })
         .cloned()
@@ -978,8 +972,8 @@ fn encode_openai_message_reasoning(message: &mut Value, content: &[ContentBlock]
 fn encode_openai_message_plaintext_reasoning(message: &mut Value, content: &[ContentBlock]) {
     let reasoning = content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Reasoning {
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Reasoning {
                 text,
                 signature: None,
                 ..
@@ -1002,8 +996,8 @@ fn encode_openai_message_structured_reasoning(
     message["reasoning_details"] = Value::Array(details);
     let fallback = content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Reasoning { text, details, .. }
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Reasoning { text, details, .. }
                 if !details.is_empty()
                     && reasoning_text_from_details(details).as_deref() != Some(text.as_str())
                     && !text.is_empty() =>
@@ -1024,7 +1018,7 @@ fn message_has_tool_results(message: &Message) -> bool {
     message
         .content
         .iter()
-        .any(|block| matches!(block, ContentBlock::ToolResult(_)))
+        .any(|block| matches!(&block.kind, ContentBlockKind::ToolResult(_)))
 }
 
 // Copies Chat-compatible extension fields preserved in the IR.
@@ -1060,7 +1054,7 @@ fn copy_openai_chat_request_extensions(
 
 // Detects placeholder empty text generated while decoding assistant tool calls.
 fn is_empty_text_only(content: &[ContentBlock]) -> bool {
-    matches!(content, [ContentBlock::Text { text }] if text.is_empty())
+    matches!(content, [ContentBlock { kind: ContentBlockKind::Text { text }, .. }] if text.is_empty())
 }
 
 /// Encodes normalized content into OpenAI Chat content JSON.
@@ -1072,7 +1066,7 @@ pub(crate) fn encode_openai_content(
 ) -> Result<Value> {
     if content
         .iter()
-        .any(|block| matches!(block, ContentBlock::Mcp(_)))
+        .any(|block| matches!(&block.kind, ContentBlockKind::Mcp(_)))
     {
         return Err(TranslationError::LossyConversion(
             "MCP history encoding is not implemented".into(),
@@ -1080,12 +1074,12 @@ pub(crate) fn encode_openai_content(
     }
     let has_non_text = content.iter().any(|block| {
         matches!(
-            block,
-            ContentBlock::Image { .. }
-                | ContentBlock::Audio { .. }
-                | ContentBlock::Video { .. }
-                | ContentBlock::File { .. }
-                | ContentBlock::Unknown { .. }
+            &block.kind,
+            ContentBlockKind::Image { .. }
+                | ContentBlockKind::Audio { .. }
+                | ContentBlockKind::Video { .. }
+                | ContentBlockKind::File { .. }
+                | ContentBlockKind::Unknown { .. }
         )
     });
     if !has_non_text {
@@ -1093,7 +1087,7 @@ pub(crate) fn encode_openai_content(
     }
     if role != Role::User {
         for block in content {
-            if let ContentBlock::Unknown { provider, raw } = block {
+            if let ContentBlockKind::Unknown { provider, raw } = &block.kind {
                 reject_responses_native_input_item(provider, raw, WireFormat::OpenAiChat)?;
             }
         }
@@ -1107,10 +1101,12 @@ pub(crate) fn encode_openai_content(
     let mut blocks = Vec::new();
     for block in content {
         crate::codecs::openai_media::validate_media(block, WireFormat::OpenAiChat)?;
-        match block {
-            ContentBlock::Text { text } => blocks.push(json!({"type": "text", "text": text})),
-            ContentBlock::Refusal { text } => blocks.push(json!({"type": "text", "text": text})),
-            ContentBlock::Image { source } => match openai_image_part(source) {
+        match &block.kind {
+            ContentBlockKind::Text { text } => blocks.push(json!({"type": "text", "text": text})),
+            ContentBlockKind::Refusal { text } => {
+                blocks.push(json!({"type": "text", "text": text}))
+            }
+            ContentBlockKind::Image { source } => match openai_image_part(source) {
                 Some(part) => blocks.push(part),
                 None => {
                     push_lossy(
@@ -1121,7 +1117,7 @@ pub(crate) fn encode_openai_content(
                     blocks.push(openai_text_part(&image_source_text(source)));
                 }
             },
-            ContentBlock::File { source } => match openai_file_part(source) {
+            ContentBlockKind::File { source } => match openai_file_part(source) {
                 Some(part) => blocks.push(part),
                 None => {
                     push_lossy(
@@ -1132,10 +1128,10 @@ pub(crate) fn encode_openai_content(
                     blocks.push(openai_text_part(&file_source_text(source)));
                 }
             },
-            ContentBlock::Audio { source } => {
+            ContentBlockKind::Audio { source } => {
                 blocks.push(crate::codecs::openai_media::audio_part(source)?);
             }
-            ContentBlock::Video { source } => {
+            ContentBlockKind::Video { source } => {
                 push_lossy(
                     diagnostics,
                     policy,
@@ -1143,12 +1139,12 @@ pub(crate) fn encode_openai_content(
                 )?;
                 blocks.push(openai_text_part(&media_source_text(source)));
             }
-            ContentBlock::Mcp(_) => {
+            ContentBlockKind::Mcp(_) => {
                 return Err(TranslationError::LossyConversion(
                     "MCP history encoding is not implemented".into(),
                 ));
             }
-            ContentBlock::Unknown { provider, raw } => {
+            ContentBlockKind::Unknown { provider, raw } => {
                 reject_responses_native_input_item(provider, raw, WireFormat::OpenAiChat)?;
                 push_lossy(
                     diagnostics,
@@ -1157,9 +1153,9 @@ pub(crate) fn encode_openai_content(
                 )?;
                 blocks.push(openai_text_part(&json_string(raw)));
             }
-            ContentBlock::Reasoning { .. }
-            | ContentBlock::ToolCall(_)
-            | ContentBlock::ToolResult(_) => {}
+            ContentBlockKind::Reasoning { .. }
+            | ContentBlockKind::ToolCall(_)
+            | ContentBlockKind::ToolResult(_) => {}
         }
     }
     Ok(Value::Array(blocks))

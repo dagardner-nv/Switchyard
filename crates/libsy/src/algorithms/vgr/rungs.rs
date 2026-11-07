@@ -7,8 +7,8 @@
 //! which never commits.
 
 use switchyard_protocol::{
-    AggLlmResponse, ContentBlock, InstructionBlock, LlmRequest, Message, Metadata, OutputParams,
-    Request, ResponseOutput, Role, SamplingParams, StopReason,
+    AggLlmResponse, ContentBlock, ContentBlockKind, InstructionBlock, LlmRequest, Message,
+    Metadata, OutputParams, Request, ResponseOutput, Role, SamplingParams, StopReason,
 };
 
 use super::TaskType;
@@ -90,9 +90,7 @@ pub(super) fn build_request(
         llm_request: LlmRequest {
             instructions: vec![InstructionBlock {
                 role: Role::System,
-                content: vec![ContentBlock::Text {
-                    text: question.system_prompt(),
-                }],
+                content: vec![ContentBlock::text(question.system_prompt())],
             }],
             messages: vec![Message::text(Role::User, judged_text)],
             output: OutputParams {
@@ -144,8 +142,10 @@ pub(super) fn build_verdict_request(
     let analysis = output
         .into_iter()
         .flat_map(|output| &output.content)
-        .filter_map(|block| match block {
-            ContentBlock::Reasoning { text, .. } | ContentBlock::Text { text } => Some(text.trim()),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Reasoning { text, .. } | ContentBlockKind::Text { text } => {
+                Some(text.trim())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -248,11 +248,11 @@ fn proposed_line(proposed: &AggLlmResponse) -> String {
         .filter(|output| output.role == Role::Assistant)
     {
         for block in &output.content {
-            match block {
-                ContentBlock::Text { text } if !text.trim().is_empty() => {
+            match &block.kind {
+                ContentBlockKind::Text { text } if !text.trim().is_empty() => {
                     fragments.push(redact(text));
                 }
-                ContentBlock::ToolCall(call) => fragments.push(format!(
+                ContentBlockKind::ToolCall(call) => fragments.push(format!(
                     "[tool call] {}({})",
                     redact(&call.name),
                     redact(&call.arguments.to_string())
@@ -292,7 +292,7 @@ pub(super) fn has_tool_call(response: &AggLlmResponse) -> bool {
             && output
                 .content
                 .iter()
-                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+                .any(|block| matches!(&block.kind, ContentBlockKind::ToolCall(_)))
     })
 }
 
@@ -349,8 +349,8 @@ fn assistant_text(output: &ResponseOutput) -> Option<String> {
     let text = output
         .content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -366,7 +366,7 @@ mod tests {
         AggLlmResponse {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text { text: text.into() }],
+                content: vec![ContentBlock::text(text)],
                 url_citations: Vec::new(),
                 stop_reason,
             }],
@@ -404,11 +404,11 @@ mod tests {
         let mut deliberation = replied("the dates check out", Some(StopReason::MaxTokens));
         deliberation.outputs[0].content.insert(
             0,
-            ContentBlock::Reasoning {
+            ContentBlock::new(ContentBlockKind::Reasoning {
                 text: "Two stories are in the window.".into(),
                 signature: None,
                 details: Vec::new(),
-            },
+            }),
         );
         let verdict = build_verdict_request("record", &deliberation, None);
         assert_eq!(
@@ -483,7 +483,7 @@ mod tests {
         use switchyard_protocol::ToolCall;
 
         let mut call = super::super::tests::call("history");
-        if let ContentBlock::ToolCall(call) = &mut call.content[0] {
+        if let ContentBlockKind::ToolCall(call) = &mut call.content[0].kind {
             call.arguments = serde_json::json!({"command": "echo sk-abcdefghijklmnop"});
         }
         let request = super::super::tests::request(vec![
@@ -494,7 +494,7 @@ mod tests {
         let proposed = AggLlmResponse {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolCall(ToolCall {
+                content: vec![ContentBlock::tool_call(ToolCall {
                     id: "next".into(),
                     name: "bash".into(),
                     arguments: serde_json::json!({"command": "echo Bearer abcdefghijklmnop"}),

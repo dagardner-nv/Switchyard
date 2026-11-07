@@ -24,7 +24,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use switchyard_protocol::{Category, ContentBlock, Message, ModelId, Request, Role};
+use switchyard_protocol::{
+    Category, ContentBlock, ContentBlockKind, Message, ModelId, Request, Role,
+};
 
 use crate::core::algorithm::{Driver, RoutingIdentity};
 use crate::core::classifier::{Classification, Classifier, Score};
@@ -52,12 +54,13 @@ pub enum ClassifyTrigger {
 pub(crate) fn is_user_turn(message: &Message) -> bool {
     message.role == Role::User
         && message.content.iter().any(|block| {
-            !matches!(block, ContentBlock::ToolResult(_)) && !is_environment_context(block)
+            !matches!(&block.kind, ContentBlockKind::ToolResult(_))
+                && !is_environment_context(block)
         })
 }
 
 fn is_environment_context(block: &ContentBlock) -> bool {
-    matches!(block, ContentBlock::Text { text } if text.trim()
+    matches!(&block.kind, ContentBlockKind::Text { text } if text.trim()
         .strip_prefix("<environment_context>")
         .and_then(|context| context.split_once("</environment_context>"))
         .is_some_and(|(_, rest)| rest.trim().is_empty()))
@@ -363,9 +366,7 @@ mod tests {
             format!("explain this: {context}")
         )));
         let mut mixed = Message::text(Role::User, context);
-        mixed.content.push(ContentBlock::Text {
-            text: "fix the parser".into(),
-        });
+        mixed.content.push(ContentBlock::text("fix the parser"));
         assert!(is_user_turn(&mixed));
         for (role, expected) in [
             (Role::User, true),
@@ -680,14 +681,12 @@ mod tests {
         let text_with_reasoning = request(Message {
             role: Role::User,
             content: vec![
-                ContentBlock::Text {
-                    text: "Implement the parser.".to_string(),
-                },
-                ContentBlock::Reasoning {
+                ContentBlock::text("Implement the parser.".to_string()),
+                ContentBlock::new(ContentBlockKind::Reasoning {
                     text: "Internal provider reasoning.".to_string(),
                     signature: Some("provider-signature".to_string()),
                     details: Vec::new(),
-                },
+                }),
             ],
         });
 
@@ -946,7 +945,7 @@ mod tests {
         let mut continued = opening.clone();
         continued.llm_request.messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: "call-1".to_string(),
                 content: Vec::new(),
                 is_error: None,
@@ -992,7 +991,7 @@ mod tests {
         let mut continued = spoke.clone();
         continued.llm_request.messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: "call-1".to_string(),
                 content: Vec::new(),
                 is_error: None,

@@ -17,7 +17,10 @@ use thiserror::Error;
 use crate::{
     LlmClientError,
     format::FormatId,
-    llm::{AggLlmResponse, ContentBlock, ResponseOutput, Role, StopReason, ToolCall, Usage},
+    llm::{
+        AggLlmResponse, ContentBlock, ContentBlockKind, ResponseOutput, Role, StopReason, ToolCall,
+        Usage,
+    },
 };
 
 /// Status reported for an upstream error delivered inside a streaming body. The
@@ -224,14 +227,14 @@ impl AggLlmResponse {
         let mut tool_call_index = 0usize;
         for (output_index, output) in self.outputs.into_iter().enumerate() {
             for block in output.content {
-                match block {
-                    ContentBlock::Text { text } => {
+                match block.kind {
+                    ContentBlockKind::Text { text } => {
                         chunks.push(LlmResponseChunk::TextDelta {
                             index: output_index,
                             text,
                         });
                     }
-                    ContentBlock::Reasoning { text, details, .. } => {
+                    ContentBlockKind::Reasoning { text, details, .. } => {
                         if !details.is_empty() {
                             chunks.push(LlmResponseChunk::ReasoningDetailsDelta {
                                 index: output_index,
@@ -245,7 +248,7 @@ impl AggLlmResponse {
                             });
                         }
                     }
-                    ContentBlock::ToolCall(tool) => {
+                    ContentBlockKind::ToolCall(tool) => {
                         let args = serde_json::to_string(&tool.arguments).unwrap_or_default();
                         chunks.push(LlmResponseChunk::ToolCallDelta {
                             index: tool_call_index,
@@ -454,7 +457,7 @@ impl ResponseAccumulator {
     pub fn finish(self) -> AggLlmResponse {
         let mut content = Vec::new();
         if self.reasoning.is_some() || !self.reasoning_details.is_empty() {
-            content.push(ContentBlock::Reasoning {
+            content.push(ContentBlock::new(ContentBlockKind::Reasoning {
                 text: self.reasoning.unwrap_or_default(),
                 signature: None,
                 // An announcement whose payload never arrived is a stream-level hint only.
@@ -463,13 +466,13 @@ impl ResponseAccumulator {
                     .into_iter()
                     .filter(|detail| !is_reasoning_id_announcement(detail))
                     .collect(),
-            });
+            }));
         }
         if !self.text.is_empty() {
-            content.push(ContentBlock::Text { text: self.text });
+            content.push(ContentBlock::text(self.text));
         }
         for call in self.tool_calls.into_values() {
-            content.push(ContentBlock::ToolCall(ToolCall {
+            content.push(ContentBlock::tool_call(ToolCall {
                 id: call.id.unwrap_or_default(),
                 name: call.name.unwrap_or_default(),
                 arguments: parse_tool_arguments(&call.arguments),
@@ -558,9 +561,7 @@ mod tests {
         assert_eq!(agg.outputs[0].stop_reason, Some(StopReason::MaxTokens));
         assert_eq!(
             agg.outputs[0].content,
-            vec![ContentBlock::Text {
-                text: "Hello".to_string()
-            }]
+            vec![ContentBlock::text("Hello".to_string())]
         );
     }
 
@@ -610,9 +611,7 @@ mod tests {
 
         assert_eq!(
             aggregate.outputs[0].content,
-            vec![ContentBlock::Text {
-                text: "hello".to_string()
-            }]
+            vec![ContentBlock::text("hello".to_string())]
         );
     }
 
@@ -686,7 +685,7 @@ mod tests {
         assert_eq!(agg.outputs[0].stop_reason, Some(StopReason::ToolUse));
         assert_eq!(
             agg.outputs[0].content,
-            vec![ContentBlock::ToolCall(ToolCall {
+            vec![ContentBlock::tool_call(ToolCall {
                 id: "call_1".to_string(),
                 name: "lookup".to_string(),
                 arguments: json!({"q": "rust"}),
@@ -709,14 +708,12 @@ mod tests {
         assert_eq!(
             agg.outputs[0].content,
             vec![
-                ContentBlock::Reasoning {
+                ContentBlock::new(ContentBlockKind::Reasoning {
                     text: "think".to_string(),
                     signature: None,
                     details: Vec::new(),
-                },
-                ContentBlock::Text {
-                    text: "answer".to_string(),
-                },
+                }),
+                ContentBlock::text("answer".to_string()),
             ]
         );
     }
@@ -728,9 +725,7 @@ mod tests {
             model: Some("m".to_string()),
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "hello".to_string(),
-                }],
+                content: vec![ContentBlock::text("hello".to_string())],
                 url_citations: Vec::new(),
                 stop_reason: Some(StopReason::EndTurn),
             }],
@@ -761,11 +756,11 @@ mod tests {
         let original = AggLlmResponse {
             outputs: vec![ResponseOutput {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Reasoning {
+                content: vec![ContentBlock::new(ContentBlockKind::Reasoning {
                     text: "fallback reasoning".to_string(),
                     signature: None,
                     details: details.clone(),
-                }],
+                })],
                 url_citations: Vec::new(),
                 stop_reason: Some(StopReason::EndTurn),
             }],
@@ -774,9 +769,13 @@ mod tests {
 
         let recovered = block_on(LlmResponse::Stream(original.into_stream()).into_agg())
             .expect("into_agg failed");
-        let ContentBlock::Reasoning {
-            text,
-            details: recovered_details,
+        let ContentBlock {
+            kind:
+                ContentBlockKind::Reasoning {
+                    text,
+                    details: recovered_details,
+                    ..
+                },
             ..
         } = &recovered.outputs[0].content[0]
         else {

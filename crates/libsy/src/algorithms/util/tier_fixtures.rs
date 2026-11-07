@@ -96,7 +96,7 @@ pub(crate) fn turn_request(failed: bool) -> Request {
                 Message::text(Role::User, "fix the build"),
                 Message {
                     role: Role::Assistant,
-                    content: vec![ContentBlock::ToolCall(ToolCall {
+                    content: vec![ContentBlock::tool_call(ToolCall {
                         id: "call_1".to_string(),
                         name: "Bash".to_string(),
                         arguments: json!({"command": "cargo test"}),
@@ -104,11 +104,9 @@ pub(crate) fn turn_request(failed: bool) -> Request {
                 },
                 Message {
                     role: Role::Tool,
-                    content: vec![ContentBlock::ToolResult(ToolResult {
+                    content: vec![ContentBlock::tool_result(ToolResult {
                         tool_call_id: "call_1".to_string(),
-                        content: vec![ContentBlock::Text {
-                            text: content.to_string(),
-                        }],
+                        content: vec![ContentBlock::text(content.to_string())],
                         is_error: Some(failed),
                     })],
                 },

@@ -24,7 +24,7 @@ use crate::core::algorithm::Driver;
 use crate::core::classifier::{Classification, Classifier, Score};
 use crate::core::state::State;
 use switchyard_protocol::{
-    ContentBlock, LlmRequest, Message, Metadata, ModelId, Request, Response, Role,
+    ContentBlockKind, LlmRequest, Message, Metadata, ModelId, Request, Response, Role,
 };
 
 /// Classifies delegated work from its parent-supplied prompt and abstains otherwise.
@@ -54,10 +54,16 @@ fn delegated_prompt_request(request: &Request) -> Option<Request> {
         .rev()
         .filter(|message| message.role == Role::User)
         .find_map(|message| {
-            message.content.iter().rev().find_map(|block| match block {
-                ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.clone()),
-                _ => None,
-            })
+            message
+                .content
+                .iter()
+                .rev()
+                .find_map(|block| match &block.kind {
+                    ContentBlockKind::Text { text } if !text.trim().is_empty() => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
         })?;
 
     Some(Request {

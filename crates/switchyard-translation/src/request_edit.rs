@@ -64,9 +64,7 @@ pub fn prepend_system_prompt(request: &mut LlmRequest, prompt: &str) {
         0,
         InstructionBlock {
             role: Role::System,
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-            }],
+            content: vec![ContentBlock::text(prompt.to_string())],
         },
     );
     request.preservation.requests.retain(|format, body| {

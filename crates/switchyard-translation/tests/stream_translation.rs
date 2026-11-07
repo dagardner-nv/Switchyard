@@ -3388,7 +3388,9 @@ fn responses_terminal_snapshots_recover_missing_output_once() -> TestResult {
     let mut expected = engine
         .decode_response(source, &response, &Default::default())?
         .response;
-    if let switchyard_protocol::ContentBlock::ToolCall(call) = &mut expected.outputs[0].content[1] {
+    if let switchyard_protocol::ContentBlockKind::ToolCall(call) =
+        &mut expected.outputs[0].content[1].kind
+    {
         call.arguments = json!({"city": "Paris"});
     }
     for target in [WireFormat::OpenAiChat, WireFormat::AnthropicMessages] {

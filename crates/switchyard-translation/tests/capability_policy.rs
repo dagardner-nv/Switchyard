@@ -32,35 +32,27 @@ const CASES: [CapabilityCase; 7] = [
 fn request_for(case: CapabilityCase) -> LlmRequest {
     let mut request = LlmRequest::default();
     let content = match case {
-        CapabilityCase::Tools => Some(ContentBlock::ToolCall(ToolCall {
+        CapabilityCase::Tools => Some(ContentBlock::tool_call(ToolCall {
             id: "call_1".to_string(),
             name: "lookup".to_string(),
             arguments: json!({}),
         })),
-        CapabilityCase::Images => Some(ContentBlock::Image {
-            source: ImageSource::Url {
-                url: "https://example.test/image.png".to_string(),
-                detail: None,
-            },
-        }),
-        CapabilityCase::Audio => Some(ContentBlock::Audio {
-            source: MediaSource::Base64 {
-                media_type: Some("audio/wav".to_string()),
-                data: "UklGRg==".to_string(),
-            },
-        }),
-        CapabilityCase::Video => Some(ContentBlock::Video {
-            source: MediaSource::Url {
-                url: "https://example.test/video.mp4".to_string(),
-                media_type: Some("video/mp4".to_string()),
-            },
-        }),
-        CapabilityCase::Files => Some(ContentBlock::File {
-            source: FileSource::FileData {
-                data: "aGVsbG8=".to_string(),
-                filename: Some("notes.txt".to_string()),
-            },
-        }),
+        CapabilityCase::Images => Some(ContentBlock::image(ImageSource::Url {
+            url: "https://example.test/image.png".to_string(),
+            detail: None,
+        })),
+        CapabilityCase::Audio => Some(ContentBlock::audio(MediaSource::Base64 {
+            media_type: Some("audio/wav".to_string()),
+            data: "UklGRg==".to_string(),
+        })),
+        CapabilityCase::Video => Some(ContentBlock::video(MediaSource::Url {
+            url: "https://example.test/video.mp4".to_string(),
+            media_type: Some("video/mp4".to_string()),
+        })),
+        CapabilityCase::Files => Some(ContentBlock::file(FileSource::FileData {
+            data: "aGVsbG8=".to_string(),
+            filename: Some("notes.txt".to_string()),
+        })),
         CapabilityCase::ReasoningEffort => {
             request.reasoning.effort = Some("medium".to_string());
             None

@@ -67,11 +67,9 @@ mod tests {
                     Message::text(Role::Assistant, "working"),
                     Message {
                         role: Role::User,
-                        content: vec![ContentBlock::ToolResult(ToolResult {
+                        content: vec![ContentBlock::tool_result(ToolResult {
                             tool_call_id: "t1".to_string(),
-                            content: vec![ContentBlock::Text {
-                                text: "ok".to_string(),
-                            }],
+                            content: vec![ContentBlock::text("ok".to_string())],
                             is_error: None,
                         })],
                     },
@@ -89,10 +87,8 @@ mod tests {
                 url_citations: Vec::new(),
                 role: Role::Assistant,
                 content: vec![
-                    ContentBlock::Text {
-                        text: "running a tool".to_string(),
-                    },
-                    ContentBlock::ToolCall(ToolCall {
+                    ContentBlock::text("running a tool".to_string()),
+                    ContentBlock::tool_call(ToolCall {
                         id: "t1".to_string(),
                         name: "bash".to_string(),
                         arguments: serde_json::json!({}),

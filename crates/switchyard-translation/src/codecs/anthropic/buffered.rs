@@ -18,9 +18,10 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
-    MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
-    SamplingParams, StopReason, Tool, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    AggLlmResponse, ContentBlock, ContentBlockKind, FileSource, ImageSource, InstructionBlock,
+    LlmRequest, MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams,
+    ResponseOutput, Role, SamplingParams, StopReason, Tool, ToolCall, ToolChoice, ToolDefinition,
+    ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -232,8 +233,10 @@ impl FormatCodec for AnthropicMessagesCodec {
                     .filter(|message| matches!(message.role, Role::System | Role::Developer))
                     .flat_map(|message| message.content.iter()),
             )
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } | ContentBlock::Refusal { text } => Some(text.as_str()),
+            .filter_map(|block| match &block.kind {
+                ContentBlockKind::Text { text } | ContentBlockKind::Refusal { text } => {
+                    Some(text.as_str())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -256,8 +259,8 @@ impl FormatCodec for AnthropicMessagesCodec {
         for (role, content, kind, index) in instructions.chain(inline) {
             for block in content {
                 if !matches!(
-                    block,
-                    ContentBlock::Text { .. } | ContentBlock::Refusal { .. }
+                    &block.kind,
+                    ContentBlockKind::Text { .. } | ContentBlockKind::Refusal { .. }
                 ) {
                     push_lossy(
                         &mut diagnostics,
@@ -404,9 +407,7 @@ impl FormatCodec for AnthropicMessagesCodec {
             }
         }
         if content.is_empty() {
-            content.push(ContentBlock::Text {
-                text: String::new(),
-            });
+            content.push(ContentBlock::text(String::new()));
         }
         let response = AggLlmResponse {
             id: body
@@ -624,9 +625,7 @@ fn strip_anthropic_unsupported_constraints(value: &mut Value) -> bool {
 // Decodes Anthropic's `system` field into instruction blocks.
 fn decode_anthropic_system(value: &Value) -> Result<Option<Vec<ContentBlock>>> {
     match value {
-        Value::String(text) if !text.is_empty() => {
-            Ok(Some(vec![ContentBlock::Text { text: text.clone() }]))
-        }
+        Value::String(text) if !text.is_empty() => Ok(Some(vec![ContentBlock::text(text.clone())])),
         Value::String(_) | Value::Null => Ok(None),
         Value::Array(blocks) => {
             let mut content = Vec::new();
@@ -639,7 +638,7 @@ fn decode_anthropic_system(value: &Value) -> Result<Option<Vec<ContentBlock>>> {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    content.push(ContentBlock::Text { text });
+                    content.push(ContentBlock::text(text));
                 }
             }
             Ok((!content.is_empty()).then_some(content))
@@ -660,10 +659,8 @@ fn decode_anthropic_content(
     policy: &TranslationPolicy,
 ) -> Result<Vec<ContentBlock>> {
     match value {
-        Value::String(text) => Ok(vec![ContentBlock::Text { text: text.clone() }]),
-        Value::Null => Ok(vec![ContentBlock::Text {
-            text: String::new(),
-        }]),
+        Value::String(text) => Ok(vec![ContentBlock::text(text.clone())]),
+        Value::Null => Ok(vec![ContentBlock::text(String::new())]),
         Value::Array(blocks) => {
             let mut content = Vec::new();
             for (index, block) in blocks.iter().enumerate() {
@@ -684,15 +681,13 @@ fn decode_anthropic_content(
                 )?);
             }
             if content.is_empty() {
-                content.push(ContentBlock::Text {
-                    text: String::new(),
-                });
+                content.push(ContentBlock::text(String::new()));
             }
             Ok(content)
         }
-        other => Ok(vec![ContentBlock::Text {
-            text: string_value(other).unwrap_or_default(),
-        }]),
+        other => Ok(vec![ContentBlock::text(
+            string_value(other).unwrap_or_default(),
+        )]),
     }
 }
 
@@ -705,14 +700,14 @@ fn decode_anthropic_content_block(
     policy: &TranslationPolicy,
 ) -> Result<Vec<ContentBlock>> {
     Ok(match block.get("type").and_then(Value::as_str) {
-        Some("text") => vec![ContentBlock::Text {
-            text: block
+        Some("text") => vec![ContentBlock::text(
+            block
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-        }],
-        Some("thinking") => vec![ContentBlock::Reasoning {
+        )],
+        Some("thinking") => vec![ContentBlock::new(ContentBlockKind::Reasoning {
             text: block
                 .get("thinking")
                 .and_then(Value::as_str)
@@ -724,8 +719,8 @@ fn decode_anthropic_content_block(
                 .filter(|signature| !signature.is_empty())
                 .map(ToOwned::to_owned),
             details: Vec::new(),
-        }],
-        Some("tool_use") => vec![ContentBlock::ToolCall(ToolCall {
+        })],
+        Some("tool_use") => vec![ContentBlock::tool_call(ToolCall {
             id: block
                 .get("id")
                 .and_then(Value::as_str)
@@ -744,7 +739,7 @@ fn decode_anthropic_content_block(
                 .to_string(),
             arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
         })],
-        Some("tool_result") => vec![ContentBlock::ToolResult(ToolResult {
+        Some("tool_result") => vec![ContentBlock::tool_result(ToolResult {
             tool_call_id: block
                 .get("tool_use_id")
                 .and_then(Value::as_str)
@@ -753,62 +748,54 @@ fn decode_anthropic_content_block(
             content: decode_tool_result_content(block.get("content").unwrap_or(&Value::Null)),
             is_error: block.get("is_error").and_then(Value::as_bool),
         })],
-        Some("image") => vec![ContentBlock::Image {
-            source: ImageSource::Raw(Value::Object(block.clone())),
-        }],
+        Some("image") => vec![ContentBlock::image(ImageSource::Raw(Value::Object(
+            block.clone(),
+        )))],
         Some("input_image") | Some("image_url") => decode_image_source(block)
-            .map(|source| vec![ContentBlock::Image { source }])
+            .map(|source| vec![ContentBlock::image(source)])
             .unwrap_or_default(),
-        Some("input_file") | Some("file") => vec![ContentBlock::File {
-            source: decode_file_source(block),
-        }],
-        Some("document") => vec![ContentBlock::File {
-            source: decode_anthropic_file_source(block),
-        }],
-        _ => vec![ContentBlock::Unknown {
+        Some("input_file") | Some("file") => vec![ContentBlock::file(decode_file_source(block))],
+        Some("document") => vec![ContentBlock::file(decode_anthropic_file_source(block))],
+        _ => vec![ContentBlock::new(ContentBlockKind::Unknown {
             provider: WireFormat::AnthropicMessages.into(),
             raw: Value::Object(block.clone()),
-        }],
+        })],
     })
 }
 
 // Preserves supported Anthropic tool-result blocks in the neutral IR.
 fn decode_tool_result_content(value: &Value) -> Vec<ContentBlock> {
     match value {
-        Value::String(text) => vec![ContentBlock::Text { text: text.clone() }],
+        Value::String(text) => vec![ContentBlock::text(text.clone())],
         Value::Array(blocks) => {
             let mut content = Vec::new();
             for block in blocks {
                 if let Some(block) = block.as_object() {
                     match block.get("type").and_then(Value::as_str) {
-                        Some("text") => content.push(ContentBlock::Text {
-                            text: block
+                        Some("text") => content.push(ContentBlock::text(
+                            block
                                 .get("text")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                        }),
-                        Some("image") => content.push(ContentBlock::Image {
-                            source: ImageSource::Raw(Value::Object(block.clone())),
-                        }),
-                        Some("document") => content.push(ContentBlock::File {
-                            source: decode_anthropic_file_source(block),
-                        }),
-                        _ => content.push(ContentBlock::Unknown {
+                        )),
+                        Some("image") => content.push(ContentBlock::image(ImageSource::Raw(
+                            Value::Object(block.clone()),
+                        ))),
+                        Some("document") => {
+                            content.push(ContentBlock::file(decode_anthropic_file_source(block)))
+                        }
+                        _ => content.push(ContentBlock::new(ContentBlockKind::Unknown {
                             provider: WireFormat::AnthropicMessages.into(),
                             raw: Value::Object(block.clone()),
-                        }),
+                        })),
                     }
                 }
             }
             content
         }
-        Value::Null => vec![ContentBlock::Text {
-            text: String::new(),
-        }],
-        other => vec![ContentBlock::Text {
-            text: json_string(other),
-        }],
+        Value::Null => vec![ContentBlock::text(String::new())],
+        other => vec![ContentBlock::text(json_string(other))],
     }
 }
 
@@ -838,6 +825,7 @@ fn decode_anthropic_tools(value: Option<&Value>) -> Vec<Tool> {
             let name = tool.get("name").and_then(Value::as_str)?.to_string();
             (!name.is_empty()).then(|| {
                 Tool::Function(ToolDefinition {
+                    extensions: None,
                     name,
                     description: tool
                         .get("description")
@@ -967,7 +955,7 @@ fn message_is_tool_result_only(message: &Message) -> bool {
         && message
             .content
             .iter()
-            .all(|block| matches!(block, ContentBlock::ToolResult(_)))
+            .all(|block| matches!(&block.kind, ContentBlockKind::ToolResult(_)))
 }
 
 // Encodes content while applying lossy-conversion policy to unknown blocks.
@@ -980,7 +968,10 @@ fn encode_anthropic_content_with_policy(
     for block in content {
         crate::codecs::openai_media::validate_media(block, WireFormat::AnthropicMessages)?;
         match block {
-            ContentBlock::Unknown { provider, raw } => {
+            ContentBlock {
+                kind: ContentBlockKind::Unknown { provider, raw },
+                ..
+            } => {
                 reject_responses_native_input_item(provider, raw, WireFormat::AnthropicMessages)?;
                 push_lossy(
                     diagnostics,
@@ -1067,9 +1058,13 @@ fn encode_anthropic_content(content: &[ContentBlock]) -> Result<Vec<Value>> {
 // Encodes response content, where synthetic reasoning may be shown to clients.
 fn encode_one_anthropic_response_block(block: &ContentBlock) -> Result<Vec<Value>> {
     match block {
-        ContentBlock::Reasoning {
-            text,
-            signature: None,
+        ContentBlock {
+            kind:
+                ContentBlockKind::Reasoning {
+                    text,
+                    signature: None,
+                    ..
+                },
             ..
         } => Ok(vec![json!({
             "type": "thinking",
@@ -1082,11 +1077,11 @@ fn encode_one_anthropic_response_block(block: &ContentBlock) -> Result<Vec<Value
 
 // Encodes a single normalized content block into Anthropic block JSON.
 fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
-    Ok(match block {
-        ContentBlock::Text { text } | ContentBlock::Refusal { text } => {
+    Ok(match &block.kind {
+        ContentBlockKind::Text { text } | ContentBlockKind::Refusal { text } => {
             vec![json!({"type": "text", "text": text})]
         }
-        ContentBlock::Reasoning {
+        ContentBlockKind::Reasoning {
             text,
             signature: Some(signature),
             ..
@@ -1095,18 +1090,18 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
             "thinking": text,
             "signature": signature,
         })],
-        ContentBlock::Reasoning { .. } => Vec::new(),
-        ContentBlock::ToolCall(call) => vec![json!({
+        ContentBlockKind::Reasoning { .. } => Vec::new(),
+        ContentBlockKind::ToolCall(call) => vec![json!({
             "type": "tool_use",
             "id": sanitize_anthropic_tool_use_id(&call.id),
             "name": call.name,
             "input": anthropic_tool_input(&call.arguments),
         })],
-        ContentBlock::ToolResult(result) => {
+        ContentBlockKind::ToolResult(result) => {
             let content = if result.content.iter().all(|block| {
                 matches!(
-                    block,
-                    ContentBlock::Text { .. } | ContentBlock::Refusal { .. }
+                    &block.kind,
+                    ContentBlockKind::Text { .. } | ContentBlockKind::Refusal { .. }
                 )
             }) {
                 Value::String(text_from_blocks(&result.content, " "))
@@ -1127,7 +1122,7 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
             }
             vec![item]
         }
-        ContentBlock::Image { source } => vec![match source {
+        ContentBlockKind::Image { source } => vec![match source {
             ImageSource::Url { url, .. } => match split_base64_data_uri(url) {
                 Some((media_type, data)) => json!({
                     "type": "image",
@@ -1145,8 +1140,8 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
             }),
             ImageSource::Raw(raw) => raw.clone(),
         }],
-        ContentBlock::File { source } => vec![encode_anthropic_file(source)?],
-        ContentBlock::Audio { source } => vec![match source {
+        ContentBlockKind::File { source } => vec![encode_anthropic_file(source)?],
+        ContentBlockKind::Audio { source } => vec![match source {
             MediaSource::Url { url, media_type } => {
                 json!({"type": "audio", "source": {"type": "url", "url": url, "media_type": media_type}})
             }
@@ -1160,7 +1155,7 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
             }),
             MediaSource::Raw(raw) => raw.clone(),
         }],
-        ContentBlock::Video { source } => vec![match source {
+        ContentBlockKind::Video { source } => vec![match source {
             MediaSource::Url { url, media_type } => {
                 json!({"type": "video", "source": {"type": "url", "url": url, "media_type": media_type}})
             }
@@ -1174,38 +1169,38 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
             }),
             MediaSource::Raw(raw) => raw.clone(),
         }],
-        ContentBlock::Mcp(_) => {
+        ContentBlockKind::Mcp(_) => {
             return Err(TranslationError::LossyConversion(
                 "MCP history encoding is not implemented".into(),
             ));
         }
-        ContentBlock::Unknown { raw, .. } => vec![raw.clone()],
+        ContentBlockKind::Unknown { raw, .. } => vec![raw.clone()],
     })
 }
 
 // Encodes only provider-safe block shapes inside Anthropic tool results.
 fn encode_one_anthropic_tool_result_block(block: &ContentBlock) -> Result<Vec<Value>> {
-    match block {
-        ContentBlock::Text { .. }
-        | ContentBlock::Refusal { .. }
-        | ContentBlock::Image { .. }
-        | ContentBlock::File { .. } => encode_one_anthropic_block(block),
-        ContentBlock::Unknown { provider, raw }
+    match &block.kind {
+        ContentBlockKind::Text { .. }
+        | ContentBlockKind::Refusal { .. }
+        | ContentBlockKind::Image { .. }
+        | ContentBlockKind::File { .. } => encode_one_anthropic_block(block),
+        ContentBlockKind::Unknown { provider, raw }
             if provider.as_str() == WireFormat::AnthropicMessages.as_str() =>
         {
             Ok(vec![raw.clone()])
         }
-        ContentBlock::Unknown { raw, .. } => {
+        ContentBlockKind::Unknown { raw, .. } => {
             Ok(vec![json!({"type": "text", "text": json_string(raw)})])
         }
-        ContentBlock::Mcp(_) => Err(TranslationError::LossyConversion(
+        ContentBlockKind::Mcp(_) => Err(TranslationError::LossyConversion(
             "MCP history encoding is not implemented".into(),
         )),
-        ContentBlock::Reasoning { .. }
-        | ContentBlock::Audio { .. }
-        | ContentBlock::Video { .. }
-        | ContentBlock::ToolCall(_)
-        | ContentBlock::ToolResult(_) => Ok(Vec::new()),
+        ContentBlockKind::Reasoning { .. }
+        | ContentBlockKind::Audio { .. }
+        | ContentBlockKind::Video { .. }
+        | ContentBlockKind::ToolCall(_)
+        | ContentBlockKind::ToolResult(_) => Ok(Vec::new()),
     }
 }
 

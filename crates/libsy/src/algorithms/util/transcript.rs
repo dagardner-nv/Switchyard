@@ -3,7 +3,7 @@
 
 //! Plain-text message rendering shared by routing judges.
 
-use switchyard_protocol::{ContentBlock, Message, Role};
+use switchyard_protocol::{ContentBlock, ContentBlockKind, Message, Role};
 
 /// Flattens a message to plain text, tool calls and tool results included.
 ///
@@ -16,8 +16,8 @@ pub(crate) fn message_text(message: &Message) -> String {
         message
             .content
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall(call) if call.name == "bash_command" => call
+            .filter_map(|block| match &block.kind {
+                ContentBlockKind::ToolCall(call) if call.name == "bash_command" => call
                     .arguments
                     .get("keystrokes")
                     .and_then(|value| value.as_str()),
@@ -104,14 +104,14 @@ pub(super) fn collect_text(
     tool_commands: &[&str],
 ) {
     for block in content {
-        match block {
-            ContentBlock::Text { text } | ContentBlock::Refusal { text } => {
+        match &block.kind {
+            ContentBlockKind::Text { text } | ContentBlockKind::Refusal { text } => {
                 parts.push(without_duplicated_terminus_commands(text, tool_commands));
             }
-            ContentBlock::ToolCall(call) => {
+            ContentBlockKind::ToolCall(call) => {
                 parts.push(format!("tool_call {}({})", call.name, call.arguments));
             }
-            ContentBlock::ToolResult(result) => collect_text(&result.content, parts, &[]),
+            ContentBlockKind::ToolResult(result) => collect_text(&result.content, parts, &[]),
             _ => {}
         }
     }
@@ -128,10 +128,8 @@ mod tests {
         let call = Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Text {
-                    text: "running it".to_string(),
-                },
-                ContentBlock::ToolCall(ToolCall {
+                ContentBlock::text("running it".to_string()),
+                ContentBlock::tool_call(ToolCall {
                     id: "call-1".to_string(),
                     name: "bash".to_string(),
                     arguments: json!({"cmd": "ls"}),
@@ -144,11 +142,9 @@ mod tests {
 
         let result = Message {
             role: Role::Tool,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: "call-1".to_string(),
-                content: vec![ContentBlock::Text {
-                    text: "no such file".to_string(),
-                }],
+                content: vec![ContentBlock::text("no such file".to_string())],
                 is_error: Some(true),
             })],
         };
@@ -163,24 +159,22 @@ mod tests {
         let message = Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Text {
-                    text: format!(
-                        "Before\n```json\n{}\n```\nAfter",
-                        json!({
-                            "analysis": "inspect the reported file",
-                            "commands": [
-                                {"keystrokes": first_command, "duration": 0.1},
-                                {"keystrokes": second_command, "duration": 0.1},
-                            ],
-                        })
-                    ),
-                },
-                ContentBlock::ToolCall(ToolCall {
+                ContentBlock::text(format!(
+                    "Before\n```json\n{}\n```\nAfter",
+                    json!({
+                        "analysis": "inspect the reported file",
+                        "commands": [
+                            {"keystrokes": first_command, "duration": 0.1},
+                            {"keystrokes": second_command, "duration": 0.1},
+                        ],
+                    })
+                )),
+                ContentBlock::tool_call(ToolCall {
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": first_command, "duration": 0.1}),
                 }),
-                ContentBlock::ToolCall(ToolCall {
+                ContentBlock::tool_call(ToolCall {
                     id: "call-2".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": second_command, "duration": 0.1}),
@@ -214,20 +208,18 @@ mod tests {
         let message = Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Text {
-                    text: format!(
-                        "First {} second {} repeated {}",
-                        batch(first_command),
-                        batch(second_command),
-                        batch(first_command)
-                    ),
-                },
-                ContentBlock::ToolCall(ToolCall {
+                ContentBlock::text(format!(
+                    "First {} second {} repeated {}",
+                    batch(first_command),
+                    batch(second_command),
+                    batch(first_command)
+                )),
+                ContentBlock::tool_call(ToolCall {
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": first_command}),
                 }),
-                ContentBlock::ToolCall(ToolCall {
+                ContentBlock::tool_call(ToolCall {
                     id: "call-2".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": second_command}),
@@ -253,13 +245,13 @@ mod tests {
         .to_string();
         let without_tool_call = Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::Text { text: text.clone() }],
+            content: vec![ContentBlock::text(text.clone())],
         };
         let mismatched_tool_call = Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Text { text },
-                ContentBlock::ToolCall(ToolCall {
+                ContentBlock::text(text),
+                ContentBlock::tool_call(ToolCall {
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": "sed -n '1,20p' app.py\n", "duration": 0.1}),
@@ -289,16 +281,16 @@ mod tests {
         let message = Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Text {
-                    text: json!({
+                ContentBlock::text(
+                    json!({
                         "commands": [
                             {"keystrokes": first_command},
                             {"keystrokes": second_command},
                         ],
                     })
                     .to_string(),
-                },
-                ContentBlock::ToolCall(ToolCall {
+                ),
+                ContentBlock::tool_call(ToolCall {
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": first_command}),
@@ -320,16 +312,16 @@ mod tests {
         let message = Message {
             role: Role::Assistant,
             content: vec![
-                ContentBlock::Text {
-                    text: json!({
+                ContentBlock::text(
+                    json!({
                         "commands": [
                             {"keystrokes": command},
                             {"keystrokes": command},
                         ],
                     })
                     .to_string(),
-                },
-                ContentBlock::ToolCall(ToolCall {
+                ),
+                ContentBlock::tool_call(ToolCall {
                     id: "call-1".to_string(),
                     name: "bash_command".to_string(),
                     arguments: json!({"keystrokes": command}),

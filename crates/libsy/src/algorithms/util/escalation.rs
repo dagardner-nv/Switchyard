@@ -497,7 +497,7 @@ pub(crate) fn request_at_turn(session_id: Option<&str>, turn: usize) -> Request 
 
 #[cfg(test)]
 mod tests {
-    use switchyard_protocol::{ContentBlock, Message, Role};
+    use switchyard_protocol::{ContentBlock, ContentBlockKind, Message, Role};
 
     use super::*;
     use crate::algorithms::util::llm_judge::Judge;
@@ -549,9 +549,7 @@ mod tests {
         assert_eq!(built.llm_request.instructions[0].role, Role::System);
         assert_eq!(
             built.llm_request.instructions[0].content.as_slice(),
-            &[ContentBlock::Text {
-                text: PROMPT_TEMPLATE.to_string()
-            }]
+            &[ContentBlock::text(PROMPT_TEMPLATE.to_string())]
         );
         assert_eq!(built.llm_request.messages.len(), 1);
         assert_eq!(built.llm_request.messages[0].role, Role::User);
@@ -669,12 +667,14 @@ mod tests {
         ] {
             let judge = escalation_judge(512, Some(phase), &contract)?;
             let built = judge.build_request(&State::default(), &request_at_turn(None, 1));
-            let system_prompt = built.llm_request.instructions[0].content.iter().find_map(
-                |content| match content {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                },
-            );
+            let system_prompt =
+                built.llm_request.instructions[0]
+                    .content
+                    .iter()
+                    .find_map(|content| match &content.kind {
+                        ContentBlockKind::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    });
             assert!(system_prompt.is_some_and(|prompt| {
                 prompt.starts_with("Custom trajectory rubric.")
                     && prompt.contains("EFFICIENT_EVALUATION")

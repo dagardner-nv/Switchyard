@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{Result, TranslationError};
 use crate::format::WireFormat;
-use crate::llm::{ContentBlock, FileSource, ImageSource, MediaSource};
+use crate::llm::{ContentBlock, ContentBlockKind, FileSource, ImageSource, MediaSource};
 use crate::util::json_string;
 
 pub(super) struct ImagePayload {
@@ -183,22 +183,22 @@ pub(super) fn audio_part(source: &MediaSource) -> Result<Value> {
 
 // File IDs belong to their provider; a target cannot resolve another provider's image ID.
 pub(super) fn validate_media(block: &ContentBlock, target: WireFormat) -> Result<()> {
-    let is_unsupported = match block {
-        ContentBlock::Image {
+    let is_unsupported = match &block.kind {
+        ContentBlockKind::Image {
             source: ImageSource::Raw(raw),
         } => raw.get("file_id").is_some() && target != WireFormat::OpenAiResponses,
-        ContentBlock::Audio { .. } => target == WireFormat::AnthropicMessages,
-        ContentBlock::File {
+        ContentBlockKind::Audio { .. } => target == WireFormat::AnthropicMessages,
+        ContentBlockKind::File {
             source: FileSource::FileId(_),
         } => target == WireFormat::AnthropicMessages,
-        ContentBlock::File {
+        ContentBlockKind::File {
             source: FileSource::Raw(raw),
         } if target == WireFormat::OpenAiChat => {
             raw.get("file_url").is_some()
                 || (raw.get("type").and_then(Value::as_str) == Some("document")
                     && raw["source"]["type"].as_str() == Some("url"))
         }
-        ContentBlock::ToolResult(result) => {
+        ContentBlockKind::ToolResult(result) => {
             for block in &result.content {
                 validate_media(block, target)?;
             }

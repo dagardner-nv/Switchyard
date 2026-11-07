@@ -26,6 +26,11 @@ serde_json = "1"
 
 ## Simple request
 
+[`ContentBlock`] holds a [`ContentBlockKind`] and optional provider `extensions`.
+The kind is flattened during serialization, preserving the existing `type`-tagged
+JSON shape. Extensions are omitted when absent. Block and function-tool extensions
+group provider fields by codec [`FormatId`], such as `anthropic_messages`.
+
 ```rust
 use switchyard_protocol::{ContentBlock, LlmRequest, Message, Role};
 
@@ -33,9 +38,7 @@ let request = LlmRequest {
     model: Some("provider/model".into()),
     messages: vec![Message {
         role: Role::User,
-        content: vec![ContentBlock::Text {
-            text: "Explain tail latency".into(),
-        }],
+        content: vec![ContentBlock::text("Explain tail latency")],
     }],
     ..LlmRequest::default()
 };
@@ -61,9 +64,7 @@ let request = Request {
         model: Some("provider/model".into()),
         instructions: vec![InstructionBlock {
             role: Role::System,
-            content: vec![ContentBlock::Text {
-                text: "Answer with concise operational guidance.".into(),
-            }],
+            content: vec![ContentBlock::text("Answer with concise operational guidance.")],
         }],
         messages: vec![Message::text(Role::User, "Why is p99 latency rising?")],
         tools: vec![ToolDefinition {
@@ -75,6 +76,7 @@ let request = Request {
                 "required": ["name"]
             }),
             strict: Some(true),
+            extensions: None,
         }.into()],
         tool_choice: Some(ToolChoice::Auto),
         sampling: SamplingParams {

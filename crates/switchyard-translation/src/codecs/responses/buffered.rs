@@ -24,9 +24,9 @@ use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
 use crate::llm::{
-    AggLlmResponse, ContentBlock, FileSource, ImageSource, LlmRequest, MediaSource, Message,
-    OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role, SamplingParams,
-    StopReason, Tool, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    AggLlmResponse, ContentBlock, ContentBlockKind, FileSource, ImageSource, LlmRequest,
+    MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
+    SamplingParams, StopReason, Tool, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -85,9 +85,7 @@ impl FormatCodec for OpenAiResponsesCodec {
         {
             request.instructions.push(crate::llm::InstructionBlock {
                 role: Role::System,
-                content: vec![ContentBlock::Text {
-                    text: instructions.to_string(),
-                }],
+                content: vec![ContentBlock::text(instructions.to_string())],
             });
         }
         // With `previous_response_id`, the provider holds the earlier turns, so a tool output
@@ -193,8 +191,10 @@ impl FormatCodec for OpenAiResponsesCodec {
             .instructions
             .iter()
             .flat_map(|instruction| instruction.content.iter())
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } | ContentBlock::Refusal { text } => Some(text.as_str()),
+            .filter_map(|block| match &block.kind {
+                ContentBlockKind::Text { text } | ContentBlockKind::Refusal { text } => {
+                    Some(text.as_str())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -337,10 +337,9 @@ impl FormatCodec for OpenAiResponsesCodec {
                     text_offset += output
                         .content
                         .iter()
-                        .map(|block| match block {
-                            ContentBlock::Text { text } | ContentBlock::Refusal { text } => {
-                                text.chars().count()
-                            }
+                        .map(|block| match &block.kind {
+                            ContentBlockKind::Text { text }
+                            | ContentBlockKind::Refusal { text } => text.chars().count(),
                             _ => 0,
                         })
                         .sum::<usize>();
@@ -372,9 +371,7 @@ impl FormatCodec for OpenAiResponsesCodec {
             ResponseOutput {
                 url_citations: Vec::new(),
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: String::new(),
-                }],
+                content: vec![ContentBlock::text(String::new())],
                 stop_reason: Some(StopReason::EndTurn),
             }
         }];
@@ -632,9 +629,9 @@ fn decode_responses_input(
                         // any other shape rides through as one text block.
                         let content = match item.get("output") {
                             Some(output @ Value::Array(_)) => decode_responses_content(output),
-                            output => vec![ContentBlock::Text {
-                                text: output.map(json_string).unwrap_or_default(),
-                            }],
+                            output => vec![ContentBlock::text(
+                                output.map(json_string).unwrap_or_default(),
+                            )],
                         };
                         // An output whose call is not in this body answers a call the provider
                         // holds behind `previous_response_id`; it stays a tool result so routing
@@ -735,10 +732,10 @@ fn decode_responses_input(
                                 ) => Role::Tool,
                                 _ => Role::User,
                             },
-                            content: vec![ContentBlock::Unknown {
+                            content: vec![ContentBlock::new(ContentBlockKind::Unknown {
                                 provider: WireFormat::OpenAiResponses.into(),
                                 raw: Value::Object(item.clone()),
-                            }],
+                            })],
                         };
                         flush_unattached_responses_reasoning(
                             &mut messages,
@@ -854,7 +851,7 @@ fn flush_responses_tool_block(
         content.extend(
             std::mem::take(pending_tool_calls)
                 .into_iter()
-                .map(ContentBlock::ToolCall),
+                .map(ContentBlock::tool_call),
         );
         messages.push(Message {
             role: Role::Assistant,
@@ -865,7 +862,7 @@ fn flush_responses_tool_block(
     for output in std::mem::take(pending_tool_outputs) {
         messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult(output)],
+            content: vec![ContentBlock::tool_result(output)],
         });
     }
 
@@ -879,11 +876,11 @@ fn decode_responses_reasoning_item(item: &Map<String, Value>) -> Vec<ContentBloc
         .and_then(Value::as_str)
         .and_then(super::decode_anthropic_thinking)
     {
-        return vec![ContentBlock::Reasoning {
+        return vec![ContentBlock::new(ContentBlockKind::Reasoning {
             text,
             signature: Some(signature),
             details: Vec::new(),
-        }];
+        })];
     }
     let mut parts = Vec::new();
     collect_responses_reasoning_text(item.get("content"), &mut parts);
@@ -898,17 +895,17 @@ fn decode_responses_reasoning_item(item: &Map<String, Value>) -> Vec<ContentBloc
     } else {
         Vec::new()
     };
-    vec![ContentBlock::Reasoning {
+    vec![ContentBlock::new(ContentBlockKind::Reasoning {
         text: parts.join("\n"),
         signature: None,
         details,
-    }]
+    })]
 }
 
 // Decodes Responses content arrays or strings into normalized content blocks.
 fn decode_responses_content(value: &Value) -> Vec<ContentBlock> {
     match value {
-        Value::String(text) => vec![ContentBlock::Text { text: text.clone() }],
+        Value::String(text) => vec![ContentBlock::text(text.clone())],
         Value::Array(blocks) => {
             let mut out = Vec::new();
             for block in blocks {
@@ -917,23 +914,23 @@ fn decode_responses_content(value: &Value) -> Vec<ContentBlock> {
                 };
                 match block.get("type").and_then(Value::as_str) {
                     Some("input_text") | Some("output_text") | Some("text") => {
-                        out.push(ContentBlock::Text {
-                            text: block
+                        out.push(ContentBlock::text(
+                            block
                                 .get("text")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                        });
+                        ));
                     }
-                    Some("refusal") => out.push(ContentBlock::Refusal {
-                        text: block
+                    Some("refusal") => out.push(ContentBlock::refusal(
+                        block
                             .get("refusal")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
-                    }),
+                    )),
                     Some("reasoning_text") | Some("summary_text") => {
-                        out.push(ContentBlock::Reasoning {
+                        out.push(ContentBlock::new(ContentBlockKind::Reasoning {
                             text: block
                                 .get("text")
                                 .and_then(Value::as_str)
@@ -941,38 +938,30 @@ fn decode_responses_content(value: &Value) -> Vec<ContentBlock> {
                                 .to_string(),
                             signature: None,
                             details: Vec::new(),
-                        });
+                        }));
                     }
                     Some("input_image") => {
                         if let Some(source) = decode_image_source(block) {
-                            out.push(ContentBlock::Image { source });
+                            out.push(ContentBlock::image(source));
                         }
                     }
-                    Some("input_audio") => out.push(ContentBlock::Audio {
-                        source: MediaSource::Raw(Value::Object(block.clone())),
-                    }),
-                    Some("input_file") => out.push(ContentBlock::File {
-                        source: decode_file_source(block),
-                    }),
-                    _ => out.push(ContentBlock::Unknown {
+                    Some("input_audio") => out.push(ContentBlock::audio(MediaSource::Raw(
+                        Value::Object(block.clone()),
+                    ))),
+                    Some("input_file") => out.push(ContentBlock::file(decode_file_source(block))),
+                    _ => out.push(ContentBlock::new(ContentBlockKind::Unknown {
                         provider: WireFormat::OpenAiResponses.into(),
                         raw: Value::Object(block.clone()),
-                    }),
+                    })),
                 }
             }
             if out.is_empty() {
-                out.push(ContentBlock::Text {
-                    text: String::new(),
-                });
+                out.push(ContentBlock::text(String::new()));
             }
             out
         }
-        Value::Null => vec![ContentBlock::Text {
-            text: String::new(),
-        }],
-        other => vec![ContentBlock::Text {
-            text: string_value(other).unwrap_or_default(),
-        }],
+        Value::Null => vec![ContentBlock::text(String::new())],
+        other => vec![ContentBlock::text(string_value(other).unwrap_or_default())],
     }
 }
 
@@ -1067,6 +1056,7 @@ fn decode_responses_tools(
             {
                 custom_tools.insert(name.to_string(), Value::Object(tool.clone()));
                 out.push(ToolDefinition {
+                    extensions: None,
                     name: name.to_string(),
                     description: tool
                         .get("description")
@@ -1082,6 +1072,7 @@ fn decode_responses_tools(
                     && !name.is_empty()
                 {
                     out.push(ToolDefinition {
+                        extensions: None,
                         name: name.to_string(),
                         description: function
                             .get("description")
@@ -1121,6 +1112,7 @@ fn push_responses_function_tool(
     }
 
     out.push(ToolDefinition {
+        extensions: None,
         name: name.to_string(),
         description: tool
             .get("description")
@@ -1145,6 +1137,7 @@ fn push_responses_id_tool(
     }
 
     out.push(ToolDefinition {
+        extensions: None,
         name: id.to_string(),
         description: tool
             .get("description")
@@ -1286,7 +1279,7 @@ fn encode_responses_input(
     let mut call_names: HashMap<&str, &str> = HashMap::new();
     for message in messages {
         for block in &message.content {
-            if let ContentBlock::ToolCall(call) = block {
+            if let ContentBlockKind::ToolCall(call) = &block.kind {
                 call_names.insert(call.id.as_str(), call.name.as_str());
             }
         }
@@ -1294,7 +1287,12 @@ fn encode_responses_input(
     for message in messages {
         // The decoder carries each native top-level input item as one
         // provider-qualified block, so replay that block in place.
-        if let [ContentBlock::Unknown { provider, raw }] = message.content.as_slice()
+        if let [
+            ContentBlock {
+                kind: ContentBlockKind::Unknown { provider, raw },
+                ..
+            },
+        ] = message.content.as_slice()
             && provider.as_str() == WireFormat::OpenAiResponses.as_str()
             && is_responses_native_input_item(raw)
         {
@@ -1307,8 +1305,8 @@ fn encode_responses_input(
             .iter()
             .filter(|block| {
                 !matches!(
-                    block,
-                    ContentBlock::Reasoning {
+                    &block.kind,
+                    ContentBlockKind::Reasoning {
                         signature: Some(_),
                         ..
                     }
@@ -1321,8 +1319,8 @@ fn encode_responses_input(
         }
         if content.iter().any(|block| {
             matches!(
-                block,
-                ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+                &block.kind,
+                ContentBlockKind::ToolCall(_) | ContentBlockKind::ToolResult(_)
             )
         }) {
             let mut visible_content = Vec::new();
@@ -1347,7 +1345,7 @@ fn encode_responses_input(
                         visible_content.clear();
                     }
                     encoded.push(item);
-                } else if !matches!(block, ContentBlock::Reasoning { .. }) {
+                } else if !matches!(&block.kind, ContentBlockKind::Reasoning { .. }) {
                     visible_content.push(block.clone());
                 }
             }
@@ -1376,7 +1374,7 @@ fn encode_responses_input(
             )? {
                 encoded.push(item);
                 emitted_special = true;
-            } else if !matches!(block, ContentBlock::Reasoning { .. }) {
+            } else if !matches!(&block.kind, ContentBlockKind::Reasoning { .. }) {
                 visible_content.push(block.clone());
             } else {
                 omitted_reasoning = true;
@@ -1447,13 +1445,13 @@ fn encode_responses_special_input(
     diagnostics: &mut Vec<TranslationDiagnostic>,
     policy: &TranslationPolicy,
 ) -> Result<Option<Value>> {
-    Ok(match block {
-        ContentBlock::Reasoning {
+    Ok(match &block.kind {
+        ContentBlockKind::Reasoning {
             text,
             signature: None,
             details,
         } => encode_responses_reasoning_input(text, details),
-        ContentBlock::ToolCall(call) if custom_tools.contains(&call.name) => {
+        ContentBlockKind::ToolCall(call) if custom_tools.contains(&call.name) => {
             // A freeform tool call replays as `custom_tool_call` with its raw input.
             custom_call_ids.insert(call.id.clone());
             Some(json!({
@@ -1463,7 +1461,7 @@ fn encode_responses_special_input(
                 "input": crate::codex_custom_tools::input_from_arguments(&call.arguments),
             }))
         }
-        ContentBlock::ToolCall(call) => {
+        ContentBlockKind::ToolCall(call) => {
             // A Responses client dispatches on name plus namespace, so undo the
             // qualification this request applied for a flat upstream.
             let (name, namespace) = namespaces
@@ -1484,7 +1482,7 @@ fn encode_responses_special_input(
             }
             Some(item)
         }
-        ContentBlock::ToolResult(result) => {
+        ContentBlockKind::ToolResult(result) => {
             // A result answering a freeform call replays as `custom_tool_call_output`; anything
             // else is a `function_call_output`.
             let mut item = json!({
@@ -1561,10 +1559,10 @@ fn encode_responses_content(
 ) -> Result<Value> {
     let has_non_text = content.iter().any(|block| {
         !matches!(
-            block,
-            ContentBlock::Text { .. }
-                | ContentBlock::Refusal { .. }
-                | ContentBlock::Reasoning { .. }
+            &block.kind,
+            ContentBlockKind::Text { .. }
+                | ContentBlockKind::Refusal { .. }
+                | ContentBlockKind::Reasoning { .. }
         )
     });
     if !has_non_text {
@@ -1572,12 +1570,14 @@ fn encode_responses_content(
     }
     let mut blocks = Vec::new();
     for block in content {
-        match block {
-            ContentBlock::Text { text } => blocks.push(json!({"type": "input_text", "text": text})),
-            ContentBlock::Refusal { text } => {
+        match &block.kind {
+            ContentBlockKind::Text { text } => {
+                blocks.push(json!({"type": "input_text", "text": text}))
+            }
+            ContentBlockKind::Refusal { text } => {
                 blocks.push(json!({"type": "refusal", "refusal": text}));
             }
-            ContentBlock::Image { source } => match responses_image_part(source) {
+            ContentBlockKind::Image { source } => match responses_image_part(source) {
                 Some(part) => blocks.push(part),
                 None => {
                     push_lossy(
@@ -1588,10 +1588,10 @@ fn encode_responses_content(
                     blocks.push(json!({"type": "input_text", "text": image_source_text(source)}));
                 }
             },
-            ContentBlock::Audio { source } => {
+            ContentBlockKind::Audio { source } => {
                 blocks.push(crate::codecs::openai_media::audio_part(source)?);
             }
-            ContentBlock::Video { source } => blocks.push(match source {
+            ContentBlockKind::Video { source } => blocks.push(match source {
                 MediaSource::Raw(raw) => json!({"type": "input_text", "text": json_string(raw)}),
                 MediaSource::Url { url, media_type } => json!({
                     "type": "input_video",
@@ -1603,7 +1603,7 @@ fn encode_responses_content(
                     "video": {"media_type": media_type, "data": data},
                 }),
             }),
-            ContentBlock::File { source } => match responses_file_part(source) {
+            ContentBlockKind::File { source } => match responses_file_part(source) {
                 Some(part) => blocks.push(part),
                 None => {
                     push_lossy(
@@ -1614,12 +1614,12 @@ fn encode_responses_content(
                     blocks.push(json!({"type": "input_text", "text": file_source_text(source)}));
                 }
             },
-            ContentBlock::Mcp(_) => {
+            ContentBlockKind::Mcp(_) => {
                 return Err(TranslationError::LossyConversion(
                     "MCP history encoding is not implemented".into(),
                 ));
             }
-            ContentBlock::Unknown { raw, .. } => {
+            ContentBlockKind::Unknown { raw, .. } => {
                 push_lossy(
                     diagnostics,
                     policy,
@@ -1627,9 +1627,9 @@ fn encode_responses_content(
                 )?;
                 blocks.push(json!({"type": "input_text", "text": json_string(raw)}));
             }
-            ContentBlock::Reasoning { .. }
-            | ContentBlock::ToolCall(_)
-            | ContentBlock::ToolResult(_) => {}
+            ContentBlockKind::Reasoning { .. }
+            | ContentBlockKind::ToolCall(_)
+            | ContentBlockKind::ToolResult(_) => {}
         }
     }
     Ok(Value::Array(blocks))
@@ -1644,8 +1644,8 @@ fn encode_responses_tool_output(
 ) -> Result<Value> {
     let text_only = content.iter().all(|block| {
         matches!(
-            block,
-            ContentBlock::Text { .. } | ContentBlock::Refusal { .. }
+            &block.kind,
+            ContentBlockKind::Text { .. } | ContentBlockKind::Refusal { .. }
         )
     });
     if text_only {
@@ -1789,7 +1789,7 @@ fn decode_responses_output_item(
         Some("function_call") => Ok(Some(ResponseOutput {
             url_citations: Vec::new(),
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -1807,7 +1807,7 @@ fn decode_responses_output_item(
         Some("custom_tool_call") => Ok(Some(ResponseOutput {
             url_citations: Vec::new(),
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -1834,10 +1834,10 @@ fn decode_responses_output_item(
         Some(kind) if super::is_native_output(kind) => Ok(Some(ResponseOutput {
             url_citations: Vec::new(),
             role: Role::Assistant,
-            content: vec![ContentBlock::Unknown {
+            content: vec![ContentBlock::new(ContentBlockKind::Unknown {
                 provider: WireFormat::OpenAiResponses.into(),
                 raw: Value::Object(item.clone()),
-            }],
+            })],
             stop_reason: None,
         })),
         _ => Ok(None),
@@ -1884,8 +1884,8 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
             .iter()
             .flat_map(|output| {
                 let has_output_items = output.content.iter().any(|block| {
-                    matches!(block, ContentBlock::ToolCall(_))
-                        || matches!(block, ContentBlock::Unknown { provider, raw }
+                    matches!(&block.kind, ContentBlockKind::ToolCall(_))
+                        || matches!(&block.kind, ContentBlockKind::Unknown { provider, raw }
                             if provider.as_str() == WireFormat::OpenAiResponses.as_str()
                                 && raw["type"].as_str().is_some_and(super::is_native_output))
                 });
@@ -1898,18 +1898,24 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                 };
                 let mut items = Vec::new();
 
-                let encrypted_reasoning = output.content.iter().find_map(|block| match block {
-                    ContentBlock::Reasoning { details, .. } => encrypted_reasoning_data(details),
-                    _ => None,
-                });
-                let encrypted_reasoning_id = output.content.iter().find_map(|block| match block {
-                    ContentBlock::Reasoning { details, .. } => encrypted_reasoning_item_id(details),
-                    _ => None,
-                });
+                let encrypted_reasoning =
+                    output.content.iter().find_map(|block| match &block.kind {
+                        ContentBlockKind::Reasoning { details, .. } => {
+                            encrypted_reasoning_data(details)
+                        }
+                        _ => None,
+                    });
+                let encrypted_reasoning_id =
+                    output.content.iter().find_map(|block| match &block.kind {
+                        ContentBlockKind::Reasoning { details, .. } => {
+                            encrypted_reasoning_item_id(details)
+                        }
+                        _ => None,
+                    });
                 let has_signed_reasoning = output.content.iter().any(|block| {
                     matches!(
-                        block,
-                        ContentBlock::Reasoning {
+                        &block.kind,
+                        ContentBlockKind::Reasoning {
                             signature: Some(_),
                             ..
                         }
@@ -1917,11 +1923,11 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                 });
                 if has_signed_reasoning {
                     for (index, block) in output.content.iter().enumerate() {
-                        if let ContentBlock::Reasoning {
+                        if let ContentBlockKind::Reasoning {
                             text,
                             signature,
                             details,
-                        } = block
+                        } = &block.kind
                         {
                             let encrypted = signature
                                 .as_deref()
@@ -1964,14 +1970,14 @@ fn encode_responses_output(outputs: &[ResponseOutput]) -> Value {
                     }));
                 }
 
-                items.extend(output.content.iter().filter_map(|block| match block {
-                    ContentBlock::ToolCall(call) => Some(json!({
+                items.extend(output.content.iter().filter_map(|block| match &block.kind {
+                    ContentBlockKind::ToolCall(call) => Some(json!({
                         "type": "function_call",
                         "call_id": call.id,
                         "name": call.name,
                         "arguments": json_string_python_style(&call.arguments),
                     })),
-                    ContentBlock::Unknown { provider, raw }
+                    ContentBlockKind::Unknown { provider, raw }
                         if provider.as_str() == WireFormat::OpenAiResponses.as_str()
                             && raw["type"].as_str().is_some_and(super::is_native_output) =>
                     {

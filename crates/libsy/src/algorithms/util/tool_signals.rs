@@ -21,7 +21,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use switchyard_protocol::codex_namespaces::{split_qualified_name, tool_namespaces};
-use switchyard_protocol::{ContentBlock, Request, Role, WireFormat};
+use switchyard_protocol::{ContentBlock, ContentBlockKind, Request, Role, WireFormat};
 
 use super::affinity::is_user_turn;
 use crate::{LibsyError, Result};
@@ -1076,9 +1076,9 @@ fn extract_tool_signals_with_window_and_semantics(
             assistant_turn_count += 1;
         }
         for block in &message.content {
-            match block {
+            match &block.kind {
                 _ if index < start => continue,
-                ContentBlock::ToolCall(call) => {
+                ContentBlockKind::ToolCall(call) => {
                     // Responses namespaced tools arrive as `<namespace>__<tool>`.
                     let bare_name = namespaces
                         .and_then(|namespaces| split_qualified_name(namespaces, &call.name))
@@ -1138,7 +1138,7 @@ fn extract_tool_signals_with_window_and_semantics(
                         code_semantic,
                     });
                 }
-                ContentBlock::ToolResult(result) => {
+                ContentBlockKind::ToolResult(result) => {
                     // Before the empty-text filter: empty results still count.
                     tool_result_count += 1;
                     let is_error = result.is_error == Some(true);
@@ -1190,7 +1190,7 @@ fn extract_tool_signals_with_window_and_semantics(
                     }
                 }
                 // Built-in tool history stays opaque so it can be replayed unchanged.
-                ContentBlock::Unknown { provider, raw }
+                ContentBlockKind::Unknown { provider, raw }
                     if provider.as_str() == WireFormat::OpenAiResponses.as_str()
                         && raw.get("type").and_then(Value::as_str)
                             == Some("apply_patch_call_output") =>
@@ -1203,7 +1203,7 @@ fn extract_tool_signals_with_window_and_semantics(
                     let is_error = raw.get("status").and_then(Value::as_str) == Some("failed");
                     tool_texts.push((text.to_owned(), is_error));
                 }
-                ContentBlock::Unknown { provider, raw }
+                ContentBlockKind::Unknown { provider, raw }
                     if provider.as_str() == WireFormat::OpenAiResponses.as_str()
                         && raw.get("type").and_then(Value::as_str) == Some("shell_call_output") =>
                 {
@@ -1296,8 +1296,8 @@ fn command_text(value: &Value) -> Option<String> {
 
 /// Text carried by a content block, ignoring the non-textual kinds.
 fn text_of(block: &ContentBlock) -> Option<&str> {
-    match block {
-        ContentBlock::Text { text } | ContentBlock::Refusal { text } => Some(text.as_str()),
+    match &block.kind {
+        ContentBlockKind::Text { text } | ContentBlockKind::Refusal { text } => Some(text.as_str()),
         _ => None,
     }
 }
@@ -1748,7 +1748,7 @@ mod tests {
     use serde_json::json;
     use switchyard_protocol::codex_namespaces::TOOL_NAMESPACES_KEY;
     use switchyard_protocol::{
-        ContentBlock, LlmRequest, Message, Metadata, Role, ToolCall, ToolResult,
+        ContentBlock, ContentBlockKind, LlmRequest, Message, Metadata, Role, ToolCall, ToolResult,
     };
 
     fn with_messages(messages: Vec<Message>) -> Request {
@@ -1768,7 +1768,7 @@ mod tests {
     fn tc(name: &str) -> Message {
         Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: String::new(),
                 name: name.to_string(),
                 arguments: json!({}),
@@ -1780,7 +1780,7 @@ mod tests {
     fn bash(command: &str) -> Message {
         Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: String::new(),
                 name: "Bash".to_string(),
                 arguments: json!({"command": command}),
@@ -1792,11 +1792,9 @@ mod tests {
     fn tr(text: &str) -> Message {
         Message {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: String::new(),
-                content: vec![ContentBlock::Text {
-                    text: text.to_string(),
-                }],
+                content: vec![ContentBlock::text(text.to_string())],
                 is_error: None,
             })],
         }
@@ -1896,7 +1894,11 @@ mod tests {
     fn structured_tool_failures_feed_error_and_recovery_signals() {
         for text in ["Dependency unavailable", "", "5 passed in 0.12s"] {
             let mut failed = tr(text);
-            let ContentBlock::ToolResult(result) = &mut failed.content[0] else {
+            let ContentBlock {
+                kind: ContentBlockKind::ToolResult(result),
+                ..
+            } = &mut failed.content[0]
+            else {
                 panic!("expected tool result");
             };
             result.is_error = Some(true);
@@ -2101,7 +2103,7 @@ mod tests {
     fn retrieved_file_contents_are_ignored() {
         let call = |id: &str, name: &str, arguments: Value| Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments,
@@ -2109,11 +2111,9 @@ mod tests {
         };
         let result = |id: &str, text: &str| Message {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: id.to_string(),
-                content: vec![ContentBlock::Text {
-                    text: text.to_string(),
-                }],
+                content: vec![ContentBlock::text(text.to_string())],
                 is_error: None,
             })],
         };
@@ -2163,10 +2163,10 @@ mod tests {
 
     // A request whose tool result answers the tool call.
     fn call_with_result(mut call: Message, mut result: Message) -> Request {
-        if let ContentBlock::ToolCall(call) = &mut call.content[0] {
+        if let ContentBlockKind::ToolCall(call) = &mut call.content[0].kind {
             call.id = "call-1".into();
         }
-        if let ContentBlock::ToolResult(result) = &mut result.content[0] {
+        if let ContentBlockKind::ToolResult(result) = &mut result.content[0].kind {
             result.tool_call_id = "call-1".into();
         }
         with_messages(vec![call, result])
@@ -2213,7 +2213,7 @@ mod tests {
     fn failed_reads_signal_unless_the_file_is_missing() {
         let failed = |text: &str| {
             let mut result = tr(text);
-            if let ContentBlock::ToolResult(result) = &mut result.content[0] {
+            if let ContentBlockKind::ToolResult(result) = &mut result.content[0].kind {
                 result.is_error = Some(true);
             }
             result
@@ -2262,7 +2262,7 @@ mod tests {
             });
             let call = Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolCall(ToolCall {
+                content: vec![ContentBlock::tool_call(ToolCall {
                     id: String::new(),
                     name: "terminal".to_string(),
                     arguments: json!({"command": "cat run.log"}),
@@ -2416,10 +2416,10 @@ mod tests {
                         raw["call_id"] = json!(call_id);
                         Message {
                             role: Role::User,
-                            content: vec![ContentBlock::Unknown {
+                            content: vec![ContentBlock::new(ContentBlockKind::Unknown {
                                 provider: WireFormat::OpenAiResponses.into(),
                                 raw,
-                            }],
+                            })],
                         }
                     })
                     .collect(),
@@ -2454,10 +2454,10 @@ mod tests {
                 success["call_id"] = json!(format!("success_{index}"));
                 request.llm_request.messages.push(Message {
                     role: Role::User,
-                    content: vec![ContentBlock::Unknown {
+                    content: vec![ContentBlock::new(ContentBlockKind::Unknown {
                         provider: WireFormat::OpenAiResponses.into(),
                         raw: success.clone(),
-                    }],
+                    })],
                 });
             }
             let recovered = ToolSignals::from_request(&request, Some(3));
@@ -2474,7 +2474,7 @@ mod tests {
         // ToolResult block, empty-content results included. assistant_turn_count
         // tracks Role::Assistant only, while turn_depth counts every message.
         let result = |content: Vec<ContentBlock>| {
-            ContentBlock::ToolResult(ToolResult {
+            ContentBlock::tool_result(ToolResult {
                 tool_call_id: String::new(),
                 content,
                 is_error: None,
@@ -2486,9 +2486,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![
-                    result(vec![ContentBlock::Text {
-                        text: "ok".to_string(),
-                    }]),
+                    result(vec![ContentBlock::text("ok".to_string())]),
                     result(Vec::new()),
                 ],
             },
@@ -2536,7 +2534,7 @@ mod tests {
     fn exec_command(cmd: Value) -> Message {
         Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: String::new(),
                 name: "exec_command".to_string(),
                 arguments: cmd,
@@ -2861,7 +2859,7 @@ mod tests {
         for arguments in arguments {
             let call = Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolCall(ToolCall {
+                content: vec![ContentBlock::tool_call(ToolCall {
                     id: String::new(),
                     name: "str_replace_based_edit_tool".to_string(),
                     arguments,

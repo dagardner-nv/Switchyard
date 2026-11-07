@@ -12,7 +12,7 @@ use switchyard_protocol::ModelId;
 use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::{FormatId, WireFormat};
-use crate::llm::{ContentBlock, LlmRequest, Message, PreservationMetadata};
+use crate::llm::{ContentBlock, ContentBlockKind, LlmRequest, Message, PreservationMetadata};
 use crate::policy::{
     LossyConversionPolicy, PreservationPolicy, TranslationPolicy, UnknownFieldPolicy,
 };
@@ -175,7 +175,7 @@ pub fn validate_request_capabilities(
     }
     if policy.target_capabilities.supports_images == Some(false)
         && messages_have_block(&request.messages, |block| {
-            matches!(block, ContentBlock::Image { .. })
+            matches!(&block.kind, ContentBlockKind::Image { .. })
         })
     {
         push_lossy(
@@ -186,7 +186,7 @@ pub fn validate_request_capabilities(
     }
     if policy.target_capabilities.supports_audio == Some(false)
         && messages_have_block(&request.messages, |block| {
-            matches!(block, ContentBlock::Audio { .. })
+            matches!(&block.kind, ContentBlockKind::Audio { .. })
         })
     {
         push_lossy(
@@ -197,7 +197,7 @@ pub fn validate_request_capabilities(
     }
     if policy.target_capabilities.supports_video == Some(false)
         && messages_have_block(&request.messages, |block| {
-            matches!(block, ContentBlock::Video { .. })
+            matches!(&block.kind, ContentBlockKind::Video { .. })
         })
     {
         push_lossy(
@@ -208,7 +208,7 @@ pub fn validate_request_capabilities(
     }
     if policy.target_capabilities.supports_files == Some(false)
         && messages_have_block(&request.messages, |block| {
-            matches!(block, ContentBlock::File { .. })
+            matches!(&block.kind, ContentBlockKind::File { .. })
         })
     {
         push_lossy(
@@ -245,8 +245,8 @@ pub fn validate_request_capabilities(
 fn messages_have_tools(messages: &[Message]) -> bool {
     messages_have_block(messages, |block| {
         matches!(
-            block,
-            ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_)
+            &block.kind,
+            ContentBlockKind::ToolCall(_) | ContentBlockKind::ToolResult(_)
         )
     })
 }
@@ -268,8 +268,10 @@ fn content_has_block(
 ) -> bool {
     content.iter().any(|block| {
         predicate(block)
-            || match block {
-                ContentBlock::ToolResult(result) => content_has_block(&result.content, predicate),
+            || match &block.kind {
+                ContentBlockKind::ToolResult(result) => {
+                    content_has_block(&result.content, predicate)
+                }
                 _ => false,
             }
     })

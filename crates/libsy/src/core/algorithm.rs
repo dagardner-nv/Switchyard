@@ -25,8 +25,8 @@ use tracing::Instrument;
 /// [`switchyard_protocol::LlmResponse`] carries either a live
 /// [`switchyard_protocol::LlmResponseStream`] or the terminal aggregate.
 use switchyard_protocol::{
-    AggLlmResponse, Category, ContentBlock, DecisionRequest, DecisionResponse, ModelId, Request,
-    Response, StopReason,
+    AggLlmResponse, Category, ContentBlockKind, DecisionRequest, DecisionResponse, ModelId,
+    Request, Response, StopReason,
 };
 
 use crate::{DriverError, LibsyError, Result, State, observability};
@@ -390,11 +390,11 @@ impl AnswerSummary {
                 && !output
                     .content
                     .iter()
-                    .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+                    .any(|block| matches!(&block.kind, ContentBlockKind::ToolCall(_)))
         }) && response.outputs.iter().any(|output| {
             output.role == switchyard_protocol::Role::Assistant
                 && output.content.iter().any(
-                    |block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()),
+                    |block| matches!(&block.kind, ContentBlockKind::Text { text } if !text.trim().is_empty()),
                 )
         });
         Self { final_reply }
@@ -957,7 +957,7 @@ mod tests {
     use crate::core::testing::{Serve, ServeResult, echo, reply, serve_decision, test_drive};
     use futures::StreamExt;
     use switchyard_protocol::{
-        LlmResponse, LlmResponseChunk, completion_text, text_request, text_response,
+        ContentBlock, LlmResponse, LlmResponseChunk, completion_text, text_request, text_response,
     };
 
     #[test]
@@ -968,7 +968,7 @@ mod tests {
         assert!(!AnswerSummary::of(&answer).final_reply);
         answer.outputs[0].stop_reason = Some(StopReason::EndTurn);
         let mut tool = answer.outputs[0].clone();
-        tool.content = vec![ContentBlock::ToolCall(switchyard_protocol::ToolCall {
+        tool.content = vec![ContentBlock::tool_call(switchyard_protocol::ToolCall {
             id: "call".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
@@ -976,7 +976,7 @@ mod tests {
         answer.outputs.push(tool);
         assert!(!AnswerSummary::of(&answer).final_reply);
         answer.outputs.pop();
-        answer.outputs[0].content = vec![ContentBlock::Text { text: "  ".into() }];
+        answer.outputs[0].content = vec![ContentBlock::text("  ")];
         assert!(!AnswerSummary::of(&answer).final_reply);
         assert!(!AnswerSummary::of(&AggLlmResponse::default()).final_reply);
     }

@@ -42,8 +42,8 @@ use switchyard_libsy::{
 use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver};
 use switchyard_protocol::{Category, ModelId};
 use switchyard_protocol::{
-    ContentBlock, LlmRequest, LlmResponse, Message, Metadata, Request, Response, Role,
-    RoutedLlmClient, ToolCall, ToolResult, Usage, WireFormat,
+    ContentBlock, ContentBlockKind, LlmRequest, LlmResponse, Message, Metadata, Request, Response,
+    Role, RoutedLlmClient, ToolCall, ToolResult, Usage, WireFormat,
 };
 use switchyard_protocol::{
     LlmClientError, LlmResponseChunk, LlmResponseStreamEvent, StopReason, text_request,
@@ -726,11 +726,11 @@ async fn affinity_warns_once_when_request_has_no_usable_identity() -> switchyard
         llm_request: LlmRequest {
             messages: vec![Message {
                 role: Role::User,
-                content: vec![ContentBlock::Reasoning {
+                content: vec![ContentBlock::new(ContentBlockKind::Reasoning {
                     text: "provider reasoning".to_string(),
                     signature: None,
                     details: Vec::new(),
-                }],
+                })],
             }],
             ..LlmRequest::default()
         },
@@ -1279,7 +1279,7 @@ async fn stage_router_records_algorithm_owned_metrics() -> switchyard_libsy::Res
                 Message::text(Role::User, "fix the build"),
                 Message {
                     role: Role::Assistant,
-                    content: vec![ContentBlock::ToolCall(ToolCall {
+                    content: vec![ContentBlock::tool_call(ToolCall {
                         id: "call_1".to_string(),
                         name: "Bash".to_string(),
                         arguments: json!({"command": "cargo test"}),
@@ -1287,11 +1287,11 @@ async fn stage_router_records_algorithm_owned_metrics() -> switchyard_libsy::Res
                 },
                 Message {
                     role: Role::Tool,
-                    content: vec![ContentBlock::ToolResult(ToolResult {
+                    content: vec![ContentBlock::tool_result(ToolResult {
                         tool_call_id: "call_1".to_string(),
-                        content: vec![ContentBlock::Text {
-                            text: "fatal runtime error: out of memory".to_string(),
-                        }],
+                        content: vec![ContentBlock::text(
+                            "fatal runtime error: out of memory".to_string(),
+                        )],
                         is_error: Some(true),
                     })],
                 },

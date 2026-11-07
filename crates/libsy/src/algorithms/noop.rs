@@ -34,9 +34,7 @@ impl Algorithm for Noop {
             outputs: vec![ResponseOutput {
                 url_citations: Vec::new(),
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "OK".to_string(),
-                }],
+                content: vec![ContentBlock::text("OK".to_string())],
                 stop_reason: Some(StopReason::EndTurn),
             }],
             ..Default::default()

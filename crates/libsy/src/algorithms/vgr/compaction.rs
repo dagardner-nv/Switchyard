@@ -10,7 +10,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use async_trait::async_trait;
-use switchyard_protocol::{ContentBlock, Message, Request, Response, Role, ToolCall, ToolResult};
+use switchyard_protocol::{
+    ContentBlock, ContentBlockKind, Message, Request, Response, Role, ToolCall, ToolResult,
+};
 
 use super::text::{clip_mid, turn_start};
 use crate::Result;
@@ -121,9 +123,9 @@ fn recorded(state: &State, request: &Request) -> Option<(usize, usize, String)> 
 
 fn rewrite(request: &mut Request, head: usize, cut: usize, summary: &str) {
     let messages = &mut request.llm_request.messages;
-    messages[head - 1].content.push(ContentBlock::Text {
-        text: summary.to_string(),
-    });
+    messages[head - 1]
+        .content
+        .push(ContentBlock::text(summary.to_string()));
     messages.drain(head..cut);
     drop_exact_replay(request);
 }
@@ -133,7 +135,7 @@ fn is_task_message(message: &Message) -> bool {
         && message
             .content
             .iter()
-            .any(|block| matches!(block, ContentBlock::Text { .. }))
+            .any(|block| matches!(&block.kind, ContentBlockKind::Text { .. }))
 }
 
 fn fingerprint(messages: &[Message]) -> String {
@@ -155,8 +157,8 @@ fn result_text(result: &ToolResult) -> String {
     result
         .content
         .iter()
-        .map(|part| match part {
-            ContentBlock::Text { text } => text.as_str(),
+        .map(|part| match &part.kind {
+            ContentBlockKind::Text { text } => text.as_str(),
             _ => "[non-text content]",
         })
         .collect::<Vec<_>>()
@@ -169,19 +171,19 @@ fn digest(messages: &[Message]) -> String {
     let mut user_text = Vec::new();
     for message in messages {
         for block in &message.content {
-            match block {
-                ContentBlock::Text { text } if message.role == Role::Assistant => {
+            match &block.kind {
+                ContentBlockKind::Text { text } if message.role == Role::Assistant => {
                     narration.push(text.as_str());
                 }
-                ContentBlock::Text { text } if message.role == Role::User => {
+                ContentBlockKind::Text { text } if message.role == Role::User => {
                     user_text.push(clip_mid(text, RECENT_RESULT_BUDGET, 0.5));
                 }
-                ContentBlock::ToolCall(call) => steps.push(Step {
+                ContentBlockKind::ToolCall(call) => steps.push(Step {
                     narration: std::mem::take(&mut narration),
                     call,
                     result: None,
                 }),
-                ContentBlock::ToolResult(result) => {
+                ContentBlockKind::ToolResult(result) => {
                     if let Some(step) = steps
                         .iter_mut()
                         .rev()
@@ -275,7 +277,7 @@ mod tests {
     fn call(id: &str, command: &str) -> Message {
         Message {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![ContentBlock::tool_call(ToolCall {
                 id: id.into(),
                 name: "bash".into(),
                 arguments: serde_json::json!({ "command": command }),
@@ -286,9 +288,9 @@ mod tests {
     fn result(id: &str, text: &str) -> Message {
         Message {
             role: Role::Tool,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![ContentBlock::tool_result(ToolResult {
                 tool_call_id: id.into(),
-                content: vec![ContentBlock::Text { text: text.into() }],
+                content: vec![ContentBlock::text(text)],
                 is_error: None,
             })],
         }
@@ -445,7 +447,7 @@ mod tests {
             content: ["a", "b"]
                 .into_iter()
                 .map(|id| {
-                    ContentBlock::ToolCall(ToolCall {
+                    ContentBlock::tool_call(ToolCall {
                         id: id.into(),
                         name: format!("tool_{id}"),
                         arguments: serde_json::json!({}),
@@ -459,11 +461,9 @@ mod tests {
                 content: order
                     .into_iter()
                     .map(|id| {
-                        ContentBlock::ToolResult(ToolResult {
+                        ContentBlock::tool_result(ToolResult {
                             tool_call_id: id.into(),
-                            content: vec![ContentBlock::Text {
-                                text: format!("output_{id}"),
-                            }],
+                            content: vec![ContentBlock::text(format!("output_{id}"))],
                             is_error: Some(id == "b"),
                         })
                     })

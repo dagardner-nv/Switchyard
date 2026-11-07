@@ -11,7 +11,7 @@ use libsy::{
     AffinityRouter, Algorithm, Classifier, Driver, Event, LibsyError, Processor, RoutingOutcome,
     State,
 };
-use switchyard_protocol::{ContentBlock, Message, ModelId, Request, Role};
+use switchyard_protocol::{ContentBlockKind, Message, ModelId, Request, Role};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -127,7 +127,7 @@ fn latest_user_prompt(messages: &[Message]) -> Option<String> {
             if !message
                 .content
                 .iter()
-                .any(|block| matches!(block, ContentBlock::ToolResult(_)))
+                .any(|block| matches!(&block.kind, ContentBlockKind::ToolResult(_)))
             {
                 skipped = true;
             }

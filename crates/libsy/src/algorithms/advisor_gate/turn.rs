@@ -3,7 +3,7 @@
 
 //! Extract reply text and tool-use signals for advisor review.
 
-use switchyard_protocol::{AggLlmResponse, ContentBlock, StopReason};
+use switchyard_protocol::{AggLlmResponse, ContentBlockKind, StopReason};
 
 // ── Response inspection ────────────────────────────────────────────────────
 
@@ -16,7 +16,7 @@ pub(super) fn has_tool_use(agg: &AggLlmResponse) -> bool {
             || output
                 .content
                 .iter()
-                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+                .any(|block| matches!(&block.kind, ContentBlockKind::ToolCall(_)))
     })
 }
 
@@ -26,8 +26,8 @@ pub(super) fn visible_text(agg: &AggLlmResponse) -> Option<String> {
         .outputs
         .iter()
         .flat_map(|output| output.content.iter())
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -48,8 +48,8 @@ pub(super) fn reasoning_text(agg: &AggLlmResponse) -> Option<String> {
         .outputs
         .iter()
         .flat_map(|output| output.content.iter())
-        .filter_map(|block| match block {
-            ContentBlock::Reasoning { text, .. } => Some(text.as_str()),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Reasoning { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();

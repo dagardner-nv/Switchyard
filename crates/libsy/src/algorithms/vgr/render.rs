@@ -6,7 +6,7 @@
 //! Each section is redacted before its budget applies, and user requirements
 //! render in full while trajectory and attempt evidence clip.
 
-use switchyard_protocol::{ContentBlock, Request, Role};
+use switchyard_protocol::{ContentBlockKind, Request, Role};
 
 use super::text::{Turn, clip_mid, content_text, redact, tool_result_failed};
 
@@ -86,18 +86,18 @@ fn agentic_trajectory(request: &Request) -> Vec<String> {
     let mut events = Vec::new();
     for message in messages {
         for block in &message.content {
-            let event = match block {
-                ContentBlock::Text { text } | ContentBlock::Refusal { text } => {
+            let event = match &block.kind {
+                ContentBlockKind::Text { text } | ContentBlockKind::Refusal { text } => {
                     match message.role {
                         Role::Assistant => Some(("assistant", text.clone())),
                         Role::Tool => Some(("tool result", text.clone())),
                         _ => None,
                     }
                 }
-                ContentBlock::ToolCall(call) => {
+                ContentBlockKind::ToolCall(call) => {
                     Some(("tool call", format!("{}({})", call.name, call.arguments)))
                 }
-                ContentBlock::ToolResult(result) => Some((
+                ContentBlockKind::ToolResult(result) => Some((
                     if tool_result_failed(result) {
                         "tool error"
                     } else {

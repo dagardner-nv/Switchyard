@@ -8,9 +8,9 @@ pub mod common;
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_translation::{
-    ContentBlock, FormatId, ImageSource, InstructionBlock, LlmRequest, LossyConversionPolicy,
-    Message, Role, TranslationEngine, TranslationError, TranslationPolicy, WireFormat,
-    prepare_request_for_target, sanitize_anthropic_tool_use_id,
+    ContentBlock, ContentBlockKind, FormatId, ImageSource, InstructionBlock, LlmRequest,
+    LossyConversionPolicy, Message, Role, TranslationEngine, TranslationError, TranslationPolicy,
+    WireFormat, prepare_request_for_target, sanitize_anthropic_tool_use_id,
 };
 
 use common::{REASONING_MODEL, normalized_policy, shell_tool_call};
@@ -87,9 +87,7 @@ fn anthropic_server_tools_survive_request_reconstruction() -> TestResult {
             function.description = Some("Updated edit description".into());
             request.instructions.push(InstructionBlock {
                 role: Role::System,
-                content: vec![ContentBlock::Text {
-                    text: "Plan first.".into(),
-                }],
+                content: vec![ContentBlock::text("Plan first.")],
             });
             request.preservation.requests.clear();
             let output = engine.encode_request(WireFormat::AnthropicMessages, &request, &policy)?;
@@ -167,10 +165,8 @@ fn openai_chat_rejects_mcp_history_before_text_only_returns() {
             messages: vec![Message {
                 role,
                 content: vec![
-                    ContentBlock::Text {
-                        text: "Keep this text".into(),
-                    },
-                    ContentBlock::Mcp(McpContent::Listing {
+                    ContentBlock::text("Keep this text"),
+                    ContentBlock::mcp(McpContent::Listing {
                         server_name: "inventory".into(),
                         id: None,
                         tools: Vec::new(),
@@ -2104,9 +2100,8 @@ fn responses_rebuild_preserves_inline_instructions() -> TestResult {
         "Top-level guidance.\n\nInitial system.\n\nInitial developer.\n\nLater system.\n\nLater developer.\n\nSeparate message."
     );
     assert_eq!(anthropic["messages"].as_array().map(Vec::len), Some(2));
-    request.messages.last_mut().ok_or("missing suffix")?.content = vec![ContentBlock::Text {
-        text: "Edited suffix.".into(),
-    }];
+    request.messages.last_mut().ok_or("missing suffix")?.content =
+        vec![ContentBlock::text("Edited suffix.")];
     let expected = json!({
         "model": "gpt-4",
         "instructions": "Top-level guidance.",
@@ -2133,15 +2128,11 @@ fn responses_rebuild_preserves_inline_instructions() -> TestResult {
 #[test]
 fn anthropic_reports_dropped_instruction_content() -> TestResult {
     let engine = TranslationEngine::default();
-    let image = ContentBlock::Image {
-        source: ImageSource::Url {
-            url: "https://example.test/layout.png".into(),
-            detail: None,
-        },
-    };
-    let text = ContentBlock::Text {
-        text: "Match this layout.".into(),
-    };
+    let image = ContentBlock::image(ImageSource::Url {
+        url: "https://example.test/layout.png".into(),
+        detail: None,
+    });
+    let text = ContentBlock::text("Match this layout.");
     let mut top_level = LlmRequest {
         messages: vec![Message::text(Role::User, "Hi")],
         ..LlmRequest::default()
@@ -3769,7 +3760,11 @@ fn openai_tool_result_error_flag_survives_decoding() -> TestResult {
         }
         let body = json!({"model": "route", "messages": [message]});
         let decoded = engine.decode_request(WireFormat::OpenAiChat, &body, &normalized_policy())?;
-        let ContentBlock::ToolResult(result) = &decoded.request.messages[0].content[0] else {
+        let ContentBlock {
+            kind: ContentBlockKind::ToolResult(result),
+            ..
+        } = &decoded.request.messages[0].content[0]
+        else {
             panic!("expected tool result");
         };
         assert_eq!(result.is_error, expected);
@@ -4584,10 +4579,12 @@ fn responses_lite_additional_tools_item_is_the_tool_list() -> TestResult {
     assert_eq!(names, vec!["exec", "update_plan"]);
     assert!(
         !decoded.request.messages.iter().any(|message| {
-            message
-                .content
-                .iter()
-                .any(|block| matches!(block, switchyard_protocol::ContentBlock::Unknown { .. }))
+            message.content.iter().any(|block| {
+                matches!(
+                    &block.kind,
+                    switchyard_protocol::ContentBlockKind::Unknown { .. }
+                )
+            })
         }),
         "the additional_tools item must not become a conversation message"
     );
@@ -5011,7 +5008,10 @@ fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
         .iter()
         .flat_map(|message| &message.content)
         .map(|block| match block {
-            ContentBlock::ToolResult(result) => Ok(result.tool_call_id.as_str()),
+            ContentBlock {
+                kind: ContentBlockKind::ToolResult(result),
+                ..
+            } => Ok(result.tool_call_id.as_str()),
             other => Err(format!("expected a tool result, got {other:?}")),
         })
         .collect::<Result<Vec<_>, _>>()?;

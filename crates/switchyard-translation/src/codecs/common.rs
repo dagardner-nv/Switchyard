@@ -6,7 +6,7 @@
 use serde_json::{Map, Value};
 
 use crate::error::{Result, TranslationError};
-use crate::llm::{ContentBlock, LlmRequest, Tool, ToolChoice};
+use crate::llm::{ContentBlock, ContentBlockKind, LlmRequest, Tool, ToolChoice};
 
 // Internal provenance survives mutations that invalidate exact request replay.
 pub(crate) const ANTHROPIC_REQUEST_KEY: &str = "switchyard_anthropic_request";
@@ -99,10 +99,10 @@ pub(crate) fn is_known_role_name(name: &str) -> bool {
 pub(crate) fn text_from_blocks(content: &[ContentBlock], separator: &str) -> String {
     content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            ContentBlock::Refusal { text } => Some(text.as_str()),
-            ContentBlock::Unknown { raw, .. } => raw.as_str(),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Text { text } => Some(text.as_str()),
+            ContentBlockKind::Refusal { text } => Some(text.as_str()),
+            ContentBlockKind::Unknown { raw, .. } => raw.as_str(),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -113,8 +113,8 @@ pub(crate) fn text_from_blocks(content: &[ContentBlock], separator: &str) -> Str
 pub(crate) fn reasoning_text_from_blocks(content: &[ContentBlock], separator: &str) -> String {
     content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Reasoning { text, .. } => Some(text.as_str()),
+        .filter_map(|block| match &block.kind {
+            ContentBlockKind::Reasoning { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()

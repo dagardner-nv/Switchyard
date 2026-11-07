@@ -37,7 +37,7 @@ the destination model. Select a Rust field or type for its full crate definition
 
 ### Messages and tool content
 
-<a href="../../../rust/switchyard_protocol/llm/struct.Message.html#structfield.role"><code>Message.role</code></a> is a <a href="../../../rust/switchyard_protocol/llm/enum.Role.html"><code>Role</code></a>; <a href="../../../rust/switchyard_protocol/llm/struct.Message.html#structfield.content"><code>Message.content</code></a> is an ordered <a href="../../../rust/switchyard_protocol/llm/enum.ContentBlock.html"><code>Vec&lt;ContentBlock&gt;</code></a>.
+<a href="../../../rust/switchyard_protocol/llm/struct.Message.html#structfield.role"><code>Message.role</code></a> is a <a href="../../../rust/switchyard_protocol/llm/enum.Role.html"><code>Role</code></a>; <a href="../../../rust/switchyard_protocol/llm/struct.Message.html#structfield.content"><code>Message.content</code></a> is an ordered <a href="../../../rust/switchyard_protocol/llm/struct.ContentBlock.html"><code>Vec&lt;ContentBlock&gt;</code></a>.
 The content variants cover text, reasoning, media, tools, MCP activity, refusals,
 and unknown provider blocks. An unknown block retains its source format and raw
 JSON. Its retention does not make it usable in a different API.

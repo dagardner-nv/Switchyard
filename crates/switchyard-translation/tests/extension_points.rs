@@ -338,13 +338,12 @@ impl FormatCodec for MinimalCustomCodec {
                 outputs: vec![ResponseOutput {
                     url_citations: Vec::new(),
                     role: Role::Assistant,
-                    content: vec![switchyard_translation::ContentBlock::Text {
-                        text: body
-                            .get("text")
+                    content: vec![switchyard_translation::ContentBlock::text(
+                        body.get("text")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
-                    }],
+                    )],
                     stop_reason: None,
                 }],
                 usage: Usage::default(),
@@ -374,8 +373,8 @@ impl FormatCodec for MinimalCustomCodec {
                 "text": response
                     .first_output()
                     .and_then(|output| {
-                        output.content.iter().find_map(|block| match block {
-                            switchyard_translation::ContentBlock::Text { text } => {
+                        output.content.iter().find_map(|block| match &block.kind {
+                            switchyard_translation::ContentBlockKind::Text { text } => {
                                 Some(text.clone())
                             }
                             _ => None,
