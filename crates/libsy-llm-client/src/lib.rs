@@ -33,6 +33,9 @@ pub mod raw;
 mod responses_reasoning;
 pub mod run;
 mod system_one;
+// BEGIN TEMPORARY TEST: Codex end-to-end tool diagnostics. Do not commit.
+pub mod temporary_tool_log;
+// END TEMPORARY TEST.
 
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};

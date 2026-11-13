@@ -82,6 +82,9 @@ fn frame_event(
     value: Value,
     redactor: &Redactor,
 ) -> Result<Event, serde_json::Error> {
+    // BEGIN TEMPORARY TEST: Codex end-to-end tool diagnostics. Do not commit.
+    crate::temporary_tool_log::response(&value, redactor);
+    // END TEMPORARY TEST.
     let data = redactor.json(serde_json::to_string(&value)?);
     match target_format {
         WireFormat::OpenAiChat => Ok(Event::default().data(data)),

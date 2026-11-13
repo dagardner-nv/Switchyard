@@ -576,6 +576,14 @@ impl TranslatingLlmClient {
             &self.client
         };
         let builder = client.post(url).json(body);
+        // BEGIN TEMPORARY TEST: Codex end-to-end tool diagnostics. Do not commit.
+        if backend.wire_format() == WireFormat::OpenAiChat && body.get("tools").is_some() {
+            eprintln!(
+                "  encoded tools: {}",
+                crate::temporary_tool_log::tool_names(&body["tools"]).join(", ")
+            );
+        }
+        // END TEMPORARY TEST.
         let builder = forward_metadata_headers(builder, metadata, backend);
         let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
@@ -636,6 +644,17 @@ impl TranslatingLlmClient {
             };
             metrics::record_upstream_attempt(Some(status.as_u16()));
             crate::payload_capture::record("response", || String::from_utf8_lossy(&body));
+            // BEGIN TEMPORARY TEST: Codex end-to-end tool diagnostics. Do not commit.
+            if backend.wire_format() == WireFormat::OpenAiChat
+                && let Ok(value) = serde_json::from_slice::<Value>(&body)
+                && let Some(log) = crate::temporary_tool_log::format_response(
+                    &value,
+                    "Response tool_call (Chat Completions)",
+                )
+            {
+                eprintln!("{log}");
+            }
+            // END TEMPORARY TEST.
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
                 body: body.to_vec(),
@@ -966,6 +985,23 @@ async fn prepare_response_stream(
             .map_err(convert_reqwest_error)
     });
     let mut chunks = decode_stream(bytes, backend.wire_format())?;
+    // BEGIN TEMPORARY TEST: Codex end-to-end tool diagnostics. Do not commit.
+    if backend.wire_format() == WireFormat::OpenAiChat {
+        chunks = chunks
+            .inspect(|event| {
+                if let Ok(event) = event
+                    && let Some(preserved) = event.preservation()
+                    && let Some(log) = crate::temporary_tool_log::format_response(
+                        preserved.raw(),
+                        "Response tool_call (Chat Completions)",
+                    )
+                {
+                    eprintln!("{log}");
+                }
+            })
+            .boxed();
+    }
+    // END TEMPORARY TEST.
     match chunks.next().await {
         None => Ok(stream::empty().boxed()),
         // Nothing has reached the caller, so transport failures can still be retried.

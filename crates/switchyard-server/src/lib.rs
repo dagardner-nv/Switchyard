@@ -14,6 +14,9 @@ mod routing_log;
 mod shutdown;
 mod sse;
 mod stats;
+// BEGIN TEMPORARY TEST: Codex end-to-end tool diagnostics. Do not commit.
+mod temporary_tool_log;
+// END TEMPORARY TEST.
 #[cfg(test)]
 mod testing;
 mod usage_metrics;
@@ -1041,6 +1044,9 @@ fn resolve_route(
     mut body: Value,
     wire_format: WireFormat,
 ) -> std::result::Result<(&Route, Request), Response> {
+    // BEGIN TEMPORARY TEST: Codex end-to-end tool diagnostics. Do not commit.
+    temporary_tool_log::request(&body);
+    // END TEMPORARY TEST.
     // Only trusted translation hops may supply exact request preservation state.
     // Strip it before decoding and retaining the raw body for upstream replay.
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {

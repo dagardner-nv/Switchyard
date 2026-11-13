@@ -34,6 +34,9 @@ pub(crate) fn into_http_response(
                 served_model.as_deref(),
                 &request_extensions,
             )?;
+            // BEGIN TEMPORARY TEST: Codex end-to-end tool diagnostics. Do not commit.
+            crate::temporary_tool_log::response(&body, &redactor);
+            // END TEMPORARY TEST.
             Ok(Json(body).into_response())
         }
         LlmResponse::Stream(stream) => {
