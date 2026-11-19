@@ -51,21 +51,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
       - name: Build manylinux x86_64 wheel
         shell: bash
         run: |
           set -euxo pipefail
           docker run --rm \
             -e MATURIN_VERSION="${MATURIN_VERSION}" \
+            -e CARGO_HOME=/tmp/switchyard-cargo \
+            -e RUSTUP_HOME=/tmp/switchyard-rustup \
             -v "${GITHUB_WORKSPACE}:/io" \
             -w /io \
             "quay.io/pypa/manylinux2014_x86_64" \
             /bin/bash -lc '
               set -euxo pipefail
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-              source "${HOME}/.cargo/env"
-              PYTHON=/opt/python/cp310-cp310/bin/python
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+              source "${CARGO_HOME}/env"
+              cargo --version
+              PYTHON=/opt/python/cp312-cp312/bin/python
               "${PYTHON}" -m pip install --upgrade pip
               "${PYTHON}" -m pip install "maturin==${MATURIN_VERSION}"
               "${PYTHON}" -m maturin build \
@@ -75,7 +78,7 @@ jobs:
                 --out dist \
                 --interpreter "${PYTHON}"
             '
-      - name: Smoke install wheel on Python 3.10
+      - name: Smoke install wheel on Python 3.12
         shell: bash
         run: |
           python -m pip install --upgrade pip

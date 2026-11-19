@@ -4,10 +4,13 @@
 //! Per-provider backend configuration: wire format, upstream URL, and auth.
 
 use std::time::Duration;
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use reqwest::RequestBuilder;
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use switchyard_protocol::{Metadata, WireFormat};
 
@@ -28,7 +31,14 @@ const OPENAI_OVERFLOW_PHRASES: &[&str] = &[
     "please reduce the length of the input",
     "exceeds the maximum allowed input length",
     "exceeds the maximum allowed length",
+    "exceeds the available context size",
     "is longer than the model's context length",
+    // llama-server, both of its ERROR_TYPE_EXCEED_CONTEXT_SIZE messages
+    // (tools/server/server-context.cpp). The structured check below catches
+    // them from `error.type`; these cover a proxy that rewrites the envelope
+    // and keeps the message.
+    "exceeds the available context size",
+    "larger than the max context size",
 ];
 
 // Anthropic has no structured `error.code`, so detection is phrase-based only.
@@ -45,24 +55,36 @@ pub struct HttpBackendConfig {
     /// Base URL of the provider API (e.g. `https://api.openai.com/v1`).
     pub base_url: String,
     /// API key for the provider, loaded by the caller. `None` sends no configured auth.
+    /// Client construction rejects active values that cannot form the provider's auth header.
     pub api_key: Option<String>,
     /// Whether this backend forwards the caller's provider credential and application headers.
     ///
-    /// All backends reachable through a forwarding route must use the same provider.
+    /// The forwarding backends in one route must use one credential family (OpenAI or
+    /// Anthropic) unless they all use the same scheme, host, and port, such as one LLM
+    /// gateway. Backends that send a configured key are not restricted.
     pub forward_auth: bool,
     /// Custom headers added to every outbound call to this backend.
     ///
     /// Provider-owned headers are rejected so a static value cannot replace
-    /// configured or forwarded auth. Header names are case-insensitive.
+    /// configured or forwarded auth. Names and values must be valid HTTP header bytes;
+    /// header names are case-insensitive.
+    /// Configured values replace caller values for the same header name.
     pub extra_headers: BTreeMap<String, String>,
     /// Default top-level request fields, applied only when the request omits the key.
     pub extra_body: BTreeMap<String, Value>,
+    /// Top-level request fields dropped from the outbound body before `extra_body` is merged,
+    /// so a target can reinstate one deliberately. For providers that reject an otherwise
+    /// standard field (e.g. an internal API that 400s on `max_output_tokens`).
+    pub omit_body_fields: BTreeSet<String>,
     /// Reasoning effort forced on every request to this backend, replacing whatever the caller
-    /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`;
-    /// Anthropic has no equivalent and rejects the setting at configuration time.
+    /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`,
+    /// and Anthropic Messages as `output_config.effort`.
     pub reasoning_effort: Option<String>,
-    /// Additional attempts after the initial upstream request.
+    /// Additional attempts for transient upstream failures.
+    /// One template-compatibility retry may also run within the same timeout.
     pub max_retries: u32,
+    /// Cooldown after an exhausted transient completion failure. Zero disables it.
+    pub failure_cooldown: Duration,
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
     /// `None` leaves the wait unbounded.
     pub timeout: Option<Duration>,
@@ -76,8 +98,10 @@ impl fmt::Debug for HttpBackendConfig {
             .field("forward_auth", &self.forward_auth)
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
+            .field("omit_body_fields", &self.omit_body_fields)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_retries", &self.max_retries)
+            .field("failure_cooldown", &self.failure_cooldown)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -98,8 +122,25 @@ pub enum Backend {
 }
 
 impl Backend {
-    // Checks custom headers before the client can send a request.
-    pub(crate) fn validate_extra_headers(&self, model_name: &str) -> Result<()> {
+    // Matches reqwest's header conversions before the client can send a request.
+    pub(crate) fn validate_configured_headers(&self, model_name: &str) -> Result<()> {
+        for (name, value) in &self.config().extra_headers {
+            if HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(LlmClientError::Configuration {
+                    message: format!(
+                        "model {model_name:?} extra_headers contains invalid HTTP header name {name:?}"
+                    ),
+                });
+            }
+            if HeaderValue::from_bytes(value.as_bytes()).is_err() {
+                return Err(LlmClientError::Configuration {
+                    message: format!(
+                        "model {model_name:?} has invalid HTTP header value for extra_headers entry {name:?}"
+                    ),
+                });
+            }
+        }
+
         let invalid_name = self.config().extra_headers.keys().find(|name| match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
                 name.eq_ignore_ascii_case("authorization")
@@ -122,6 +163,23 @@ impl Backend {
                 ),
             });
         }
+
+        let Some(api_key) = self.configured_api_key() else {
+            return Ok(());
+        };
+        let valid_api_key = match self {
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
+                HeaderValue::try_from(format!("Bearer {api_key}")).is_ok()
+            }
+            Backend::Anthropic(_) => HeaderValue::from_str(api_key).is_ok(),
+        };
+        if !valid_api_key {
+            return Err(LlmClientError::Configuration {
+                message: format!(
+                    "model {model_name:?} api_key cannot be encoded as an HTTP header"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -141,6 +199,19 @@ impl Backend {
             | Backend::OpenAiResponses(config)
             | Backend::Anthropic(config) => config,
         }
+    }
+
+    // Static credentials are unused when the caller's authorization is forwarded.
+    fn configured_api_key(&self) -> Option<&str> {
+        if self.is_forwarding_auth() {
+            None
+        } else {
+            self.config().api_key.as_deref()
+        }
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.config().base_url
     }
 
     /// The fully resolved upstream URL for this backend's endpoint.
@@ -166,11 +237,7 @@ impl Backend {
     /// `x-api-key: <key>` plus the required `anthropic-version` header. A backend
     /// with `forward_auth` uses the caller's provider credential instead.
     pub fn apply_auth(&self, mut builder: RequestBuilder) -> RequestBuilder {
-        let api_key = if self.is_forwarding_auth() {
-            None
-        } else {
-            self.config().api_key.as_deref()
-        };
+        let api_key = self.configured_api_key();
         match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
                 if let Some(api_key) = api_key {
@@ -255,6 +322,11 @@ impl Backend {
         &self.config().extra_body
     }
 
+    /// Top-level fields dropped from outbound request bodies before `extra_body` is merged.
+    pub fn omit_body_fields(&self) -> &BTreeSet<String> {
+        &self.config().omit_body_fields
+    }
+
     /// Reasoning effort forced on outbound requests, if the target configures one.
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.config().reasoning_effort.as_deref()
@@ -265,15 +337,14 @@ impl Backend {
         self.config().max_retries
     }
 
+    /// Cooldown after an exhausted transient completion failure.
+    pub fn failure_cooldown(&self) -> Duration {
+        self.config().failure_cooldown
+    }
+
     /// Deadline for all attempts and the complete response; `None` leaves the wait unbounded.
     pub fn timeout(&self) -> Option<Duration> {
         self.config().timeout
-    }
-
-    /// Whether this backend speaks the Anthropic Messages wire format — the only
-    /// one with a `count_tokens` endpoint.
-    pub fn is_anthropic(&self) -> bool {
-        matches!(self, Backend::Anthropic(_))
     }
 
     /// The upstream `/v1/messages/count_tokens` URL, derived from the same base
@@ -293,11 +364,19 @@ impl Backend {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => is_overflow_body(
                 body,
                 |value| {
-                    value
-                        .get("error")
-                        .and_then(|err| err.get("code"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("context_length_exceeded")
+                    let error = value.get("error");
+                    let field = |name| {
+                        error
+                            .and_then(|err| err.get(name))
+                            .and_then(serde_json::Value::as_str)
+                    };
+                    // llama-server puts the HTTP status in `code` as a number and
+                    // names the reason in `type`, so the canonical code never
+                    // matches. Its two overflow messages are worded unlike any
+                    // other provider's, which leaves the type as the signal that
+                    // holds across releases.
+                    field("code") == Some("context_length_exceeded")
+                        || field("type") == Some("exceed_context_size_error")
                 },
                 OPENAI_OVERFLOW_PHRASES,
             ),
@@ -374,8 +453,10 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
             max_retries: 0,
+            failure_cooldown: Duration::ZERO,
             timeout: None,
         }
     }
@@ -438,6 +519,75 @@ mod tests {
         );
     }
 
+    // Header validation follows reqwest for both accepted and rejected bytes.
+    #[test]
+    fn validates_additional_header_bytes() {
+        let cases = [
+            ("x-display-name", "café", None),
+            (
+                "bad header",
+                "value",
+                Some("invalid HTTP header name \"bad header\""),
+            ),
+            (
+                "x-test-header",
+                "bad\nvalue",
+                Some("invalid HTTP header value for extra_headers entry \"x-test-header\""),
+            ),
+        ];
+
+        for (name, value, expected) in cases {
+            let mut config = config("x");
+            config
+                .extra_headers
+                .insert(name.to_string(), value.to_string());
+            let result = Backend::OpenAiChat(config).validate_configured_headers("model");
+            match expected {
+                Some(expected) => assert!(
+                    result.is_err_and(|error| error.to_string().contains(expected)),
+                    "expected {expected:?}"
+                ),
+                None => result.expect("encodable header must pass validation"),
+            }
+        }
+    }
+
+    // Only static credentials that apply_auth would send are validated.
+    #[test]
+    fn configured_api_key_validation_matches_auth_application() {
+        const INVALID_KEY: &str = "canary\nsecret";
+        let mut config = config("x");
+        config.api_key = Some(INVALID_KEY.to_string());
+        let builders: [fn(HttpBackendConfig) -> Backend; 2] =
+            [Backend::OpenAiChat, Backend::Anthropic];
+        let client = reqwest::Client::new();
+
+        for build_backend in builders {
+            let error = build_backend(config.clone())
+                .validate_configured_headers("model")
+                .expect_err("invalid API key must fail")
+                .to_string();
+            assert!(
+                error.contains("api_key cannot be encoded as an HTTP header"),
+                "{error}"
+            );
+            assert!(!error.contains(INVALID_KEY), "API key leaked in: {error}");
+
+            let mut forwarded = config.clone();
+            forwarded.forward_auth = true;
+            let backend = build_backend(forwarded);
+            backend
+                .validate_configured_headers("model")
+                .expect("unused API key must not fail validation");
+            let request = backend
+                .apply_auth(client.get("https://example.test"))
+                .build()
+                .expect("request");
+            assert!(!request.headers().contains_key("authorization"));
+            assert!(!request.headers().contains_key("x-api-key"));
+        }
+    }
+
     #[test]
     fn openai_detects_canonical_and_wrapped_overflow() {
         let backend = Backend::OpenAiChat(config("x"));
@@ -463,6 +613,31 @@ mod tests {
         ));
         assert!(backend.is_context_overflow(
             r#"{"object":"error","message":"The input (12345 tokens) is longer than the model's context length (8192 tokens).","type":"BadRequestError","param":null,"code":400}"#
+        ));
+    }
+
+    #[test]
+    fn openai_detects_llama_server_overflow() {
+        let backend = Backend::OpenAiChat(config("x"));
+        // llama-server, numeric `code` and the reason in `type`. Both of the
+        // messages ERROR_TYPE_EXCEED_CONTEXT_SIZE can carry are here.
+        assert!(backend.is_context_overflow(
+            r#"{"error":{"code":400,"message":"request (600000 tokens) exceeds the available context size (524288 tokens), try increasing it","type":"exceed_context_size_error"}}"#
+        ));
+        assert!(backend.is_context_overflow(
+            r#"{"error":{"code":400,"message":"input (600000 tokens) is larger than the max context size (524288 tokens). skipping","type":"exceed_context_size_error"}}"#
+        ));
+        // The type alone is enough, so a reworded message still falls back.
+        assert!(backend.is_context_overflow(
+            r#"{"error":{"code":400,"message":"something new","type":"exceed_context_size_error"}}"#
+        ));
+        // And the message alone is enough, for a proxy that drops the type.
+        assert!(backend.is_context_overflow(
+            r#"{"error":{"code":400,"message":"request (600000 tokens) exceeds the available context size (524288 tokens), try increasing it"}}"#
+        ));
+        // llama-server's other 400s must still surface to the caller.
+        assert!(!backend.is_context_overflow(
+            r#"{"error":{"code":400,"message":"Invalid tool_choice","type":"invalid_request_error"}}"#
         ));
     }
 

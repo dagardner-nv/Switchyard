@@ -1,19 +1,17 @@
-# Stage-Router Routing
+# Stage Router
 
 **Execution** routing uses the stage router to choose a model from tool results
 and agent progress. Configure it with `type = "stage_router"`.
 
 Stage-router routing sends each request to either a **capable** model or a
-cheaper **efficient** one, depending on where the agent is in its run. The goal
-is to spend the capable model on the turns that need it (exploration, error
-recovery, hard reasoning) and let the efficient model carry the routine,
-mechanical work. Which tier a turn defaults to depends on the picker you choose
-(`capable_first` or `efficient_first`); the signals then move individual turns
-off that default. You configure it with a single knob, `confidence_threshold`,
-plus an optional LLM classifier.
+typically cheaper **efficient** one, depending on where the agent is in its run.
+The goal is to spend the capable model on turns that need exploration or error
+recovery and let the efficient model carry routine, mechanical work. Choose a
+required `picker` for ambiguous turns, tune the split with
+`confidence_threshold`, and optionally add an LLM classifier.
 
-If the selected target exceeds its context window, the client tries the route's
-remaining targets in configured order for that request. See
+Model-call fallback happens after the routing decision. Eligible context-window
+or availability failures can try the route's other completion target. See
 [Context-Window Handling](../operations/context_window.md).
 
 ## How it works
@@ -22,47 +20,98 @@ A tool-using agent's run moves through stages that call for different amounts of
 model capability. The built-in vocabulary is calibrated for coding agents: it
 recognizes file observation, mutation, planning, shell activity, and test results.
 
-For each LLM call, stage-router estimates which stage the agent is in from the
-**tool-result history** on the conversation, scoring two axes:
+For each LLM call without an active hold, stage-router estimates the agent's state from the
+conversation's **tool-result history**, scoring signals in two directions:
 
-- **WRONG → capable**: `severity` (windowed error severity), `spinning` (deep
+- **RECOVERY → capable**: `severity` (windowed error severity), `spinning` (deep
   churn with no reads or writes), and `exploring` (reading or planning without
   producing) push toward the capable tier.
-- **PROGRESS → efficient**: `recent_production_intensity` (writes and edits
-  landing over the recent window) pushes toward the efficient tier.
+- **PROGRESS → efficient**: `production_intensity` (the share of recent
+  recognized operations that are writes or edits) pushes toward the efficient
+  tier with 1.5 times the weight of one signal. Production with no error in the
+  recent window adds 1.2 more signals toward efficient, so clean production
+  resolves a turn to the efficient tier on its own, even when writes are a small
+  share of recent operations.
 
 The axes are **corroborative**: the signed score is `tanh`-squashed to a
-confidence in `[0, 1]`, so one full signal alone scores ~`0.46` and a second
-corroborating signal is what pushes it decisively past a `0.5` threshold. A
-repeated failures and critical-error severity are hard overrides that escalate. The router
-then routes:
-
-- the **capable** tier for uncertain, exploratory, or error-recovery turns, and
-- the **efficient** tier for settled, mechanical turns.
+confidence in `[0, 1]`. One maxed scoring dimension produces about `0.46`;
+corroborating evidence pushes confidence decisively past a `0.5` threshold.
+Repeated failures, critical-error severity, and context compaction are hard
+overrides to the capable tier. Set `compaction_override = false` to disable the
+compaction override in either picker. Active holds bypass signal extraction and scoring.
+Severity and test results come from tool output that ran something. The contents
+returned by the built-in read and search tools do not count, unless the tool
+reports a failure. Reading a missing file does not add error severity, even
+when the tool marks the result as an error.
 
 `confidence_threshold` sets how sure that estimate must be before the router acts
-on the signal alone. Below it, the turn stays on the picker's default tier (or,
-if you added the optional classifier, goes to it first). A turn with no
-tool-result history yet has no stage to estimate, so it takes the default tier.
+on the signal alone. Scores inside the ambiguous band go to the optional
+classifier and then, if it cannot decide, to the picker's default tier. A turn
+with no tool-result history follows the same fallback path.
 
 The routing decision for one turn:
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 26}}}%%
-flowchart LR
-    t["turn"] --> g{"confidence >= threshold?"}
-    g -->|yes| s["signals pick capable/efficient"]
-    g -->|no| c{"classifier set?"}
-    c -->|yes| k["classifier picks capable/efficient"]
-    c -->|no| d["use picker default tier"]
+%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 36, "rankSpacing": 38}}}%%
+flowchart TB
+    start(["New turn"])
+    hold{"Active hold?"}
+    heldRoute(["Route to held tier<br/>confidence = 1.0"])
+    history[/"Read tool-result history"/]
+    recovery{"Hard recovery signal?"}
+    scorer["Compute signed tool-signal score"]
+    band{"Outside the<br/>ambiguous band?"}
+    classifier{"Usable classifier verdict?"}
+    capable(["Route to CAPABLE"])
+    signalRoute(["Route by score sign<br/>negative → efficient · positive → capable"])
+    classifierRoute(["Route by classifier verdict"])
+    defaultRoute(["Route to picker default"])
 
-    classDef box font-family:monospace,fill:none,stroke:#9aa0a6,stroke-width:1px;
-    class t,s,k,d,g,c box;
+    start --> hold
+    hold -->|Yes| heldRoute
+    hold -->|No| history
+    history --> recovery
+    recovery -->|Yes| capable
+    recovery -->|No| scorer
+    scorer --> band
+    band -->|Yes| signalRoute
+    band -->|No · ambiguous| classifier
+    classifier -->|Yes| classifierRoute
+    classifier -->|No · absent or invalid| defaultRoute
+
+    classDef input fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e,stroke-width:2px;
+    classDef process fill:#f8fafc,stroke:#64748b,color:#1e293b,stroke-width:1.5px;
+    classDef decision fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px;
+    classDef capable fill:#ede9fe,stroke:#7c3aed,color:#4c1d95,stroke-width:3px;
+    classDef outcome fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px;
+
+    class start,history input;
+    class scorer process;
+    class hold,recovery,band,classifier decision;
+    class capable capable;
+    class heldRoute,signalRoute,classifierRoute,defaultRoute outcome;
 ```
 
-With `capable_first`, the default is capable, so a turn only reaches the cheaper
-efficient model on a confident efficient signal (or an efficient verdict from
-the classifier). Raising the threshold shrinks that path; lowering it widens it.
+Both pickers support `capable_hold_turns` (default `2`) and
+`efficient_hold_turns` (default `0` on standalone routes; composite's
+capable-first policy defaults to `-1`). A positive value holds that tier for the
+specified number of requests after a switch, excluding the switch request.
+Held requests do not restart the counter. A finite capable hold also starts or
+restarts on a signal-driven capable decision. Active holds return the selected
+tier at confidence `1.0` before extracting tool signals or scoring. The existing
+cascade then skips the fallback judge. Passing tests and errors do not end holds
+early, and held requests receive no handoff notes.
+
+Set either value to `0` to disable that hold, or `-1` to pin to that tier after
+switching into it. The initial selection does not activate a pin. Pins override
+later signals, including passing tests and critical errors, and skip the fallback
+judge. If both values are `-1`, the first tier switch pins its destination.
+Switches chosen by signals, the fallback judge, or the picker default all count.
+
+Holds use the existing session state and are separate for each agent ID. Supply
+a stable session ID across requests. A pin ends when that session state is cleared
+(including session completion, expiry, or a server restart). Values below `-1` or
+above `4294967295` are rejected.
 
 ## Pickers
 
@@ -83,102 +132,159 @@ Both pickers read the same signals; only the default tier differs.
     benchmarked, so there are no calibrated thresholds for it and no measured
     accuracy or cost figures to set expectations against. The server logs a
     warning at startup when a route selects it. Use `efficient_first` unless you
-    are running your own calibration.
+    are running your own calibration. See
+    [Reachable scores per picker](#reachable-scores-per-picker) for what a
+    threshold can and cannot do with each picker.
 
 ## Tuning `confidence_threshold`
 
-The scorer rates each turn from `0` (signals are neutral) to `1` (signals point
-hard at one tier). `confidence_threshold` is the bar that rating has to clear
-before the router will switch off the picker's default tier. Clear it and the
-router routes to the tier the signals indicate; fall short and the turn stays on
-the default.
+The tool-signal scorer gives each turn a signed score in `(-1, 1)`: negative
+scores point to the efficient tier, positive scores point to the capable tier,
+and the absolute value is the confidence. `confidence_threshold` creates a
+closed **ambiguous band** from `-threshold` to `+threshold`. Scores outside the
+band make a signal-based decision; scores inside it go to the optional
+classifier or fall back to the picker's default tier.
 
-With the default `capable_first` picker, every turn starts on the capable tier
-and only drops to the efficient tier when the signals say "efficient" and clear
-the threshold. So the threshold sets how much evidence it takes to switch to the
-cheaper tier:
-
-- Raise it and only strong, decisive signals drop a turn to efficient, so the
-  router stays on capable longer (more quality, more cost).
-- Lower it and weaker signals are enough to drop to efficient, so more turns go
-  cheap (more savings, more risk).
-
-`efficient_first` is the mirror: turns start on efficient and need a signal that
-clears the threshold to escalate to capable.
-
-(If you add the optional classifier, sub-threshold turns go to it instead of
-staying on the default tier.)
+The TOML schema requires you to choose `picker` explicitly; there is no implicit
+default.
 
 **Set `0.5` explicitly.** `confidence_threshold` is required by the TOML schema;
-`0.5` is the recommended starting point and what the example below uses.
+`0.5` is the recommended starting point, derived from many coding benchmarks,
+and what the example below uses.
 
-| `confidence_threshold` | Include `classifier:` block? | Typical use |
+### Reachable scores
+
+The scorer adds a few signals from the recent tool results. Error severity and
+stalls count toward the capable tier. Writes count toward the efficient tier.
+Each signal is bounded, so a turn's confidence can only reach a few values.
+These are the ones that matter when you choose a threshold:
+
+| Situation in the recent window | Confidence | Direction |
 |---|---|---|
-| `0.0` | no | Cost/latency-sensitive. Every signal-based verdict is accepted; no per-turn LLM call. Critical-error signals still escalate to capable. |
-| `0.5` | no | Recommended starting point. The scorer is corroborative — one full wrong signal scores ~`0.46`, just under `0.5` — so a decisive escalation takes a strong signal plus corroboration, while a critical error overrides regardless. Derived from SWE-Bench Pro Python-75 calibration. |
-| `0.7` - `0.9` | yes | Classifier-assisted. Low-confidence turns go to the LLM classifier before falling back to the default tier. |
-| `1.0` | yes (required) | Classifier-driven. Tool signals only apply hard overrides; other turns reach the classifier. |
+| A soft error alone | 0.21 | Capable |
+| A hard error alone, or a stall alone | 0.46 | Capable |
+| Every operation is a write, with a soft error | 0.49 | Efficient |
+| One write among three operations and no error, the smallest clean-production score at the default window | 0.69 | Efficient |
+| A hard error plus a stall | 0.76 | Capable. The most the signals reach in this direction (0.7616). |
+| Every operation is a write and no error | 0.87 | Efficient. The most the signals reach in this direction (0.8741). |
 
-The signal-vs-classifier split is dataset-dependent. Measure it in
-production: `/v1/stats` reports stage-router decisions by source and semantic
-target, while response headers and structured decision logs explain individual selections.
+Production turns the stall signals off, so with any production in the window
+the capable side stays below 0.46. An error in the window removes the
+clean-production bonus, so with a hard error the efficient side reaches at most
+0.24. The unit test `scorer_ceilings_match_the_documented_values` in
+[`crates/libsy/src/algorithms/util/stage.rs`](../../crates/libsy/src/algorithms/util/stage.rs)
+pins these values, so a change to the scorer fails CI until this table is
+updated.
+
+### Reachable scores per picker
+
+Both pickers use the same score. The picker only sets which direction the
+signals must prove.
+
+| Picker | The signals move a turn to | Reachable confidence | What a threshold means |
+|---|---|---|---|
+| `efficient_first` | Capable (escalation) | Up to 0.7616 | At `0.5`, a hard error alone (0.46) stays in the band, so an escalation needs a second signal, a hard override, or the classifier. Below 0.46, a hard error alone escalates. At `0.77` and above, the signals never escalate; only overrides, capable holds, and the classifier can. |
+| `capable_first` | Efficient (offload) | Up to 0.8741, and at most 0.49 when an error is in the window | At `0.5`, clean production offloads (0.69 and up at the default window) and nothing else does. Below 0.49, production with a soft error in the window also offloads. At `0.88` and above, the signals never offload. |
+
+Lower the threshold to let the signals decide more turns. Raise it to keep more
+turns on the picker's default tier. Hard overrides, capable holds, and the
+classifier do not use the threshold. The server warns at startup that
+`capable_first` has no calibrated threshold.
+
+### What `0.5` means with `efficient_first`
+
+![Illustrative Stage score distribution with an ambiguous band from -0.5 to 0.5. Scores below -0.5 route efficient, scores in the band fall back to efficient, and scores above 0.5 route capable. Dotted markers show the most the signals can reach: +0.76 toward capable and -0.87 toward efficient.](../assets/stage-router-threshold.svg)
+
+With `picker = "efficient_first"`, no classifier, and a threshold of `0.5`:
+
+- scores below `-0.5` route to efficient from the tool signals;
+- scores from `-0.5` through `+0.5` are ambiguous and fall back to efficient;
+- scores above `+0.5` route to capable from the tool signals.
+
+Hard overrides and capable-hold state can still select capable independently of
+this score. Lowering the threshold narrows the ambiguous band, so more turns are
+decided directly by the scorer. Raising it widens the band, so more turns use the
+picker default (or the classifier, when configured). That movement changes the
+efficient/capable routing split.
+
+| `confidence_threshold` | Behavior | Typical use |
+|---|---|---|
+| `0.0` | Every non-zero score makes a signal-based decision. A neutral score or missing tool history still falls through. | Maximize decisions by the tool-signal scorer. |
+| `0.5` | Scores from `-0.5` through `+0.5` are ambiguous. | Recommended starting point, derived from many coding benchmarks. |
+| `1.0` | Every ordinary score is ambiguous; hard overrides and capable holds still apply. | Classifier-driven when a classifier is configured; picker-driven otherwise. |
+
+A route with a `1.0` threshold remains valid without a classifier. In that case,
+ordinary sub-threshold turns fall back to the picker's default tier; hard
+overrides and capable-hold behavior still apply.
+
+The signal-vs-classifier split is dataset-dependent. Measure it in production:
+`/v1/stats` reports decision counts by source and selected target, plus aggregate
+scorer metrics. Response headers and structured decision logs explain individual
+selections.
 
 ### Calibrating the threshold from run data
 
-The recommended `0.5` starting point was derived from SWE-Bench Pro Python-75
-calibration. To tune for a different task set or model pair, follow this
-minimum-data path.
+Use about 10% of your representative tasks. Replay their agent histories through
+the Stage tool-signal scorer and collect the unthresholded signed score for each
+ordinary turn. Track hard overrides and capable holds separately because changing
+the threshold does not affect them. Plot the score distribution, then overlay
+candidate ambiguous bands.
 
-**What you need**
-
-| Run | Coverage | Purpose |
-|---|---|---|
-| Pure-capable | ~40–75 representative tasks | Baseline outcomes + signal features |
-| Pure-efficient | ~20 tasks (sampled from capable results) | Counterfactual outcomes |
-
-Neither run needs to cover the full task set. A few dozen capable tasks gives
-enough outcome diversity; the efficient probe only needs to cover the interesting
-quadrant candidates identified from those capable results.
-
-**How to sample the efficient probe set**
-
-Stratify the pure-capable results across four quadrant candidates before running efficient:
-
-| Category | Criterion | Count | Value |
-|---|---|---|---|
-| Easy + clean | Capable passes, small diff, clear spec | ~5 | Establishes SAFE floor |
-| Easy + tricky | Capable passes, subtle logic | ~5 | Finds RESCUE candidates |
-| Hard + structural | Capable fails, large multi-file diff | ~5 | HARD noise baseline |
-| Hard + localized | Capable fails, small targeted fix | ~5 | Finds LOSS candidates |
-
-Sample across repos and diff sizes. Don't over-represent one project.
-
-**Building RESCUE / LOSS quadrants**
-
-For efficient-to-capable escalation, group the overlap tasks (those with both
-capable and efficient results):
-
-- `RESCUE` = efficient-fail ∩ capable-pass, a candidate for beneficial escalation
-- `LOSS`   = efficient-pass ∩ capable-fail, a candidate for harmful escalation
-- `SAFE`   = both pass
-- `HARD`   = both fail
-
-Sweep a few candidate thresholds in routed benchmark runs. For
-`efficient_first`, choose the lowest threshold that improves outcomes on RESCUE
-tasks without turning passing LOSS tasks into failures. Because the scorer is
-corroborative, a `0.5` threshold takes
-roughly 1.5 signals of agreement.
-
-**Caveat on fixed-model outcomes vs. routed outcomes**
-
-After a switch, the selected model inherits conversation history from the other
-model. Fixed-model runs do not measure this effect. Inherited context may help
-or hurt, so these quadrants identify candidates, not guaranteed outcomes.
-Validate the threshold with routed runs on the same tasks.
+For `efficient_first`, count how many turns fall below the band, inside it, and
+above it. Without a classifier, those regions map to signal-selected efficient,
+default-efficient, and signal-selected capable decisions. Choose the threshold
+that gives the routing split you want, then validate it on the same sample before
+running the full task set.
 
 ## Route configuration
 
-> Requires unreleased features. [Build from source](../getting_started.md#build-from-source) to run this example.
+### Knob reference
+
+Every key a `stage_router` route accepts. The `handoff_notes` and `classifier`
+tables are optional. The
+[TOML schema](../reference/toml_schema.md#stage_router) has the full table with
+required columns.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `capable_target` | required | Capable tier. |
+| `efficient_target` | required | Efficient tier. |
+| `picker` | required | `efficient_first` or `capable_first` (experimental). Tier used when the signals are not confident. |
+| `confidence_threshold` | required | Corroboration a decisive pick needs, `0` to `1`. Alias `efficient_first_threshold`. |
+| `capable_first_threshold` | `0.0` | Used only after an outer `composite` classifier selects the capable tier. No effect on a standalone route. |
+| `capable_system_prompt` | unset | System prompt prepended for capable requests. |
+| `efficient_system_prompt` | unset | System prompt prepended for efficient requests. |
+| `recent_turn_window` | `3` | Trailing tool results the signals are computed over. |
+| `compaction_override` | `true` | Context compaction forces capable. Set `false` to use the other signals and picker normally. |
+| `capable_hold_turns` | `2` | Requests kept on capable after switching to it; signal-driven capable decisions also start finite holds. `0` disables; `-1` pins after a switch. |
+| `efficient_hold_turns` | `0` | Requests kept on efficient after switching to it. `0` disables; `-1` pins after a switch. |
+| `tool_semantics.observe` | `[]` | Domain tool names that count as investigation. |
+| `tool_semantics.mutate` | `[]` | Domain tool names that count as production. |
+| `tool_semantics.plan` | `[]` | Domain tool names that count as planning. |
+| `tool_semantics.new` | `[]` | Domain tool names that count as neutral forward activity. |
+| `handoff_notes.escalation_note` | required in the table | Note handed to the capable tier when the signals or a hard override escalate. |
+| `handoff_notes.deescalation_note` | unset | Note handed to the efficient tier whenever the signals select it, with or without a capable turn before. |
+| `handoff_notes.only_on_wrong_signal_escalation` | `true` | When `true`, restricts escalation notes to signal-driven capable decisions. Held turns receive no notes with either setting. |
+| `classifier.target` | required in the table | Judge target. Not a routing destination. |
+| `classifier.base_threshold` | required for LLM judges | Lowest `p_solve` that still routes efficient. |
+| `classifier.threshold_step` | `0.0` | Added once for uncertain or unmatched verdicts, twice for unsupported. |
+| `classifier.fail_open` | `true` | On judge failure, fall open to the picker default instead of failing the request. |
+| `classifier.decision` | unset | Use a decision model instead of an LLM judge. Excludes the LLM judge keys below. |
+| `classifier.classify_trigger` | `every_request` | Only the default is accepted. The judge runs on every ambiguous turn. |
+| `classifier.message_hash_fallback` | `false` | Rejected at load. The judge retains no verdict. |
+| `classifier.recent_turn_window` | unset | Trailing messages the judge sees after the opening task. A different unit from the route's `recent_turn_window`, which counts tool results. |
+| `classifier.prompt` | packaged | Replaces the judge prompt. |
+| `classifier.response_format_type` | `json_schema` | `json_object` for providers without JSON Schema. |
+| `classifier.max_output_tokens` | `4096` | Token budget for the verdict. |
+| `classifier.judge_deadline_ms` | unset | Whole-consultation bound in milliseconds on the judge call, response drain included. On expiry the judge counts as failed and `classifier.fail_open` applies. Must be at least `1`. |
+| `subagents` | unset | Separate policy for delegated sub-agent work. |
+
+`classifier.response_schema`, `classifier.policy`, and any `classifier.mode`
+other than `capability` belong to
+[composite](composite_routing.md#custom-llm-classifier) routes and are rejected
+here. `classifier.mode = "capability"` is accepted and changes nothing.
+
+### Minimal route
 
 ```toml
 schema_version = 1
@@ -188,12 +294,12 @@ format = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 
-[targets.strong]
+[targets.capable]
 id = "openai/gpt-4o"
 llm_client = "openrouter"
 # system_prompt = "diagnose before you edit"  # optional
 
-[targets.weak]
+[targets.efficient]
 id = "openai/gpt-4o-mini"
 llm_client = "openrouter"
 # system_prompt = "follow the settled plan"  # optional
@@ -201,12 +307,13 @@ llm_client = "openrouter"
 [routes.stage]
 id = "switchyard/stage"
 type = "stage_router"
-capable_target = "strong"
-efficient_target = "weak"
+capable_target = "capable"
+efficient_target = "efficient"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3          # optional, defaults to 3
 capable_hold_turns = 2          # optional, defaults to 2
+efficient_hold_turns = 0        # optional; -1 pins after switching to efficient
 ```
 
 Save as `routes.toml` and start the server:
@@ -216,6 +323,44 @@ switchyard-server --config routes.toml --port 4000
 ```
 
 This is the recommended default: routing on tool signals alone, no classifier.
+
+### Plan and execute
+
+To start with the capable model and keep using the efficient model after a
+switch, add this route to the [minimal configuration](#minimal-route):
+
+```toml
+[routes.plan_execute]
+id = "switchyard/plan-execute"
+type = "stage_router"
+capable_target = "capable"
+efficient_target = "efficient"
+picker = "capable_first"
+confidence_threshold = 0.0
+capable_hold_turns = 0
+efficient_hold_turns = -1
+capable_system_prompt = "Inspect the task and plan before modifying files."
+```
+
+With no tool history, Stage selects capable and adds the planning prompt.
+After successful writes, Stage can select efficient; critical failures can keep
+capable selected. A switch from capable to efficient starts a hold that keeps
+selecting efficient while the session state remains. Later tool errors do not
+end it. Only capable requests receive the planning prompt. See
+[How it works](#how-it-works) for scoring and hold behavior.
+
+Send requests to `switchyard/plan-execute` with the same
+`x-switchyard-session-id` from the first planning request onward. Include the
+full conversation, including the plan, tool calls, and results. For the Responses
+API, send that history in `input` and omit both `previous_response_id` and
+`conversation`. Known continuation IDs bypass Stage even with full input
+history. Send `x-switchyard-session-final: true` when the shared session ends to
+clear all of its agents' state.
+
+When migrating from the removed `plan_execute` type, use this recipe and replace
+`planning_prompt` with `capable_system_prompt`. Stage has no exact equivalent
+for the old judged handoff or reasoning-to-text conversion; keep the plan in
+ordinary conversation text so the executor receives it.
 
 ### Optional: custom tool semantics
 
@@ -238,58 +383,70 @@ The categories affect existing stage signals:
 - `plan` counts as investigation, like the built-in planning tools.
 - `new` records forward activity that suppresses false `spinning` and
   `exploring` signals, but does not otherwise favor either tier.
-- `unknown` remains the fallback for tools that match neither the built-in
-  vocabulary nor configured semantics.
+- Unmatched tools remain `unknown`; there is no `unknown` configuration key.
 
 Configuration cannot reclassify a built-in tool. Empty names, duplicate names
 across categories, and unknown category keys are rejected when the route is
 loaded. Argument-aware wrapper tools, inferred semantics, and learned routing
 rules are outside this exact-name configuration.
 
+MCP tools match by their bare tool name or by their full name. Claude Code sends
+an MCP tool as `mcp__<server>__<tool>`, and Codex sends it with a separate
+`namespace`. For both, `send_payment_request` matches the `send_payment_request`
+tool on the `billing` MCP server, and so does
+`mcp__billing__send_payment_request`. A server name that contains `__` needs the
+full name.
+
 ### Optional: handoff notes
 
-Add a `[routes.stage.handoff_notes]` section to pass a contextual note to the
-model the router switches to. The escalation note is sent to the capable tier on
-a signal-driven escalation; the de-escalation note is sent when the scorer
-decisively picks the efficient tier.
+Add a `[routes.stage.handoff_notes]` section to append contextual guidance to a
+request when tool signals decide its tier. Notes exist only in the forwarded
+request; they do not accumulate in the caller's conversation. The escalation
+note accompanies a signal-driven capable decision, and the optional de-escalation
+note accompanies a signal-driven efficient decision.
 
 ```toml
 [routes.stage.handoff_notes]
 escalation_note = "the previous model was stalling; pick up the diagnosis"
 # deescalation_note = "..."          # optional
-# only_on_wrong_signal_escalation = true  # default; set false to always send
+# only_on_wrong_signal_escalation = true  # default; held turns never receive notes
 ```
+
+Classifier and picker-default decisions do not add handoff notes.
 
 ### Optional: LLM classifier fallback
 
-The block is optional, and omitting it is the default. With no
-`[routes.stage.classifier]` block there is no judge and no fallthrough to one:
-a turn the signals leave undecided goes straight to the `picker` tier.
+The block is optional. Without it, an ambiguous turn goes directly to the
+`picker` tier.
 
-To break ties on low-confidence turns with a model call, add the block and set
-`confidence_threshold` above `0.0`. The classifier is consulted only for turns
-that fall below the threshold:
+To judge ambiguous turns with a model call, add the block. The classifier runs
+when the scorer has no tool history or produces a score inside the closed
+ambiguous band:
 
 ```toml
+[targets.stage_judge]
+id = "openai/gpt-4o-mini"
+llm_client = "openrouter"
+
 [routes.stage.classifier]
-target = "strong"          # target the judge is called through (not a routing destination)
+target = "stage_judge"     # judge-only; never a completion destination
 base_threshold = 0.5       # p_solve floor to route efficient; below this → capable
-threshold_step = 0.1       # adds 0.1 for uncertain and 0.2 for unsupported verdicts
-recent_turn_window = 3     # conversation span the judge sees
+threshold_step = 0.1       # +0.1 for uncertain/unmatched; +0.2 for unsupported
+recent_turn_window = 3     # trailing turns added to the opening task
 prompt = "Estimate whether the efficient target can complete this request."
 response_format_type = "json_object"  # optional; default is "json_schema"
 ```
 
 `prompt` replaces the packaged capability-classifier prompt. In the default
-`json_schema` mode, Switchyard sends the verdict schema through the structured-output
-request. Set `response_format_type = "json_object"` for providers that only support
-JSON Object mode; Switchyard then adds the schema to the judge prompt and validates
-the returned object locally. The verdict schema and routing thresholds remain unchanged.
+`json_schema` mode, Switchyard sends the verdict schema through the
+structured-output request. Set `response_format_type = "json_object"` for
+providers that only support JSON Object mode; Switchyard then adds the schema to
+the judge prompt and validates the returned object locally. The verdict schema
+and routing thresholds remain unchanged.
 
-Leave the block out under
-[Composite Routing](composite_routing.md). There the tier is already picked
-at the user turn, so a fallthrough judge would sit between the signals and that
-decision and overrule it.
+The nested stage table in [Composite Routing](composite_routing.md) does not
+accept a `classifier` block. Its outer classifier supplies the tier used when
+the stage signals are ambiguous.
 
 Give the classifier its own LLM client or quota bucket where possible. Sharing
 one provider bucket with the efficient tier adds a request per classified turn
@@ -297,24 +454,28 @@ and can cause sustained 429s at scale.
 
 ## Observability
 
-Each response carries two routing headers:
+When a model serves the request, the response identifies it with this routing
+header:
 
 | Header | Content |
 |---|---|
-| `x-model-router-selected-model` | The model ID the turn was routed to. |
+| `x-model-router-selected-model` | The model ID that served the response, including any model-call fallback. |
 
 ### Decision sources
 
-The router records an internal `decision_source` for each turn to distinguish the
-paths through its cascade:
+The router labels each resolved turn with a `decision_source`. `/v1/stats`
+counts turns by it under `algorithm_stats.stage_router.routing_decisions`, and
+the `stage router override` log line carries it for overrides:
 
 | Source | When |
 |---|---|
 | `override` | A repeated failure, critical-error severity, or context-compaction marker forced the capable tier. Structured logs set `override_reason` to `repeated_failure`, `critical_error`, or `compaction`. |
-| `capable_hold` | A recent escalation kept this recovery turn on the capable tier. |
-| `dimensions` | The corroborative scorer crossed `confidence_threshold` and picked the tier by the sign of the score. |
-| `llm-classifier` | The signals were ambiguous and the classifier returned a verdict. |
-| `fall_open` | The signals were ambiguous and the classifier failed or wasn't configured; the default tier was used. |
+| `capable_hold` | A hold or pin kept this turn on capable. Any switch to capable can start it; signal-driven capable decisions also start finite holds. |
+| `efficient_hold` | A configured hold or pin kept this turn on the efficient tier. |
+| `dimensions` | The signed score fell outside the ambiguous band and selected a tier. |
+| `ambiguous` | The signed score stayed inside the band. This label never reaches `/v1/stats` or the logs: the turn continues to the classifier or the picker default, and that later source is recorded. |
+| `llm-classifier` | The signals were ambiguous and the classifier returned a usable verdict. |
+| `fall_open` | The signal scorer abstained and the classifier was absent or could not decide, so the picker default was used. |
 
 ## When *not* to use stage-router
 
@@ -323,10 +484,15 @@ paths through its cascade:
   [Random Routing](random_routing.md) (`type = "random"`).
   The stage-router's signals are wasted on a fixed traffic ratio.
 - **No tool-result history.** Stage-router needs meaningful tool-call traffic to
-  populate the tool-result signal. For pure chat-completion workloads every
-  ambiguous request lands on the picker's default tier.
+  populate its signals. For pure chat-completion workloads, the signal scorer
+  abstains; the optional classifier decides, or the request uses the picker
+  default when no classifier is configured.
 
 ## Related
 
-- [Architecture](../architecture.md): the end-to-end request lifecycle and
-  system boundaries.
+- [Model Selection](model_selection.md): choose and check the two models before
+  tuning the threshold.
+- [Mechanics of Libsy](../mechanics_of_libsy.md): the execution model and host responsibilities.
+- [TOML Schema](../reference/toml_schema.md#stage_router): the complete
+  configuration reference.
+- [Tuning](../tuning/index.md): check your current route and compare candidate settings on your workload.

@@ -3,7 +3,7 @@
 
 //! Minimal Python API for running Rust-owned libsy algorithms.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -11,18 +11,22 @@ use http::HeaderMap;
 use http::header::{HeaderName, HeaderValue};
 use pyo3::exceptions::{PyBaseException, PyStopAsyncIteration, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use serde_json::Value;
 use switchyard_libsy::{
-    Algorithm, CallModel, ClassifierContractConfig, ClassifierResponseFormat, ClassifyTrigger,
-    CustomClassifierConfig, CustomClassifierPolicy, EscalationJudgeConfig, HandoffNoteConfig,
-    LibsyError as RustLibsyError, LlmClassifierConfig, LlmFallback, LlmTaskClassifier, Noop,
-    PickerMode, Random, RoutingOutcome, RuntimeModels, StageRouter, StageRouterConfig,
-    Step as RustStep, StepStream, TaskClassifierConfig, ToolSemantics,
+    Algorithm, CallDecision, CallModel, CapabilityJudgeConfig, ClassifierContractConfig,
+    ClassifierResponseFormat, ClassifyTrigger, CustomClassifierConfig, CustomClassifierPolicy,
+    DEFAULT_UNMATCHED_STEPS, DecisionJudgeConfig, DeescalationConfig, EscalationJudgeConfig,
+    HandoffNoteConfig, LibsyError as RustLibsyError, LlmCapabilityConfig, LlmClassifierConfig,
+    LlmFallback, LlmTaskClassifier, Noop, PickerMode, Random, RoutingOutcome, RuntimeModels,
+    StageRouter, StageRouterConfig, State, Step as RustStep, StepStream, TaskClassifierConfig,
+    ToolSemantics,
 };
 use switchyard_protocol::{
-    Category, LlmClientError, LlmResponse, LlmResponseStream, LlmResponseStreamEvent, Metadata,
-    ModelId, Request, Response,
+    Category, DecisionResponse, LlmClientError, LlmResponse, LlmResponseStream,
+    LlmResponseStreamEvent, Metadata, ModelId, Request, Response,
 };
+use switchyard_runner::{AlgorithmFactory, require_target_labels};
 use tokio::sync::Mutex;
 
 use crate::errors::{ContextWindowExceededError, py_libsy_error};
@@ -75,6 +79,21 @@ fn header_map_from_python(headers: &HashMap<String, String>) -> PyResult<http::H
     Ok(result)
 }
 
+/// Attach normalized host metadata to a provider-neutral request.
+fn request_from_python(
+    request: &Bound<'_, PyAny>,
+    headers: Option<HashMap<String, String>>,
+) -> PyResult<Request> {
+    let headers = headers.as_ref().map(header_map_from_python).transpose()?;
+    let mut llm_request = from_python(request)?;
+    switchyard_translation::normalize_compaction(&mut llm_request, headers.as_ref());
+    Ok(Request {
+        llm_request,
+        raw_request: None,
+        metadata: headers.map(|headers| Metadata::from_headers(&headers)),
+    })
+}
+
 /// Classifier settings shared by standalone and stage-router classifiers.
 #[pyclass(
     name = "TaskClassifierConfig",
@@ -93,6 +112,49 @@ impl PyTaskClassifierConfig {
     }
 }
 
+/// Settings for returning an escalated session to the efficient tier.
+///
+/// `strong_min_calls` and `confirmations` must be positive; `strong_max_calls`, when set,
+/// must not be lower than `strong_min_calls`. Classifier construction reports invalid values
+/// as `ValueError`.
+#[pyclass(
+    name = "DeescalationConfig",
+    module = "switchyard.libsy",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+struct PyDeescalationConfig {
+    inner: DeescalationConfig,
+}
+
+#[pymethods]
+impl PyDeescalationConfig {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        strong_min_calls,
+        confirmations,
+        strong_max_calls=None,
+        weak_cooldown_calls=0
+    ))]
+    fn new(
+        strong_min_calls: u32,
+        confirmations: u32,
+        strong_max_calls: Option<u32>,
+        weak_cooldown_calls: u32,
+    ) -> Self {
+        Self {
+            inner: DeescalationConfig {
+                strong_min_calls,
+                strong_max_calls,
+                confirmations,
+                weak_cooldown_calls,
+            },
+        }
+    }
+}
+
 /// Settings for response-based escalation classification.
 #[pyclass(
     name = "EscalationClassifierConfig",
@@ -105,6 +167,7 @@ struct PyEscalationClassifierConfig {
     contract: ClassifierContractConfig,
     judge: EscalationJudgeConfig,
     max_output_tokens: u64,
+    judge_deadline_ms: Option<u64>,
 }
 
 #[pymethods]
@@ -115,16 +178,21 @@ impl PyEscalationClassifierConfig {
         confirmations=2,
         recent_turn_window=28,
         window_message_chars=500,
+        deescalation=None,
         max_output_tokens=4096,
+        judge_deadline_ms=None,
         prompt=None,
         response_format_type="json_schema"
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         confirmations: u32,
         recent_turn_window: usize,
         window_message_chars: usize,
+        deescalation: Option<Py<PyDeescalationConfig>>,
         max_output_tokens: u64,
+        judge_deadline_ms: Option<u64>,
         prompt: Option<String>,
         response_format_type: &str,
     ) -> PyResult<Self> {
@@ -134,8 +202,12 @@ impl PyEscalationClassifierConfig {
                 confirmations,
                 recent_turn_window,
                 window_message_chars,
+                deescalation: deescalation
+                    .map(|config| config.bind(py).try_borrow().map(|config| config.inner))
+                    .transpose()?,
             },
             max_output_tokens,
+            judge_deadline_ms,
         })
     }
 }
@@ -169,7 +241,8 @@ impl PyCustomClassifierConfig {
         session_affinity=false,
         message_hash_fallback=false,
         recent_turn_window=None,
-        max_output_tokens=4096
+        max_output_tokens=4096,
+        judge_deadline_ms=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -180,6 +253,7 @@ impl PyCustomClassifierConfig {
         message_hash_fallback: bool,
         recent_turn_window: Option<usize>,
         max_output_tokens: u64,
+        judge_deadline_ms: Option<u64>,
     ) -> PyResult<Self> {
         // Convert the Python schema into serde JSON and pair it with the target-selector policy;
         // conversion failures propagate to Python through `PyResult`.
@@ -192,6 +266,7 @@ impl PyCustomClassifierConfig {
         inner.message_hash_fallback = message_hash_fallback;
         inner.recent_turn_window = recent_turn_window;
         inner.max_output_tokens = max_output_tokens;
+        inner.judge_deadline_ms = judge_deadline_ms;
         Ok(Self { inner })
     }
 }
@@ -230,6 +305,7 @@ impl PyLlmClassifierConfig {
                 contract: config.contract.clone(),
                 config: config.judge.clone(),
                 max_output_tokens: config.max_output_tokens,
+                judge_deadline_ms: config.judge_deadline_ms,
             },
         })
     }
@@ -254,6 +330,32 @@ impl PyLlmClassifierConfig {
 
 #[pymethods]
 impl PyTaskClassifierConfig {
+    /// Route capable when a decision model's choice probability exceeds a cutoff.
+    #[staticmethod]
+    #[pyo3(signature = (*, cutoff=None, instructions=None, choices=None, apply_cutoff_to=None))]
+    fn decision(
+        cutoff: Option<f64>,
+        instructions: Option<String>,
+        choices: Option<&Bound<'_, PyAny>>,
+        apply_cutoff_to: Option<String>,
+    ) -> PyResult<Self> {
+        let defaults = DecisionJudgeConfig::default();
+        Ok(Self {
+            inner: TaskClassifierConfig {
+                judge: CapabilityJudgeConfig::Decision(DecisionJudgeConfig {
+                    cutoff,
+                    instructions,
+                    choices: match choices {
+                        Some(choices) => from_python(choices)?,
+                        None => defaults.choices,
+                    },
+                    apply_cutoff_to: apply_cutoff_to.unwrap_or(defaults.apply_cutoff_to),
+                }),
+                ..TaskClassifierConfig::default()
+            },
+        })
+    }
+
     #[new]
     #[pyo3(signature = (
         base_threshold,
@@ -263,6 +365,7 @@ impl PyTaskClassifierConfig {
         message_hash_fallback=false,
         recent_turn_window=None,
         max_output_tokens=4096,
+        judge_deadline_ms=None,
         prompt=None,
         response_format_type="json_schema"
     ))]
@@ -274,18 +377,24 @@ impl PyTaskClassifierConfig {
         message_hash_fallback: bool,
         recent_turn_window: Option<usize>,
         max_output_tokens: u64,
+        judge_deadline_ms: Option<u64>,
         prompt: Option<String>,
         response_format_type: &str,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: TaskClassifierConfig {
-                base_threshold,
-                threshold_step,
+                judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                    base_threshold,
+                    threshold_step,
+                    unmatched_steps: DEFAULT_UNMATCHED_STEPS,
+                    contract: classifier_contract(prompt, response_format_type)?,
+                    max_output_tokens,
+                    judge_deadline_ms,
+                }),
+                fail_open: true,
                 classify_trigger: classify_trigger(session_affinity),
                 message_hash_fallback,
                 recent_turn_window,
-                contract: classifier_contract(prompt, response_format_type)?,
-                max_output_tokens,
             },
         })
     }
@@ -325,6 +434,7 @@ struct PyLlmFallback {
 impl PyLlmFallback {
     fn clone_core(&self, py: Python<'_>) -> PyResult<LlmFallback> {
         Ok(LlmFallback {
+            target: None,
             config: self.config.bind(py).try_borrow()?.clone_core(),
         })
     }
@@ -378,6 +488,19 @@ fn python_client_error(py: Python<'_>, error: PyErr, model: &ModelId) -> LlmClie
     }
 }
 
+// The thread-safe Future forwards cancellation to the read on its owning Python loop.
+struct PythonStreamRead(Py<PyAny>);
+
+impl Drop for PythonStreamRead {
+    fn drop(&mut self) {
+        Python::try_attach(|py| {
+            if let Err(error) = self.0.call_method0(py, "cancel") {
+                error.write_unraisable(py, Some(self.0.bind(py)));
+            }
+        });
+    }
+}
+
 fn python_response_stream(
     py: Python<'_>,
     stream: Py<PyAny>,
@@ -388,14 +511,31 @@ fn python_response_stream(
     let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
     let stream = futures::stream::unfold(Some((iterator, locals, model)), |state| async move {
         let (iterator, locals, model) = state?;
-        let next = Python::attach(|py| {
-            pyo3_async_runtimes::into_future_with_locals(
-                &locals,
-                iterator.bind(py).call_method0("__anext__")?,
-            )
+        let next = Python::attach(|py| -> PyResult<_> {
+            let asyncio = py.import("asyncio")?;
+            let coroutine = py
+                .import("switchyard_rust._libsy_async")?
+                .getattr("next_item")?
+                .call1((iterator.bind(py),))?;
+            let context = locals.context(py).call_method0("copy")?;
+            let task = context.call_method1(
+                "run",
+                (
+                    asyncio.getattr("run_coroutine_threadsafe")?,
+                    coroutine,
+                    locals.event_loop(py),
+                ),
+            )?;
+            let read = PythonStreamRead(task.unbind());
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("loop", locals.event_loop(py))?;
+            let awaitable =
+                asyncio.call_method("wrap_future", (read.0.bind(py),), Some(&kwargs))?;
+            let next = pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)?;
+            Ok((next, read))
         });
         match next {
-            Ok(next) => match next.await {
+            Ok((next, _read)) => match next.await {
                 Ok(item) => {
                     let event =
                         Python::attach(|py| from_python::<LlmResponseStreamEvent>(item.bind(py)))
@@ -464,8 +604,22 @@ impl PyModelCall {
         self.models.clone()
     }
 
-    /// Fulfill this call with a normalized aggregate or streamed response.
-    fn respond(&mut self, py: Python<'_>, response: PyRef<'_, PyLlmResponse>) -> PyResult<()> {
+    /// Await a normalized response, cancelling Python work if the algorithm stops waiting.
+    fn respond<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        work: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        py.import("switchyard_rust._libsy_async")?
+            .getattr("respond")?
+            .call1((slf, work))
+    }
+
+    fn _respond<'py>(
+        &mut self,
+        py: Python<'py>,
+        work: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let model = self
             .inner
             .as_ref()
@@ -476,36 +630,153 @@ impl PyModelCall {
             .as_ref()
             .map(ModelId::new)
             .ok_or_else(|| py_libsy_error("model call request is missing its selected model"))?;
-        let llm_response = response.to_core(py, model)?;
+        let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        let work = pyo3_async_runtimes::into_future_with_locals(&locals, work)?;
         let call = self.take()?;
         let metadata = call.request.metadata.clone();
-        call.respond(Ok(Response {
-            llm_response,
-            metadata,
-            upstream_headers: HeaderMap::new(),
-        }))
-        .map_err(py_libsy_error)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.respond(async move {
+                let result = work.await;
+                Python::attach(|py| {
+                    let response = result.map_err(|error| {
+                        RustLibsyError::client_call(
+                            model.clone(),
+                            python_client_error(py, error, &model),
+                        )
+                    })?;
+                    let response = response
+                        .bind(py)
+                        .extract::<PyRef<'_, PyLlmResponse>>()
+                        .map_err(|error| ffi_error(error.into()))
+                        .map_err(|source| RustLibsyError::client_call(model.clone(), source))?;
+                    let llm_response = response
+                        .to_core(py, model.clone())
+                        .map_err(ffi_error)
+                        .map_err(|source| RustLibsyError::client_call(model, source))?;
+                    Ok(Response {
+                        llm_response,
+                        metadata,
+                        upstream_headers: HeaderMap::new(),
+                    })
+                })
+            })
+            .await
+            .map_err(py_libsy_error)
+        })
     }
 
-    /// Fulfill this call with a Python client failure.
-    fn fail(&mut self, error: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// Return a Python client failure through the same async reply path.
+    fn fail<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        error: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         if !error.is_instance_of::<PyBaseException>() {
             return Err(PyTypeError::new_err("error must derive from BaseException"));
         }
-        let target = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| py_libsy_error("model call has already been completed"))?
-            .request
-            .llm_request
-            .model
-            .as_ref()
-            .map(ModelId::new)
-            .ok_or_else(|| py_libsy_error("model call request is missing its selected model"))?;
+        py.import("switchyard_rust._libsy_async")?
+            .getattr("fail")?
+            .call1((slf, error))
+    }
+}
+
+/// A decision request owned by the Python host until it replies or drops the call.
+#[pyclass(name = "DecisionCall", module = "switchyard.libsy")]
+struct PyDecisionCall {
+    inner: Option<CallDecision>,
+    algorithm: String,
+    request: Py<PyAny>,
+    model: ModelId,
+}
+
+impl PyDecisionCall {
+    fn new(py: Python<'_>, call: CallDecision) -> PyResult<Self> {
+        let request = to_python(py, &call.request)?;
+        Ok(Self {
+            algorithm: call.algorithm.clone(),
+            model: call.model.clone(),
+            inner: Some(call),
+            request,
+        })
+    }
+
+    fn take(&mut self) -> PyResult<CallDecision> {
+        self.inner
+            .take()
+            .ok_or_else(|| py_libsy_error("decision call has already been completed"))
+    }
+}
+
+#[pymethods]
+impl PyDecisionCall {
+    #[getter]
+    fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+
+    /// The provider-neutral decision request as a Python dictionary.
+    #[getter]
+    fn request(&self, py: Python<'_>) -> Py<PyAny> {
+        self.request.clone_ref(py)
+    }
+
+    #[getter]
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Await a decision response, cancelling Python work if the algorithm stops waiting.
+    fn respond<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        work: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        py.import("switchyard_rust._libsy_async")?
+            .getattr("respond")?
+            .call1((slf, work))
+    }
+
+    fn _respond<'py>(
+        &mut self,
+        py: Python<'py>,
+        work: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        let work = pyo3_async_runtimes::into_future_with_locals(&locals, work)?;
         let call = self.take()?;
-        let source = python_client_error(error.py(), PyErr::from_value(error.clone()), &target);
-        call.respond(Err(RustLibsyError::client_call(target, source)))
+        let model = call.model.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.respond(async move {
+                let result = work.await;
+                Python::attach(|py| {
+                    let response = result.map_err(|error| {
+                        RustLibsyError::client_call(
+                            model.clone(),
+                            python_client_error(py, error, &model),
+                        )
+                    })?;
+                    from_python::<DecisionResponse>(response.bind(py))
+                        .map_err(ffi_error)
+                        .map_err(|source| RustLibsyError::client_call(model, source))
+                })
+            })
+            .await
             .map_err(py_libsy_error)
+        })
+    }
+
+    /// Return a Python client failure so the algorithm can apply its fallback policy.
+    fn fail<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        error: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !error.is_instance_of::<PyBaseException>() {
+            return Err(PyTypeError::new_err("error must derive from BaseException"));
+        }
+        py.import("switchyard_rust._libsy_async")?
+            .getattr("fail")?
+            .call1((slf, error))
     }
 }
 
@@ -545,6 +816,9 @@ impl PyOutcomeMetadata {
 struct PyRoutingOutcome {
     selected_model_ids: Vec<String>,
     request: Py<PyAny>,
+    fallback_request: Option<Py<PyAny>>,
+    #[pyo3(get)]
+    candidate_requests: Py<PyAny>,
     response: Option<Py<PyAny>>,
     #[pyo3(get)]
     metadata: Option<Py<PyOutcomeMetadata>>,
@@ -562,6 +836,14 @@ impl PyRoutingOutcome {
     #[getter]
     fn request(&self, py: Python<'_>) -> Py<PyAny> {
         self.request.clone_ref(py)
+    }
+
+    /// The request for the fallback candidates, when it differs from `request`.
+    #[getter]
+    fn fallback_request(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.fallback_request
+            .as_ref()
+            .map(|request| request.clone_ref(py))
     }
 
     /// An aggregate or streamed answer produced while routing, when one already exists.
@@ -622,6 +904,8 @@ fn response_to_python(py: Python<'_>, response: LlmResponse) -> PyResult<Py<PyAn
 enum PyStep {
     /// The host must serve the model call before the algorithm can continue.
     CallModel { call: Py<PyModelCall> },
+    /// The host must serve the decision call before the algorithm can continue.
+    CallDecision { call: Py<PyDecisionCall> },
     /// The terminal routing outcome.
     Done { outcome: Py<PyRoutingOutcome> },
 }
@@ -630,6 +914,23 @@ enum PyStep {
 #[pyclass(name = "_RunStream", module = "switchyard.libsy", frozen)]
 struct PyRunStream {
     inner: Arc<Mutex<StepStream>>,
+}
+
+impl PyRunStream {
+    fn new(algorithm: &Arc<dyn Algorithm>, request: Request, models: Arc<RuntimeModels>) -> Self {
+        // Starting a run spawns Rust work, including when Python's event loop has not started.
+        let stream = {
+            let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
+            Arc::clone(algorithm).run_stream(request, models, State::default())
+        };
+        Self::from_stream(stream)
+    }
+
+    fn from_stream(stream: StepStream) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(stream)),
+        }
+    }
 }
 
 #[pymethods]
@@ -687,24 +988,17 @@ impl PyAlgorithm {
         subagent_models: Option<HashMap<String, Vec<String>>>,
         headers: Option<HashMap<String, String>>,
     ) -> PyResult<PyRunStream> {
-        let headers = headers.as_ref().map(header_map_from_python).transpose()?;
-        let request = Request {
-            llm_request: from_python(request)?,
-            raw_request: None,
-            metadata: headers.map(|headers| Metadata::from_headers(&headers)),
-        };
+        let request = request_from_python(request, headers)?;
         let mut runtime_models = RuntimeModels::new(category_models_from_python(models)?);
         if let Some(subagent_models) = subagent_models {
             runtime_models =
                 runtime_models.with_subagent(category_models_from_python(subagent_models)?);
         }
-        let stream = {
-            let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
-            Arc::clone(&self.inner).run_stream(request, Arc::new(runtime_models))
-        };
-        Ok(PyRunStream {
-            inner: Arc::new(Mutex::new(stream)),
-        })
+        Ok(PyRunStream::new(
+            &self.inner,
+            request,
+            Arc::new(runtime_models),
+        ))
     }
 
     fn __repr__(&self) -> &'static str {
@@ -712,8 +1006,144 @@ impl PyAlgorithm {
     }
 }
 
+/// Deployment algorithms parsed without constructing provider clients or reading credentials.
+#[pyclass(name = "AlgorithmFactory", module = "switchyard.libsy", frozen)]
+struct PyAlgorithmFactory {
+    inner: AlgorithmFactory,
+}
+
+#[pymethods]
+impl PyAlgorithmFactory {
+    /// Parse a complete deployment; invalid configuration raises `ValueError`.
+    #[staticmethod]
+    fn from_toml(py: Python<'_>, source: &str) -> PyResult<Self> {
+        let inner = py
+            .detach(|| AlgorithmFactory::from_toml(source))
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Build independent configured handles keyed by each route's public ID.
+    fn build(&self, py: Python<'_>) -> PyResult<BTreeMap<String, Py<PyConfiguredAlgorithm>>> {
+        let algorithms = py
+            .detach(|| self.inner.build())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        algorithms
+            .into_iter()
+            .map(|(id, (algorithm, models))| {
+                let handle = PyConfiguredAlgorithm {
+                    inner: ConfiguredBackend::Bare {
+                        algorithm,
+                        models: Arc::new(models),
+                    },
+                };
+                Ok((id, Py::new(py, handle)?))
+            })
+            .collect()
+    }
+
+    /// Build handles that check target requirements before yielding host-owned calls.
+    fn build_configured(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<BTreeMap<String, Py<PyConfiguredAlgorithm>>> {
+        let algorithms = py
+            .detach(|| self.inner.build_configured())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        algorithms
+            .into_iter()
+            .map(|(id, algorithm)| {
+                let handle = PyConfiguredAlgorithm {
+                    inner: ConfiguredBackend::Governed(algorithm),
+                };
+                Ok((id, Py::new(py, handle)?))
+            })
+            .collect()
+    }
+}
+
+enum ConfiguredBackend {
+    Bare {
+        algorithm: Arc<dyn Algorithm>,
+        models: Arc<RuntimeModels>,
+    },
+    Governed(switchyard_runner::ConfiguredAlgorithm),
+}
+
+/// A reusable algorithm paired with its deployment's parent and subagent model groups.
+/// The host applies target prompts and provider settings when serving model calls.
+#[pyclass(name = "ConfiguredAlgorithm", module = "switchyard.libsy", frozen)]
+struct PyConfiguredAlgorithm {
+    inner: ConfiguredBackend,
+}
+
+#[pymethods]
+impl PyConfiguredAlgorithm {
+    /// All possible targets and their client/provider IDs, not the eligible pool for a request.
+    fn target_models<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let ConfiguredBackend::Governed(algorithm) = &self.inner else {
+            return Err(py_libsy_error(
+                "target model lookup requires AlgorithmFactory.build_configured()",
+            ));
+        };
+        let targets = PyDict::new(py);
+        for (name, target) in algorithm.target_models() {
+            let model = PyDict::new(py);
+            model.set_item("client", &target.client)?;
+            model.set_item("id", target.id.as_str())?;
+            targets.set_item(name.as_str(), model)?;
+        }
+        Ok(targets)
+    }
+
+    /// Yield host-owned model and decision calls for a normalized request.
+    /// Omitted labels mean no assessment; an empty collection supplies no new requirements.
+    /// The host authorizes `task_id`, which overrides any task ID in `headers`.
+    /// Libsy's per-run `State` is not carried forward, as in `Algorithm.run_stream`.
+    #[pyo3(signature = (request, *, headers=None, required_labels=None, task_id=None))]
+    fn run_stream(
+        &self,
+        py: Python<'_>,
+        request: &Bound<'_, PyAny>,
+        headers: Option<&Bound<'_, PyAny>>,
+        required_labels: Option<Vec<String>>,
+        task_id: Option<String>,
+    ) -> PyResult<PyRunStream> {
+        let headers = headers.map(from_python).transpose()?;
+        let mut request = request_from_python(request, headers)?;
+        if let Some(task_id) = task_id {
+            request.metadata.get_or_insert_default().task_id = Some(task_id);
+        }
+        match &self.inner {
+            ConfiguredBackend::Bare { algorithm, models } => {
+                if required_labels.is_some() {
+                    return Err(py_libsy_error(
+                        "target requirements require AlgorithmFactory.build_configured()",
+                    ));
+                }
+                Ok(PyRunStream::new(algorithm, request, Arc::clone(models)))
+            }
+            ConfiguredBackend::Governed(algorithm) => {
+                if let Some(labels) = required_labels {
+                    require_target_labels(&mut request, labels).map_err(py_libsy_error)?;
+                }
+                let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
+                let stream = py
+                    .detach(|| algorithm.run_stream(request, State::default()))
+                    .map_err(py_libsy_error)?;
+                Ok(PyRunStream::from_stream(stream))
+            }
+        }
+    }
+}
+
 fn step_to_python(step: RustStep) -> PyResult<PyStep> {
     match step {
+        RustStep::CallDecision(call) => Python::attach(|py| {
+            Ok(PyStep::CallDecision {
+                call: Py::new(py, PyDecisionCall::new(py, *call)?)?,
+            })
+        }),
         RustStep::CallModel(call) => Python::attach(|py| {
             Ok(PyStep::CallModel {
                 call: Py::new(py, PyModelCall::new(py, *call)?)?,
@@ -723,8 +1153,11 @@ fn step_to_python(step: RustStep) -> PyResult<PyStep> {
             let RoutingOutcome {
                 selected_model_ids,
                 request,
+                fallback_request,
+                candidate_requests,
                 response,
                 metadata,
+                state: _,
             } = *outcome;
             Python::attach(|py| {
                 Ok(PyStep::Done {
@@ -739,6 +1172,16 @@ fn step_to_python(step: RustStep) -> PyResult<PyStep> {
                                 .map(ToString::to_string)
                                 .collect(),
                             request: to_python(py, &request.llm_request)?,
+                            candidate_requests: to_python(
+                                py,
+                                &candidate_requests
+                                    .into_iter()
+                                    .map(|(id, request)| (id.to_string(), request.llm_request))
+                                    .collect::<std::collections::HashMap<_, _>>(),
+                            )?,
+                            fallback_request: fallback_request
+                                .map(|request| to_python(py, &request.llm_request))
+                                .transpose()?,
                             response: response
                                 .map(|response| response_to_python(py, response.llm_response))
                                 .transpose()?,
@@ -880,7 +1323,11 @@ fn stage_router_algorithm(
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let libsy_module = PyModule::new(module.py(), "libsy")?;
     libsy_module.add_class::<PyAlgorithm>()?;
+    libsy_module.add_class::<PyAlgorithmFactory>()?;
+    libsy_module.add_class::<PyConfiguredAlgorithm>()?;
     libsy_module.add_class::<PyCustomClassifierConfig>()?;
+    libsy_module.add_class::<PyDecisionCall>()?;
+    libsy_module.add_class::<PyDeescalationConfig>()?;
     libsy_module.add_class::<PyEscalationClassifierConfig>()?;
     libsy_module.add_class::<PyLlmClassifierConfig>()?;
     libsy_module.add_class::<PyLlmFallback>()?;

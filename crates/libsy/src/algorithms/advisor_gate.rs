@@ -39,7 +39,7 @@ use switchyard_protocol::{
 };
 
 use crate::core::algorithm::{Algorithm, Driver, RoutingOutcome};
-use crate::core::processor::{Event, Processor};
+use crate::core::processor::Event;
 use crate::{LibsyError, Result};
 
 mod budget;
@@ -52,6 +52,7 @@ mod trigger;
 mod turn;
 
 use super::util::buffered_response::{BufferedResponse, buffer_response};
+use super::util::robustness::safe_error_summary;
 use budget::{ReviewBudget, ScopeKey, budget_scope, stall_key};
 use signals::{GateSignalProcessor, GateSignals};
 use telemetry::{
@@ -380,18 +381,16 @@ impl AdvisorGate {
         review_tail: Option<&str>,
         trigger: &'static str,
     ) -> Result<ConsultOutcome> {
-        // The advisor reviews the FULL transcript: system/developer content is
-        // normalized out of `messages` into `instructions`, so prepend it back
-        // as leading messages (identical {role, content} shape) — the task
-        // constraints the verdict must check against usually live there.
+        // The advisor reviews the FULL transcript. Top-level system/developer
+        // content lives in `instructions`, so prepend it as leading messages
+        // (identical {role, content} shape). The task constraints the verdict
+        // must check against usually live there. Inline instruction messages
+        // stay in place.
         let transcript_messages: Vec<Message> = base
             .llm_request
             .instructions
             .iter()
-            .map(|block| Message {
-                role: block.role,
-                content: block.content.clone(),
-            })
+            .map(|block| Message::new(block.role, block.content.clone()))
             .chain(base.llm_request.messages.iter().cloned())
             .collect();
         let transcript = review_transcript(
@@ -407,7 +406,11 @@ impl AdvisorGate {
             Ok(advisor) => {
                 let advisor = advisor.clone();
                 let advisor_models = driver.models_for(&Category::Judge).to_vec();
-                match driver.call_model(consult_request, advisor_models).await {
+                // Fail-closed errors must reach the gate to refund the review budget.
+                match driver
+                    .call_model_with_error_recovery(consult_request, advisor_models, true)
+                    .await
+                {
                     Ok(response) => {
                         let served_advisor = response
                             .served_model()
@@ -437,17 +440,21 @@ impl AdvisorGate {
                     // context_length_exceeded and trigger compaction of a
                     // healthy conversation.
                     return Err(algorithm_error(format!(
-                        "advisor consult failed (fail_open = false): {error}"
+                        "advisor consult failed (fail_open = false): {}",
+                        safe_error_summary(&error)
                     )));
                 }
+                // An upstream error's Display can quote request content back,
+                // so only its redacted summary reaches logs or the audit trail.
+                let summary = safe_error_summary(&error);
                 tracing::warn!(
                     target: "libsy",
-                    error = %error,
+                    error = %summary,
                     "advisor gate: consult failed; passing the turn through (fail open)"
                 );
                 emit_review_audit(ReviewAudit {
                     verdict: "APPROVE",
-                    error: Some(error.to_string()),
+                    error: Some(summary),
                     latency_ms,
                     reply_head: None,
                     usage: None,
@@ -518,7 +525,7 @@ impl AdvisorGate {
                 },
                 output: OutputParams {
                     max_output_tokens: Some(self.config.advisor_max_tokens),
-                    response_format: None,
+                    ..OutputParams::default()
                 },
                 ..LlmRequest::default()
             },

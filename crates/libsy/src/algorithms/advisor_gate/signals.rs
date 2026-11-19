@@ -5,11 +5,9 @@
 //! fold in on [`Event::Request`], the generated turn's shape on
 //! [`Event::ModelResponse`], and the trigger classifier reads both.
 
-use async_trait::async_trait;
-
 use crate::Result;
 use crate::algorithms::util::tool_signals::ToolSignals;
-use crate::core::processor::{Event, Processor};
+use crate::core::processor::Event;
 
 use super::turn::{has_tool_use, visible_text};
 
@@ -34,9 +32,8 @@ pub(super) struct TurnSignals {
 /// Fills [`GateSignals`], each event writing its own side.
 pub(super) struct GateSignalProcessor;
 
-#[async_trait]
-impl Processor<GateSignals> for GateSignalProcessor {
-    async fn process(&self, state: &mut GateSignals, event: Event<'_>) -> Result<()> {
+impl GateSignalProcessor {
+    pub(super) async fn process(&self, state: &mut GateSignals, event: Event<'_>) -> Result<()> {
         match event {
             Event::Request { request, .. } => {
                 state.conversation = ToolSignals::from_request(request, None);
@@ -68,16 +65,16 @@ mod tests {
                 messages: vec![
                     Message::text(Role::User, "build X"),
                     Message::text(Role::Assistant, "working"),
-                    Message {
-                        role: Role::User,
-                        content: vec![ContentBlock::ToolResult(ToolResult {
+                    Message::new(
+                        Role::User,
+                        vec![ContentBlock::ToolResult(ToolResult {
                             tool_call_id: "t1".to_string(),
                             content: vec![ContentBlock::Text {
                                 text: "ok".to_string(),
                             }],
                             is_error: None,
                         })],
-                    },
+                    ),
                 ],
                 ..LlmRequest::default()
             },

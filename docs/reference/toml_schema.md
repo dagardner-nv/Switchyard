@@ -50,26 +50,82 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 |---|:---:|---|---|
 | `format` | Yes | — | `openai_chat`, `openai_responses`, or `anthropic_messages`. |
 | `base_url` | Yes | — | Upstream base URL. |
+| `context_discovery` | No | unset | Set to `"llama_cpp"` to enable `/props` context discovery for VGR efficient targets. Disabled when unset. An explicit route `context_window` takes precedence. |
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
-| `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. All backends reachable through the route must use the same provider. |
-| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
+| `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. A route's forwarding clients must use one credential family unless they all use the same scheme, host, and port, such as one LLM gateway. |
+| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. Configured values replace caller values for the same name. |
+| `responses_reasoning` | No | `"auto"` | Responses reasoning replay: `"auto"`, `"preserve_encrypted"`, `"preserve_plaintext"`, or `"drop"`. Only valid for `openai_responses`. |
+| `fallback_on_rate_limit` | No | `true` | Try another completion candidate after an upstream HTTP 429 exhausts retries. Set to `false` to return the 429 instead. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
+| `failure_cooldown_ms` | No | `5000` (5 seconds) | Skip a backend for this many milliseconds after an exhausted transient completion failure. Zero disables it. |
 | `timeout_ms` | No | unset | Deadline in milliseconds for all attempts, retry delays, and the complete response, including stream reads. Must be at least `1`. Unset leaves the wait unbounded. |
+
+For `openai_responses`, `responses_reasoning` controls replay of reasoning
+history. Most configurations should leave it unset. The values are:
+
+- `"auto"` (default): choose per request from the target that serves it,
+  including fallback targets. Targets on `api.openai.com` or `*.openai.azure.com`
+  use `"preserve_encrypted"`. On other hosts, such as a shared gateway or proxy,
+  the choice comes from the last `/`-separated part of the target `id`. Names that
+  start with `gpt-` (except `gpt-oss`) or `codex-`, and o-series names such as
+  `o3` or `o4-mini`, use `"preserve_encrypted"`. All other targets use
+  `"preserve_plaintext"`.
+- `"preserve_encrypted"`: keep reasoning items with non-empty `encrypted_content`
+  or a stored reasoning `id`, and empty their `content`. ID-only reasoning is
+  removed when the request sets `store: false`. Switchyard's translated Anthropic
+  reasoning and plaintext-only reasoning are removed. OpenAI needs this.
+- `"preserve_plaintext"`: keep `summary` and `content` text unchanged and in place,
+  for any `store` value. Remove non-empty `encrypted_content`, because Switchyard
+  cannot tell which provider issued it. An item left with no text is removed. An
+  ID-only item is kept unless the request sets `store: false`.
+- `"drop"`: remove all reasoning items. Use it for a backend, such as llama.cpp,
+  that rejects reasoning from other providers.
+
+All modes keep messages, tool calls and tool results. Set an explicit value when
+`"auto"` picks the wrong mode, for example an Azure OpenAI deployment with a custom
+name behind a gateway. The setting is rejected on other client formats, even
+when no target uses the client.
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
 must exist and be non-empty when the server loads.
 
+Cooldown is enabled by default for 5 seconds. Set `failure_cooldown_ms = 0` to disable it.
+The cooldown starts after retries are exhausted.
+
+`failure_cooldown_ms` tracks transport failures, timeouts, HTTP 408/429, and 5xx
+responses after retries. State is shared across callers per model within the client,
+including callers using forwarded credentials. With `forward_auth = true`, HTTP 429
+triggers request-local retries and, by default, fallback; other callers keep trying the model.
+For shared credentials, HTTP 429 also triggers cooldown by default. During cooldown,
+ordered fallback tries the next candidate. A terminal cooldown error returns HTTP
+503. Calls resume together after expiry. Auxiliary calls and errors after a stream
+is returned leave cooldown state unchanged.
+
+When retries are exhausted, Switchyard returns the upstream error with its
+`Retry-After`, `retry-after-ms`, and `x-should-retry` headers from the last attempt.
+
+With `fallback_on_rate_limit = false`, HTTP 429 does not start cooldown, so later
+requests can receive the upstream response too. Retry budgets and deadlines still
+apply. Other errors keep their existing fallback and cooldown behavior. This option
+controls completion candidates; judge and advisor error recovery is unchanged.
+
 `timeout_ms` applies separately to every call through the client, including judge
 verdicts and answers. To give a judge a short deadline without limiting the
 answering models, put the judge on its own `[llm_clients]` entry; two entries may
-share a `base_url`. When the deadline expires, the server returns `504` without
-trying another target. If the final answer has already started streaming, the
+share a `base_url`. When an answer deadline expires, the server returns `504`.
+If the final answer has already started streaming, the
 server sends a framed error and ends the stream without a success marker.
 
 The Rust runner collects streams used during routing before the algorithm
 continues, preserving provider events for replay. After the configured retries,
-an HTTP client failure stops routing. This also applies when `timeout_ms` is
-unset or an advisor has `fail_open = true`.
+an HTTP client failure stops routing unless the call enables recovery.
+Capability classifiers, direct classifiers, and advisor gates default to
+`fail_open = true`. A capability classifier routes to the capable tier on judge
+failures, including deadlines. A direct classifier routes to its
+`default_target`. An advisor returns the buffered executor turn when its consult
+fails.
+Set `fail_open = false` to stop the request on these failures.
+Answer calls keep their usual error behavior.
 
 Set `forward_auth = true` to use each caller's credential instead of a
 server-owned key:
@@ -89,13 +145,40 @@ values.
 
 This setting gives `base_url` the caller's login. Enable it only when that
 upstream should receive the credential, and use HTTPS unless the upstream runs
-on loopback. All backends reachable through the route must use the same
-provider because other application headers are preserved and may contain
+on loopback. Other application headers are preserved and may contain
 provider-specific credentials. Forwarding clients do not follow HTTP redirects.
-Check every forwarding client used by a route, including classifier and judge
-targets. The server rejects an Anthropic forwarding route called through an
-OpenAI endpoint, or an OpenAI forwarding route called through an Anthropic
-endpoint, before it calls an upstream.
+
+A forwarded credential belongs to the service that issued it. A ChatGPT login,
+for example, must never reach Anthropic. So all forwarding clients in a route,
+including classifier and judge targets, must use one credential family: OpenAI
+(`openai_chat` and `openai_responses` clients, which serve Chat Completions and
+Responses callers) or Anthropic (`anthropic_messages` clients, which serve
+Messages callers).
+
+The exception is one host that serves both formats, such as an LLM gateway that
+accepts each caller's gateway key on its OpenAI and Anthropic endpoints. A route
+may mix the two families when all of its forwarding clients use the same scheme,
+host, and port in `base_url`; the path may differ:
+
+```toml
+[llm_clients.gateway_responses]
+format = "openai_responses"
+base_url = "https://gateway.example.com/v1"
+forward_auth = true
+
+[llm_clients.gateway_messages]
+format = "anthropic_messages"
+base_url = "https://gateway.example.com"
+forward_auth = true
+```
+
+Such a route serves Chat Completions and Responses callers and forwards the
+caller's bearer token to every forwarding client. The server returns `400` without
+calling an upstream when a caller uses an API that the route does not serve.
+
+These limits apply only to forwarded credentials. A client with `api_key_env`
+sends the server's own key, so a route can mix formats and providers through
+such clients.
 
 ## `[targets.<name>]`
 
@@ -105,12 +188,36 @@ endpoint, before it calls an upstream.
 | `llm_client` | Yes | — | Key under `[llm_clients]`. |
 | `system_prompt` | No | unset | System prompt prepended when this target serves a completion. |
 | `extra_body` | No | `{}` | Values merged into the upstream request when the request does not already set that key. |
-| `reasoning_effort` | No | unset | Reasoning effort forced on every request to this target, replacing the value the caller sent (`reasoning.effort` on `openai_responses`, `reasoning_effort` on `openai_chat`). Rejected on `anthropic_messages` clients. Use it to run one target at a different effort than the client asked for, for example a strong tier at `max` behind a client that sends `high`. Targets with different effort settings need distinct model IDs when used within one route. Separate routes may use the same model ID with separate `llm_clients` entries (same endpoint, different name). |
+| `omit_body_fields` | No | `[]` | Top-level fields removed from every request body that Switchyard sends to this target. Switchyard removes them after it translates the request to the LLM client's `format`, so use that format's field names, for example `reasoning_effort` on `openai_chat` or `reasoning` on `openai_responses`. Switchyard applies `extra_body` and `reasoning_effort` after the removal, so either can set a removed field again. |
+| `reasoning_effort` | No | unset | Reasoning effort forced on every request to this target, replacing the value the caller sent (`reasoning.effort` on `openai_responses`, `reasoning_effort` on `openai_chat`, `output_config.effort` on `anthropic_messages`, which accepts `low`, `medium`, `high`, `xhigh`, or `max`). Use it to run one target at a different effort than the client asked for, for example a strong tier at `max` behind a client that sends `high`. |
 
-Within one route, callable targets with the same model ID must use the same `llm_client`.
-This includes completion targets and targets used for judging or classification. Switchyard rejects
-same-model targets on different clients within a route because execution is keyed by model ID.
-Separate routes may use the same model ID on different clients.
+Switchyard routes on target names, so several targets may share one `id`. Each target keeps its
+own `llm_client`, `system_prompt`, `extra_body`, `omit_body_fields`, and `reasoning_effort`. For
+example, one route can run the same model at two efforts:
+
+```toml
+[targets.capable]
+id = "gpt"
+llm_client = "openai"
+reasoning_effort = "max"
+
+[targets.efficient]
+id = "gpt"
+llm_client = "openai"
+reasoning_effort = "medium"
+```
+
+Responses, the `x-model-router-selected-model` header, and the routing log `model` field name the
+target's `id`. Existing model metric labels and the `models` keys in `/v1/stats` and
+`/v1/routing/session-stats` also use provider IDs. Targets sharing a provider model contribute
+to one model aggregate.
+
+Both stats endpoints add a separate `targets` breakdown keyed by TOML target name. Each entry
+includes `model`, configured `reasoning_effort` (or `null`), and that target's counters. The
+process stats also include `classifier.targets` for routing-time calls. Totals count each call
+once; the model and target breakdowns are two views of those calls. Routing log rows retain
+`model` and `target`, and include `reasoning_effort` when configured. Older rows without a
+target still contribute to model totals.
 
 Each selected or fallback target is prepared from the routed request independently. A prompt
 configured for one target is therefore not carried into another target's fallback request.
@@ -118,10 +225,38 @@ Judge-only, classifier-only, and reviewer-only targets are not completion destin
 receive this prompt.
 
 Escalation's weak target and Advisor's executor produce a candidate response while routing, so
-their target prompt is applied to that call. A prompted target in either role cannot use the same
-model ID as that route's judge or reviewer because those calls would otherwise be indistinguishable
-at the client boundary; Switchyard rejects that configuration when it loads.
+their target prompt is applied to that call. A prompted target in either role cannot also be that
+route's judge or reviewer; Switchyard rejects that configuration when it loads.
 Token-count requests do not apply target system prompts.
+
+## `[decision_clients.<name>]`
+
+Decision clients serve typed judgments for routing classifiers.
+
+| Key | Required | Meaning |
+|---|:---:|---|
+| `format` | Yes | `system_one` or `openai_decisions`. |
+| `endpoint` | Yes | Full API URL, including the endpoint path. |
+| `api_key_env` | Yes | Environment variable holding a non-empty API key. |
+| `timeout_ms` | Yes | Request and response deadline in milliseconds; must be at least `1`. |
+
+For [OpenAI Decisions](https://developers.openai.com/api/docs/guides/decisions):
+
+```toml
+[decision_clients.decisions]
+format = "openai_decisions"
+endpoint = "https://api.openai.com/v1/decisions"
+api_key_env = "OPENAI_API_KEY"
+timeout_ms = 5000
+
+[decision_targets.judge]
+id = "gpt-6-luna"
+decision_client = "decisions"
+```
+
+Each `decision_targets` entry pairs an upstream model `id` with a `decision_client`.
+Both formats receive the conversation messages, the question instructions, and
+the choice descriptions.
 
 ## `[routes.<name>]`
 
@@ -131,10 +266,29 @@ Every route takes the common keys below, plus the keys for its type.
 |---|:---:|---|---|
 | `id` | Yes | — | Public model ID that callers send in requests. |
 | `type` | Yes | — | Routing algorithm for this route. |
-| `context_window` | No | unset | Positive token count advertised for this route by `GET /v1/models`. Unset values appear as `null`. This does not enforce a request limit. |
-| `tool_calling` | No | unset | Tool-calling support advertised by `GET /v1/models`. When `false`, the server rejects tool definitions, tool controls, and tool history with HTTP 400 before dispatch. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. |
+| `context_window` | No | unset | Positive token count that `GET /v1/models` advertises for this route as `data[].context_length`. Unset values appear as `null`. This does not enforce a request limit. |
+| `tool_calling` | No | unset | Tool-calling support advertised by `GET /v1/models`. When `false`, the server rejects tool definitions, enabled tool controls, and tool history with HTTP 400 before dispatch. Text requests can explicitly disable tools with `tool_choice: "none"` or parallel calls with `parallel_tool_calls: false`. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. |
 | `reasoning` | No | unset | When `false`, the server rejects reasoning controls with HTTP 400 before dispatch. Explicit `true` and unset values do not restrict requests. The server does not include this declaration in `GET /v1/models`. |
 | `vision` | No | unset | Image-input support advertised in `GET /v1/models` under `data[].capabilities.vision`. When `false`, the server rejects images with HTTP 400 before dispatch, including images in tool results. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. Declare `true` only when every target the route can select accepts images. |
+
+### Optional infrastructure check
+
+A capability `llm_classifier` route without escalation may include `[routes.<name>.infra]`. Both tiers must have one model; each model may have
+multiple workers. A host applies the policy explicitly with `Route::apply_infra`
+after `Route::decide`, using periodically collected model-pool metrics and local in-flight
+counts. Plain `decide` and `execute` retain task routing. Sub-agent routing is unchanged.
+
+```toml
+[routes.example.infra]
+max_signal_age_ms = 3000
+min_waiting_requests = 4
+max_capable_inflight = 2
+```
+
+All keys are required. Limits must be positive. Missing or stale observations retain
+the task decision. See the
+[Dynamo PreProc example](../../examples/dynamo-preproc/README.md#task-classification-and-queue-based-routing)
+for collection and capacity safeguards.
 
 ### `noop`
 
@@ -175,6 +329,14 @@ Splits traffic across targets. See
 | `weights` | No | equal | Finite, non-negative relative weights in `targets` order, with at least one positive value. Invalid weights are rejected at load time. |
 | `seed` | No | unset | Reproduces the selection sequence. |
 
+### `plan_execute`
+
+This route type has been removed. Use `stage_router` with
+`picker = "capable_first"`, `confidence_threshold = 0.0`,
+`capable_hold_turns = 0`, `efficient_hold_turns = -1`, and a
+`capable_system_prompt`. See the recipe in
+[Plan/Execute with Stage](../routing_algorithms/stage_router_routing.md#plan-and-execute).
+
 ### `prefill_router`
 
 !!! warning "Experimental in v0.3.0"
@@ -208,14 +370,15 @@ checkpoint = "/models/router.pt"
 
 ### `llm_classifier`
 
-Runs one of three judge-backed modes: `capability`, `escalation`, or `custom`.
-`max_output_tokens` applies to all three.
+Runs one of four modes: `capability`, `escalation`, `custom`, or `direct`.
+`max_output_tokens` and `judge_deadline_ms` apply to LLM judges.
 
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
 | `mode` | No | `capability` | Classifier behavior. Set it explicitly for new configurations. |
-| `classifier_target` | Capability, escalation | — | Target the judge is called through. Not a routing destination. Custom mode uses `models.judge`. |
+| `classifier_target` | Capability, escalation | — | Target the judge is called through. Not a routing destination. Custom and direct modes use `models.judge`. |
 | `max_output_tokens` | No | `4096` | Maximum completion tokens for the judge verdict. Must be at least `1`. |
+| `judge_deadline_ms` | No | unset | Bounds the whole judge consultation in milliseconds, the model call and the response drain included. On expiry the judge is treated as unavailable and follows the route's `fail_open` setting. Must be at least `1`. Unset leaves the consultation unbounded. |
 | `response_format_type` | No | `json_schema` | Structured-output mode for capability and escalation judges. Use `json_object` when the provider does not support JSON Schema; Switchyard adds the schema to the prompt and validates the verdict locally. Custom mode always uses its configured JSON Schema. |
 
 Capability mode classifies before serving. See
@@ -226,10 +389,12 @@ Capability mode classifies before serving. See
 | `strong_target` | Yes | — | Capable tier. |
 | `weak_target` | Yes | — | Efficient tier. |
 | `base_threshold` | Yes | — | Lowest solve probability that routes to the weak target. In `[0, 1]`. |
-| `threshold_step` | No | `0.0` | Finite, non-negative amount added once for uncertain or unmatched verdicts and twice for unsupported verdicts. `base_threshold + 2 * threshold_step` must be at most `1`. |
+| `fail_open` | No | `true` | When `true`, judge client failures and deadlines route to the capable tier and record fail-open evidence. When `false`, they stop the request. Invalid decision-model verdicts route to the capable tier when `fail_open = true` and stop the request with an error when `fail_open = false`. Invalid LLM-judge verdicts still use the capable tier with either setting. |
+| `threshold_step` | No | `0.0` | Finite, non-negative amount added once for uncertain verdicts, `unmatched_steps` times for unmatched verdicts, and twice for unsupported verdicts. `base_threshold + 2 * threshold_step` must be at most `1`. |
+| `unmatched_steps` | No | `1` | Threshold steps applied to an unmatched verdict (no capability rule applies). `0`, `1`, or `2`; `2` treats it like an unsupported verdict. |
 | `classify_trigger` | No | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and retains that target across intervening tool calls only when requests carry a session ID; without a session ID, it behaves like `every_request`. `new_session` judges once and reuses that target for the session. |
-| `message_hash_fallback` | No | `false` | Keys affinity on the first user message. Requires `classify_trigger = "new_session"`. |
-| `recent_turn_window` | No | unset | When unset, the judge sees the opening task and latest user follow-up, when present. When set, it also sees trailing turns. |
+| `message_hash_fallback` | No | `false` | Retains the target against a hash of the first user message when a request carries no session ID. Requires `classify_trigger = "new_session"` or `"user_turn"`. |
+| `recent_turn_window` | No | unset | LLM judges default to the opening task and latest user follow-up. Decision judges default to the opening task plus 10 recent messages. An explicit value sets the trailing message window. |
 | `prompt` | No | packaged prompt | Replaces the capability prompt. The packaged schema is sent separately as structured-output configuration. |
 
 Escalation mode serves the weak target first and judges the completed turn. See
@@ -240,9 +405,14 @@ Escalation mode serves the weak target first and judges the completed turn. See
 | `strong_target` | Yes | — | Target used after the session latches. |
 | `weak_target` | Yes | — | Target served before the latch. |
 | `prompt` | No | packaged prompt | Replaces the trajectory-judge prompt. |
-| `escalation.confirmations` | No | `2` | Consecutive escalate verdicts required to latch. Above `1` needs a session ID. |
+| `escalation.confirmations` | No | `2` | Consecutive fresh-evidence verdicts for the same failure category required to latch. Above `1` needs a stable session ID. |
 | `escalation.recent_turn_window` | No | `28` | Trailing messages shown to the judge. |
 | `escalation.window_message_chars` | No | `500` | Per-message cap inside that window. |
+| `escalation.deescalation` | No | unset | Enables phase-aware de-escalation. Requires a stable session ID. |
+| `escalation.deescalation.strong_min_calls` | With de-escalation | — | Strong-tier turns before release is allowed. Must be at least `1`. |
+| `escalation.deescalation.confirmations` | With de-escalation | — | Consecutive judge declines required to return to weak. Must be at least `1`. |
+| `escalation.deescalation.strong_max_calls` | No | unset | Hard limit on strong-tier turns before forced de-escalation. Must be at least `strong_min_calls`. |
+| `escalation.deescalation.weak_cooldown_calls` | No | `0` | Weak calls served without judging after a hard-limit return. |
 
 Existing configurations that contain `escalation` but omit `mode` remain valid.
 
@@ -250,7 +420,9 @@ Custom mode validates the judge's JSON against `response_schema`, resolves the
 policy selector, and routes to a runtime model group. A verdict names a group and
 the first model in it serves the turn. An eligible non-timeout failure tries the
 rest of that group, then any remaining models in `models.any`. A timeout stops
-the request without trying another model.
+the request without trying another model. A connection that times out before it
+is established counts as a connection failure, not a timeout, so it tries the
+next model.
 
 The `[routes.<name>.models]` table takes any group name you choose. `any` and
 `judge` are reserved and required; `capable` and `efficient` are reserved for the
@@ -269,7 +441,7 @@ how one route chooses between more than two models.
 | `response_schema` | Yes | — | Inner JSON Schema encoded as a TOML string. Switchyard adds the provider wrapper. |
 | `policy` | Yes | — | Policy table. `target_selector` accepts a JSON Pointer such as `/decision/target`. |
 | `classify_trigger` | No | `every_request` | When the judge runs. `every_request` judges every request, tool continuations included. `user_turn` judges each new user message and retains that target across intervening tool calls only when requests carry a session ID; without a session ID, it behaves like `every_request`. `new_session` judges once and reuses that target for the session. |
-| `message_hash_fallback` | No | `false` | Keys affinity on the first user message. Requires `classify_trigger = "new_session"`. |
+| `message_hash_fallback` | No | `false` | Retains the target against a hash of the first user message when a request carries no session ID. Requires `classify_trigger = "new_session"` or `"user_turn"`. |
 | `recent_turn_window` | No | unset | When unset, the judge sees the opening task and latest user follow-up, when present. When set, it also sees trailing turns. |
 
 The selected JSON label must name a configured group. A label naming a target
@@ -280,65 +452,168 @@ Classifier prompts must not contain `{{RESPONSE_SCHEMA}}`. Switchyard supplies
 the schema automatically: through the structured-output request in `json_schema`
 mode, or in the prompt in `json_object` mode.
 
+Direct mode asks a decision target to select one model group. See
+[Direct selection](../routing_algorithms/llm_classifier_routing.md#direct-selection).
+`classify_trigger` and `message_hash_fallback` work as in custom mode.
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `models` | Yes | — | Model groups, as in custom mode. Every non-empty group except `judge` and `any` is an option, and its name is the option ID. Needs at least two options. `models.judge` must name a decision target. |
+| `default_target` | Yes | — | Option used when the decision call fails or returns a choice that is not an option. |
+| `fail_open` | No | `true` | When `true`, decision call failures, deadlines, and invalid choices route to `default_target`. When `false`, they stop the request. |
+| `recent_turn_window` | No | `10` | Trailing turns sent as `task` after the opening task. |
+
 ### `stage_router`
 
 Scores tool signals to pick a tier per turn. See
-[Stage-Router Routing](../routing_algorithms/stage_router_routing.md) for the
-optional `handoff_notes` and `classifier` tables and for tuning.
+[Stage-Router Routing](../routing_algorithms/stage_router_routing.md) for how
+the signals work and for tuning.
 
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
 | `capable_target` | Yes | — | Capable tier. |
 | `efficient_target` | Yes | — | Efficient tier. |
 | `picker` | Yes | — | `efficient_first`, or `capable_first` (experimental, unbenchmarked). Tier used when the signals are not confident. |
-| `confidence_threshold` | Yes | — | Corroboration a decisive pick needs. In `[0, 1]`. |
+| `confidence_threshold` | Yes | — | Corroboration a decisive pick needs. In `[0, 1]`. `efficient_first_threshold` is accepted as an alias. |
+| `capable_first_threshold` | No | `0.0` | Threshold used after an outer classifier selects the capable tier. Only a [composite](#composite) route sets that tier, so this key has no effect on a standalone `stage_router` route. |
+| `capable_system_prompt` | No | unset | System prompt prepended for capable requests. |
+| `efficient_system_prompt` | No | unset | System prompt prepended for efficient requests. |
 | `recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
-| `capable_hold_turns` | No | `2` | Requests kept on the capable tier after escalation. A clean test pass clears the hold early; `0` disables it. |
+| `compaction_override` | No | `true` | Context compaction forces capable. Set `false` to use the other signals and picker normally. |
+| `capable_hold_turns` | No | `2` | Requests kept on capable after a switch. Signal-driven capable decisions also start finite holds. Active holds skip signal processing and classification; `0` disables; `-1` pins after a switch. |
+| `efficient_hold_turns` | No | `0` | Requests kept on efficient after a switch, even when errors appear. `0` disables; `-1` pins after a switch. |
 | `tool_semantics.observe` | No | `[]` | Exact ASCII case-insensitive domain tool names that count as read-only investigation. |
 | `tool_semantics.mutate` | No | `[]` | Exact ASCII case-insensitive domain tool names that count as state-changing production. |
 | `tool_semantics.plan` | No | `[]` | Exact ASCII case-insensitive domain tool names that count as planning or task decomposition. |
 | `tool_semantics.new` | No | `[]` | Exact ASCII case-insensitive domain tool names that demonstrate forward activity without favoring either tier. |
-| `classifier.classify_trigger` | No | `every_request` | When the judge runs. See the `llm_classifier` route. `new_session` has no effect here. |
-| `classifier.response_format_type` | No | `json_schema` | Structured-output mode for the optional classifier judge. Use `json_object` when the classifier provider does not support JSON Schema; Switchyard adds the schema to the prompt and validates the verdict locally. |
+| `handoff_notes` | No | unset | Table of notes appended to the forwarded request when the signals pick a tier. Keys below. |
+| `classifier` | No | unset | Table for the optional capability judge consulted on ambiguous turns. Keys below. |
 | `subagents` | No | unset | Nested `passthrough` or custom `llm_classifier` policy used only for delegated sub-agent work. See [Sub-Agent-Aware Routing](../routing_algorithms/subagent_routing.md). |
+
+#### `handoff_notes` keys
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `handoff_notes.escalation_note` | Yes, when the table is present | — | Note appended to the request when the signals or a hard override escalate to the capable tier. |
+| `handoff_notes.deescalation_note` | No | unset | Note appended to the request whenever the signals select the efficient tier, whether or not a capable turn came before. |
+| `handoff_notes.only_on_wrong_signal_escalation` | No | `true` | When `true`, restricts escalation notes to signal-driven capable decisions. Held turns receive no notes with either setting. |
+
+#### `classifier` keys
+
+The judge runs when the signals are ambiguous or the request has no tool
+history. It runs as a step inside the stage cascade, not as a standalone route,
+so it is consulted on every ambiguous turn and never retains a verdict.
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `classifier.target` | Yes, when the table is present | — | Target the judge is called through. Not a routing destination. |
+| `classifier.base_threshold` | For LLM judges | — | Lowest `p_solve` that still routes to the efficient tier. In `[0, 1]`. Omit with `classifier.decision`. |
+| `classifier.threshold_step` | No | `0.0` | Finite, non-negative amount added once for uncertain or unmatched verdicts and twice for unsupported verdicts. `base_threshold + 2 * threshold_step` must be at most `1`. |
+| `classifier.fail_open` | No | `true` | When `true`, judge client failures and deadlines let the turn fall open to the picker default and record fail-open evidence. When `false`, they stop the request. |
+| `classifier.decision` | No | defaults for a decision target | Decision model settings. A classifier target in `decision_targets` uses the defaults when this table is absent. It cannot be combined with `base_threshold`, `threshold_step`, `prompt`, `response_format_type`, or `max_output_tokens`; the load error is `decision cannot use LLM judge settings`. See [Decision model classifier](../routing_algorithms/composite_routing.md#decision-model-classifier). |
+| `classifier.classify_trigger` | No | `every_request` | Only the default is accepted here. The stage fallback judge runs on every ambiguous turn and retains no verdict, so `user_turn` and `new_session` are rejected at load. Use a [composite](#composite) route to judge once per user turn. |
+| `classifier.message_hash_fallback` | No | `false` | Rejected at load on a `stage_router` route. The fallback judge retains nothing to key on. |
+| `classifier.recent_turn_window` | No | unset | LLM judges default to task messages. Decision judges default to 10 recent messages plus the opening task. An explicit value counts trailing messages, while the route window counts tool results. |
+| `classifier.prompt` | No | packaged prompt | Replaces the capability judge prompt. The verdict schema is unchanged. |
+| `classifier.response_format_type` | No | `json_schema` | Structured-output mode for the LLM judge. Use `json_object` when the provider does not support JSON Schema; Switchyard adds the schema to the prompt and validates the verdict locally. Not with `classifier.decision`. |
+| `classifier.max_output_tokens` | No | `4096` | Maximum completion tokens for the LLM judge verdict. Must be at least `1`. Not with `classifier.decision`. |
+| `classifier.judge_deadline_ms` | No | unset | Bounds the whole judge consultation in milliseconds, the model call and the response drain included. On expiry the judge is treated as unavailable and the turn falls open to the picker default, or stops the request with `classifier.fail_open` = `false`. Must be at least `1`. Unset leaves the consultation unbounded. |
+
+`classifier.response_schema`, `classifier.policy`, and any `classifier.mode`
+other than `capability` are rejected on a `stage_router` route with
+`custom classifier settings require composite with mode = custom`.
+`classifier.mode = "capability"` is accepted and changes nothing. Use a
+[composite](#composite) route for a custom judge.
 
 ### `auto`
 
-Uses Switchyard's recommended default routing strategy instead of one you pick
-yourself: a `stage_router` preset with `picker = "efficient_first"` and
-`confidence_threshold = 0.5`, no classifier. See
-[Stage-Router Routing](../routing_algorithms/stage_router_routing.md) for a
-deeper dive on the current default, or the
-[strategy table](../routing_algorithms/overview.md#choose-a-strategy) to pick
-one manually.
+`auto` is a preset. It builds a `stage_router` route with fixed settings and no
+classifier. Use it when you want the recommended starting point without tuning.
+See [Auto](../routing_algorithms/overview.md#auto) for what the preset does and
+when it does not route.
 
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
 | `capable_target` | Yes | — | Capable tier. |
 | `efficient_target` | Yes | — | Efficient tier. |
 
+`auto` accepts no other keys. Adding one is a configuration error. For example,
+adding `confidence_threshold = 0.5` to an `auto` route fails `--dry-run` with:
+
+```text
+unknown field `confidence_threshold`, expected `capable_target` or `efficient_target`
+```
+
+An `auto` route behaves the same as this `stage_router` route. It has no
+classifier, no handoff notes, and no per-tier system prompts:
+
+```toml
+[routes.smart]
+id = "switchyard"
+type = "stage_router"
+capable_target = "strong"
+efficient_target = "weak"
+picker = "efficient_first"
+confidence_threshold = 0.5
+recent_turn_window = 3
+capable_hold_turns = 2
+```
+
+To tune the preset, replace the `auto` route with this block and edit the keys.
+The [stage_router](#stage_router) table lists every key. See
+[Stage-Router Routing](../routing_algorithms/stage_router_routing.md) for
+tuning guidance and the [model selection guide](../routing_algorithms/model_selection.md)
+for choosing the two targets.
+
 ### `composite`
 
 Composes other algorithms, letting one set another's
-configuration. Today a classifier sets the tier a stage router falls open to when its own signals are not confident, leaving its scoring and escalation logic untouched. See
+configuration. Today a classifier selects the stage router's starting tier and
+confidence threshold. Tool signals still drive escalation and recovery. See
 [Composite Routing](../routing_algorithms/composite_routing.md).
 
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
 | `classifier.target` | Yes | — | Target the tier judge is called through. Not a routing destination. |
-| `classifier.base_threshold` | Yes | — | `p_solve` floor that still routes to the efficient tier. In `[0, 1]`. |
+| `classifier.base_threshold` | For LLM judges | unset | `p_solve` floor that still routes to the efficient tier. In `[0, 1]`. Omit with `classifier.decision`. |
+| `classifier.threshold_step` | No | `0.0` | Finite, non-negative amount added once for uncertain or unmatched verdicts and twice for unsupported verdicts. `base_threshold + 2 * threshold_step` must be at most `1`. |
 | `classifier.classify_trigger` | Yes | — | `user_turn` re-picks the tier whenever the user speaks, `new_session` picks once and holds it. `every_request` is rejected here: a judge call per tool step is the cost this route exists to avoid. |
-| `classifier.message_hash_fallback` | No | `false` | Retains the tier by hashing the first user message, for clients that send no session ID. Unlike the `llm_classifier` route, this works on either trigger. Conversations opening with the same text share a tier. |
+| `classifier.decision` | No | defaults for a decision target | Decision model settings. A classifier target in `decision_targets` uses the defaults when this table is absent. It cannot be combined with the LLM judge keys (`base_threshold`, `threshold_step`, `prompt`, `response_format_type`, `max_output_tokens`). |
+| `classifier.decision.cutoff` | No | `0.92` | Select capable when the `apply_cutoff_to` probability is above this value. In `[0, 1]`. |
+| `classifier.decision.instructions` | No | built in | Replaces the default question text. Keep the meaning of the choices. |
+| `classifier.decision.choices` | No | `capable`, `efficient` | Array of `{ id, description }` tables sent as the choice options. IDs must be unique. |
+| `classifier.decision.apply_cutoff_to` | No | `capable` | Choice ID whose probability is compared with `cutoff`. |
+| `classifier.fail_open` | No | `true` | On judge failure, retain the last classified tier or default to efficient. Set `false` to return the error. |
+| `classifier.message_hash_fallback` | No | `false` | Retains the tier by hashing the first user message, for clients that send no session ID. Works with either supported trigger. Conversations opening with the same text share a tier. |
+| `classifier.recent_turn_window` | No | unset | LLM judges default to task messages. Decision judges default to 10 recent messages plus the opening task. An explicit value sets the trailing message window. |
+| `classifier.prompt` | No | packaged prompt | Replaces the classifier judge prompt. The verdict schema is unchanged. |
+| `classifier.response_format_type` | No | `json_schema` | Structured-output mode for the judge. Use `json_object` when the provider does not support JSON Schema. Switchyard adds the schema to the prompt and validates the verdict locally. |
+| `classifier.max_output_tokens` | No | `4096` | Maximum completion tokens for the judge verdict. Must be at least `1`. |
+| `classifier.judge_deadline_ms` | No | unset | Bounds the whole judge consultation in milliseconds, the model call and the response drain included. On expiry, error handling follows `classifier.fail_open`. Must be at least `1`. Unset leaves the consultation unbounded. |
 | `stage.capable_target` | Yes | — | Capable tier. |
 | `stage.efficient_target` | Yes | — | Efficient tier. |
-| `stage.confidence_threshold` | Yes | — | Corroboration a decisive signal needs. In `[0, 1]`. |
+| `stage.efficient_first_threshold` | No | `0.4` | Signal confidence required after an Efficient classification. In `[0, 1]`. Also accepts `confidence_threshold`. |
+| `stage.capable_first_threshold` | No | `0.0` | Signal confidence required after a Capable classification. In `[0, 1]`. |
 | `stage.recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
-| `stage.capable_hold_turns` | No | `2` | Requests kept on the capable tier after escalation. A clean test pass clears the hold early; `0` disables it. |
+| `stage.compaction_override` | No | `true` | Same compaction override as `stage_router`. Can also be set per `efficient` or `capable` profile. |
+| `stage.capable_hold_turns` | No | CF: `0`, EF: `2` | Same capable hold as `stage_router`: `0` disables; `-1` pins after a switch. |
+| `stage.efficient_hold_turns` | No | CF: `-1`; EF: `0` | Defaults to pinning efficient after a switch when the classifier selected capable-first. Explicit `0` disables; positive values hold that many requests. |
 | `stage.tool_semantics.observe` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as observation. |
 | `stage.tool_semantics.mutate` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as mutation. |
 | `stage.tool_semantics.plan` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as planning. |
 | `stage.tool_semantics.new` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as neutral forward activity. |
+| `stage.handoff_notes` | No | unset | Optional guidance appended to forwarded requests. Uses the same fields and behavior as [stage-router handoff notes](../routing_algorithms/stage_router_routing.md#optional-handoff-notes). |
 | `subagents` | No | unset | Nested policy used only for delegated sub-agent work. |
+
+The capable-first profile uses a planning prompt by default. Shared or profile
+`capable_system_prompt` overrides it. An empty string disables it.
+
+Optional `efficient` and `capable` tables provide independent stage
+settings and prompts. See [independent stage profiles](../routing_algorithms/composite_routing.md#independent-stage-profiles).
+
+For decision classifier configuration, see
+[Decision model classifier](../routing_algorithms/composite_routing.md#decision-model-classifier).
+The same decision settings are accepted by the optional `stage_router` classifier.
 
 The tier is retained per session. A deployment that sends no session ID needs
 `classifier.message_hash_fallback = true`, which keys on the first user message
@@ -370,6 +645,35 @@ advisor's plan. See
 | `fail_open` | No | `true` | Lets the gated turn through when the advisor fails, instead of returning an error. |
 | `reviewer_system_prompt` | No | packaged prompt | Replaces the APPROVE/REDO reviewer prompt. |
 | `redo_feedback_prefix` | No | packaged prompt | Replaces the text put in front of a REDO plan fed back to the executor. |
+
+### `vgr`
+
+Generates an efficient candidate and verifies it before serving a final answer.
+See [Verification-Gated Routing](../routing_algorithms/vgr_routing.md) for the
+verification policy, tool turns, handoff behavior, and serving modes.
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `efficient_target` | Yes | — | Target that generates the candidate. |
+| `capable_target` | Yes | — | Target used when the candidate is not accepted. Must resolve to a different model ID from `efficient_target`. |
+| `judge_target` | No | `efficient_target` | Target used for efficient-tier verification. |
+| `capable_judge_target` | No | unset | Optional target for capable-tier confirmation. |
+| `mode` | No | `off` | `off` serves capable directly; `shadow` evaluates but serves capable; `evaluate` serves the policy decision for evaluation; `active` serves it in production. |
+| `active_approval` | In `active` mode | unset | Must be `"prospective-validation-and-canary-approved"`. |
+| `deadline_seconds` | No | `30` | Time budget for the efficient attempt and verification. Must be finite and greater than zero. |
+| `bounded_efficient` | No | `true` | Enforce the decision deadline and efficient turn budget. |
+| `task_typing` | No | `true` | Use a judge call to select the task's verification path. |
+| `breaker_threshold` | No | `5` | Efficient endpoint failures needed to open the circuit breaker. Must be at least `1`. |
+| `breaker_cooldown_seconds` | No | `30` | Wait before retrying an open efficient circuit. Must be finite and greater than zero. |
+| `confirmed_recovery_min_clean_tail` | No | unset | Clean trailing tool results needed to accept a recovered run with capable-judge confirmation. |
+| `agentic_handoff` | No | `false` | Tell the capable tier when it inherits unverified tool-using work. |
+| `compact_handoff` | No | `false` | Condense efficient-tier history at handoff. Requires `agentic_handoff = true`. Experimental and lossy. |
+| `efficient_turn_budget_seconds` | No | unset | Wall-clock budget for efficient work within one user turn, including tool execution. Must be finite and greater than zero. |
+| `latch_escalation` | No | `false` | Retain escalation across later user turns. In `shadow` mode, the hold ends at the next user turn. |
+| `efficient_supports_attachments` | No | `false` | Allow the efficient tier to attempt requests containing attachments. The model must support the input. |
+
+Start with the [route configuration](../routing_algorithms/vgr_routing.md#configure-a-route)
+or the [complete local-server example](../../examples/vgr-local-servers.toml).
 
 ## Validation Errors
 

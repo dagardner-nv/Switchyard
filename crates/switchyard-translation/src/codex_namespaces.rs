@@ -24,19 +24,14 @@
 //! namespace against its default group: dropping a builtin group's namespace
 //! would look the call up in the wrong place.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 use switchyard_protocol::ProviderExtensions;
 
-/// Separator between a namespace and a tool name in a qualified wire name.
-pub const NAMESPACE_SEPARATOR: &str = "__";
-
-/// Request extension key holding the qualified-name to namespace mapping.
-///
-/// Prefixed so it cannot collide with a real provider field, and so a codec that
-/// allowlists provider fields never forwards it.
-pub const TOOL_NAMESPACES_KEY: &str = "switchyard_codex_tool_namespaces";
+pub use switchyard_protocol::codex_namespaces::{
+    NAMESPACE_SEPARATOR, TOOL_NAMESPACES_KEY, split_qualified_name, tool_namespaces,
+};
 
 /// Joins a namespace and a tool name into the name used on the wire.
 pub fn qualified_tool_name(namespace: &str, tool: &str) -> String {
@@ -48,8 +43,18 @@ pub fn record_tool_namespace(
     namespaces: &mut Map<String, Value>,
     qualified: &str,
     namespace: &str,
+    description: Option<&str>,
 ) {
-    namespaces.insert(qualified.to_string(), Value::String(namespace.to_string()));
+    let value = description.map_or_else(
+        || Value::String(namespace.to_string()),
+        |description| {
+            serde_json::json!({
+                "namespace": namespace,
+                "description": description,
+            })
+        },
+    );
+    namespaces.insert(qualified.to_string(), value);
 }
 
 /// Stores a collected mapping on a request's extensions, when it has entries.
@@ -61,82 +66,33 @@ pub fn attach_tool_namespaces(extensions: &mut ProviderExtensions, namespaces: M
     }
 }
 
-/// Reads the mapping back off a request's extensions.
-pub fn tool_namespaces(extensions: &ProviderExtensions) -> Option<&Map<String, Value>> {
-    extensions
-        .fields
-        .get(TOOL_NAMESPACES_KEY)
-        .and_then(Value::as_object)
+/// Returns a retained description for `namespace`.
+pub fn namespace_description<'a>(
+    namespaces: &'a Map<String, Value>,
+    namespace: &str,
+) -> Option<&'a str> {
+    namespaces.values().find_map(|value| {
+        let object = value.as_object()?;
+        (object.get("namespace").and_then(Value::as_str) == Some(namespace))
+            .then(|| object.get("description").and_then(Value::as_str))
+            .flatten()
+    })
 }
 
-/// Splits a qualified wire name back into its tool name and namespace.
-///
-/// Returns `None` for a name the request never qualified, so an unrecognized
-/// call is left alone rather than attributed to the wrong namespace. The tool
-/// name may itself contain the separator, so the namespace is matched as a
-/// prefix rather than by splitting on it.
-pub fn split_qualified_name(
-    namespaces: &Map<String, Value>,
-    qualified: &str,
-) -> Option<(String, String)> {
-    let namespace = namespaces.get(qualified).and_then(Value::as_str)?;
-    let tool = qualified
-        .strip_prefix(namespace)?
-        .strip_prefix(NAMESPACE_SEPARATOR)?;
-    Some((tool.to_string(), namespace.to_string()))
-}
-
-/// Reverse map from an upstream tool name to its Codex tool name and namespace.
-///
-/// The exact qualified name is always registered. A model often returns a near
-/// miss instead, so two fallback spellings are registered when neither can be
-/// confused with another tool:
-///
-/// * the qualified name without the `mcp__` prefix
-/// * the bare tool name, only when exactly one namespace claims it
+/// Maps exact qualified tool names to their Codex tool names and namespaces.
 pub fn qualified_tool_origins(
     extensions: &ProviderExtensions,
 ) -> HashMap<String, (String, String)> {
     let Some(namespaces) = tool_namespaces(extensions) else {
         return HashMap::new();
     };
-    let split: Vec<(String, String, String)> = namespaces
+    namespaces
         .keys()
         .filter_map(|qualified| {
             let (tool, namespace) = split_qualified_name(namespaces, qualified)?;
-            Some((qualified.clone(), tool, namespace))
+            Some((qualified.clone(), (tool.to_string(), namespace.to_string())))
         })
-        .collect();
-
-    // A bare name claimed by more than one namespace cannot be guessed, and a
-    // fallback must never shadow a name that is itself a real qualified tool.
-    let mut bare_claims: HashMap<&str, usize> = HashMap::new();
-    for (_, tool, _) in &split {
-        *bare_claims.entry(tool.as_str()).or_default() += 1;
-    }
-    let qualified_names: HashSet<&str> = split
-        .iter()
-        .map(|(qualified, _, _)| qualified.as_str())
-        .collect();
-
-    let mut origins = HashMap::new();
-    for (qualified, tool, namespace) in &split {
-        let origin = (tool.clone(), namespace.clone());
-        if let Some(stripped) = namespace.strip_prefix("mcp__") {
-            let spelling = qualified_tool_name(stripped, tool);
-            if !qualified_names.contains(spelling.as_str()) {
-                origins.entry(spelling).or_insert_with(|| origin.clone());
-            }
-        }
-        if bare_claims.get(tool.as_str()) == Some(&1) && !qualified_names.contains(tool.as_str()) {
-            origins
-                .entry(tool.clone())
-                .or_insert_with(|| origin.clone());
-        }
-        // The exact spelling always wins over a fallback.
-        origins.insert(qualified.clone(), origin);
-    }
-    origins
+        .collect()
 }
 
 /// Restore the Codex tool name and namespace on function calls and argument completions.
@@ -191,6 +147,7 @@ mod tests {
                 &mut namespaces,
                 &qualified_tool_name(namespace, tool),
                 namespace,
+                None,
             );
         }
         let mut extensions = ProviderExtensions::default();
@@ -206,7 +163,7 @@ mod tests {
         let simple = tool_namespaces(&simple).expect("mapping present");
         assert_eq!(
             split_qualified_name(simple, "mcp__docs__search"),
-            Some(("search".to_string(), "mcp__docs".to_string()))
+            Some(("search", "mcp__docs"))
         );
         assert_eq!(split_qualified_name(simple, "unknown_tool"), None);
 
@@ -214,17 +171,20 @@ mod tests {
         let nested = tool_namespaces(&nested).expect("mapping present");
         assert_eq!(
             split_qualified_name(nested, "mcp__docs__fetch__raw"),
-            Some(("fetch__raw".to_string(), "mcp__docs".to_string()))
+            Some(("fetch__raw", "mcp__docs"))
         );
     }
 
-    // A bare name claimed by two namespaces must not be guessed: a wrong guess
-    // dispatches the call to the wrong server.
     #[test]
-    fn leaves_an_ambiguous_bare_name_alone() {
-        let origins =
-            qualified_tool_origins(&extensions(&[("mcp__a", "search"), ("mcp__b", "search")]));
-        let mut response = json!({"output": [{"type": "function_call", "name": "search"}]});
+    fn leaves_unqualified_names_alone() {
+        let origins = qualified_tool_origins(&extensions(&[("mcp__docs", "search")]));
+        let mut response = json!([
+            {"output": [{"type": "function_call", "name": "search"}]},
+            {"type": "response.output_item.done", "item": {
+                "type": "function_call", "name": "docs__search"
+            }},
+            {"type": "response.function_call_arguments.done", "name": "docs__search"}
+        ]);
         let before = response.clone();
 
         restore_qualified_tool_names(&mut response, &origins);

@@ -11,7 +11,7 @@ use nemo_relay_plugin::{
     MetricValueType, PluginRuntime,
 };
 use serde_json::{Map, json};
-use switchyard_llm_client::{LlmCallObservation, RunObservation, RunObserver};
+use switchyard_llm_client::{ModelCallObservation, RunObservation, RunObserver};
 use switchyard_protocol::{
     LlmClientError, LlmResponse, LlmResponseChunk, LlmStreamError, Metadata, ProviderExtensions,
     Request, Response, Usage, WireFormat,
@@ -22,6 +22,7 @@ use switchyard_runner::{
 use switchyard_translation::{TranslationEngine, encode_stream_with_extensions};
 
 use crate::config::SwitchyardConfig;
+use crate::span_capture::CapturedSpan;
 use crate::translation;
 
 #[cfg(test)]
@@ -59,6 +60,7 @@ pub(crate) struct RoutingMetric {
 pub(crate) enum RoutingEvent {
     Mark(RoutingMark),
     Metric(RoutingMetric),
+    Span(CapturedSpan),
 }
 
 struct MetricDescriptor<'a> {
@@ -117,6 +119,7 @@ impl SwitchyardRuntime {
             .map_err(|error| self.redactor.text(error))?;
         llm_request.stream = streaming;
         let headers = string_headers(&request.headers);
+        switchyard_translation::normalize_compaction(&mut llm_request, Some(&headers));
         let mut metadata = Metadata::from_headers(&headers);
         let relay_gateway_placeholder = !headers.contains_key("x-switchyard-session-id")
             && headers
@@ -170,21 +173,12 @@ impl SwitchyardRuntime {
         request: Request,
         emit_event: RoutingEventEmitter,
     ) -> Execution<ReturnedEventStream> {
-        let redactor = Arc::clone(&self.redactor);
-        let emit_event: RoutingEventEmitter = Arc::new(move |event| {
-            emit_event(sanitize_event(&redactor, event));
-        });
+        let emit_event = self.sanitized_emitter(emit_event);
         let request_extensions = request.llm_request.extensions.clone();
         let Execution { result, mut events } = self.execute(inbound, request).await;
         let (result, finalization_failed) = match result {
             Ok(routed) => {
-                let metadata = events
-                    .iter()
-                    .find_map(|event| match event {
-                        RoutingEvent::Mark(mark) => Some(mark.metadata.clone()),
-                        RoutingEvent::Metric(_) => None,
-                    })
-                    .unwrap_or_else(|| Json::Object(Map::new()));
+                let metadata = event_metadata(&events).unwrap_or_else(|| Json::Object(Map::new()));
                 let result = returned_events(
                     routed.response,
                     inbound,
@@ -224,6 +218,11 @@ impl SwitchyardRuntime {
         }
     }
 
+    fn sanitized_emitter(&self, emit_event: RoutingEventEmitter) -> RoutingEventEmitter {
+        let redactor = Arc::clone(&self.redactor);
+        Arc::new(move |event| emit_event(sanitize_event(&redactor, event)))
+    }
+
     async fn execute(&self, inbound: WireFormat, request: Request) -> Execution<RoutedResponse> {
         let Some(route) = self.route(&request) else {
             return Execution {
@@ -255,20 +254,26 @@ impl SwitchyardRuntime {
                 .push(observation);
         });
         match route.execute(request, Some(observer)).await {
-            Ok(output) => {
+            Ok(mut output) => {
                 let outcome_fields = self.emit_observations(
                     &mut events,
                     take_observations(&observations),
                     &metadata,
+                    route,
                 );
-                let served_model = output.response.served_model().map(|model| model.as_str());
+                let served_target = output.response.served_model().cloned();
+                let served_model = served_target
+                    .as_ref()
+                    .map(|target| route.provider_model(target));
                 let mut decision_outcome_fields = outcome_fields.clone();
                 let mut data = json!({
                     "algorithm": route.algorithm_name(),
-                    "selected_model": output.selected_model.as_str(),
+                    "selected_model": route.provider_model(&output.selected_model).as_str(),
                     "served_model": served_model,
-                    "fallback_used": served_model
-                        .map(|model| model != output.selected_model.as_str()),
+                    "selected_target": output.selected_model.as_str(),
+                    "served_target": served_target,
+                    "reasoning_effort": served_target.as_ref().and_then(|target| route.target(target)).and_then(|target| target.reasoning_effort.as_deref()),
+                    "fallback_used": served_target.as_ref().map(|target| target != &output.selected_model),
                 });
                 if let Json::Object(data) = &mut data {
                     data.append(&mut decision_outcome_fields);
@@ -279,6 +284,9 @@ impl SwitchyardRuntime {
                     metadata,
                     severity: Some(LogSeverity::Info),
                 }));
+                if let Some(model) = served_model {
+                    output.response.set_served_model(model);
+                }
                 Execution {
                     result: Ok(RoutedResponse {
                         response: output.response,
@@ -292,15 +300,18 @@ impl SwitchyardRuntime {
                     &mut events,
                     take_observations(&observations),
                     &metadata,
+                    route,
                 );
-                self.route_execution_error_mark(
-                    &mut events,
-                    &error.execution_error_summary(),
-                    None,
-                    outcome_fields,
-                );
+                let summary = error.execution_error_summary();
+                self.route_execution_error_mark(&mut events, &summary, None, outcome_fields);
+                // Preserve the status without exposing the provider's error body.
+                let message = "Switchyard route execution failed";
+                let message = summary
+                    .upstream_status
+                    .and_then(|status| nemo_relay_plugin::http_error_message(status, message).ok())
+                    .unwrap_or_else(|| message.to_owned());
                 Execution {
-                    result: Err("Switchyard route execution failed".into()),
+                    result: Err(message),
                     events,
                 }
             }
@@ -320,10 +331,20 @@ impl SwitchyardRuntime {
         events: &mut Vec<RoutingEvent>,
         observations: Vec<RunObservation>,
         metadata: &Json,
+        route: &Route,
     ) -> Map<String, Json> {
         let mut call_index = 0;
         let mut outcome_fields = Map::new();
-        for observation in observations {
+        for mut observation in observations {
+            // Relay's model fields and token metrics retain provider identities.
+            match &mut observation {
+                RunObservation::LlmCall(call)
+                | RunObservation::DecisionCall(call)
+                | RunObservation::AnswerCall(call) => {
+                    call.selected_model = route.provider_model(&call.selected_model).clone();
+                }
+                _ => {}
+            }
             match observation {
                 RunObservation::Outcome(outcome) => {
                     outcome_fields.insert(
@@ -336,7 +357,23 @@ impl SwitchyardRuntime {
                 }
                 RunObservation::LlmCall(call) => {
                     call_index += 1;
-                    self.routing_call_events(events, call, call_index, metadata);
+                    self.routing_call_events(
+                        events,
+                        call,
+                        call_index,
+                        metadata,
+                        "switchyard.routing.llm_call",
+                    );
+                }
+                RunObservation::DecisionCall(call) => {
+                    call_index += 1;
+                    self.routing_call_events(
+                        events,
+                        call,
+                        call_index,
+                        metadata,
+                        "switchyard.routing.decision_call",
+                    );
                 }
                 RunObservation::RoutingOverhead(duration) => {
                     let latency_ms = duration.as_secs_f64() * 1_000.0;
@@ -374,15 +411,16 @@ impl SwitchyardRuntime {
     fn routing_call_events(
         &self,
         events: &mut Vec<RoutingEvent>,
-        call: LlmCallObservation,
+        call: ModelCallObservation,
         call_index: usize,
         metadata: &Json,
+        mark_name: &str,
     ) {
         let outcome = if call.is_success { "ok" } else { "error" };
         let latency_ms = call.duration.as_secs_f64() * 1_000.0;
         let token_metrics = token_usage_metrics("routing", &call, metadata);
         events.push(RoutingEvent::Mark(RoutingMark {
-            name: "switchyard.routing.llm_call".into(),
+            name: mark_name.into(),
             data: json!({
                 "call_index": call_index,
                 "selected_model": call.selected_model.as_str(),
@@ -442,19 +480,17 @@ fn evidence_for_mark(evidence: Option<Json>) -> Option<Json> {
         "source" | "verdict" | "trigger" | "reason_code" => value
             .as_str()
             .is_some_and(|value| value.len() <= MAX_EVIDENCE_STRING_BYTES),
-        "score" | "confidence" | "threshold" => value.is_number(),
+        "score" | "confidence" | "threshold" | "capable_score" | "capable_threshold" => {
+            value.is_number()
+        }
         _ => false,
     });
     (!evidence.is_empty()).then_some(Json::Object(evidence))
 }
 
-pub(crate) fn emit_events(
-    runtime: &PluginRuntime,
-    redactor: &ProviderKeyRedactor,
-    events: Vec<RoutingEvent>,
-) {
+pub(crate) fn emit_events(emit_event: &RoutingEventEmitter, events: Vec<RoutingEvent>) {
     for event in events {
-        emit_event(runtime, redactor, event);
+        emit_event(event);
     }
 }
 
@@ -479,6 +515,9 @@ pub(crate) fn emit_event(
         RoutingEvent::Metric(metric) => runtime
             .emit_metric(&metric.name, metric.measurements, Some(&metric.metadata))
             .map_err(|error| ("routing metric", metric.name, error)),
+        RoutingEvent::Span(span) => span
+            .emit(runtime)
+            .map_err(|error| ("routing span", "libsy".into(), error)),
     };
     if let Err((kind, name, error)) = result {
         let message = redactor.text(format!(
@@ -504,6 +543,7 @@ fn sanitize_event(redactor: &ProviderKeyRedactor, mut event: RoutingEvent) -> Ro
                     .map(|value| redactor.value(value));
             }
         }
+        RoutingEvent::Span(span) => span.sanitize(redactor),
     }
     event
 }
@@ -605,6 +645,7 @@ fn normalized_stream_error(chunks: &[LlmResponseChunk]) -> Option<LlmClientError
         LlmResponseChunk::StreamError { message } => Some(LlmClientError::UpstreamHttp {
             status: StatusCode::BAD_GATEWAY,
             body: message.clone(),
+            headers: Box::default(),
         }),
         _ => None,
     })
@@ -673,7 +714,7 @@ fn route_execution_error_events(
 fn event_metadata(events: &[RoutingEvent]) -> Option<Json> {
     events.iter().find_map(|event| match event {
         RoutingEvent::Mark(mark) => Some(mark.metadata.clone()),
-        RoutingEvent::Metric(_) => None,
+        _ => None,
     })
 }
 
@@ -717,7 +758,7 @@ fn routing_overhead_metric(latency_ms: f64, metadata: Json) -> RoutingEvent {
 
 fn token_usage_metrics(
     call_role: &str,
-    call: &LlmCallObservation,
+    call: &ModelCallObservation,
     metadata: &Json,
 ) -> Vec<RoutingEvent> {
     let Some(usage) = call.usage.as_ref() else {
@@ -917,6 +958,7 @@ mod tests {
                 "target": {
                     "format": format,
                     "base_url": base_url,
+                    "max_retries": 0,
                 }
             },
             "targets": {
@@ -934,6 +976,8 @@ mod tests {
             }
         });
         SwitchyardRuntime::new(crate::config::SwitchyardConfig {
+            capture_routing_payloads: false,
+            max_routing_payload_bytes: crate::config::DEFAULT_ROUTING_PAYLOAD_BYTES,
             priority: 0,
             switchyard_config_path: None,
             switchyard_config: Some(deployment.as_object().unwrap().clone()),
@@ -1040,16 +1084,128 @@ mod tests {
                     RoutingEvent::Mark(mark) if mark.name == "switchyard.routing.decision" => {
                         Some(&mark.data)
                     }
-                    RoutingEvent::Mark(_) | RoutingEvent::Metric(_) => None,
+                    _ => None,
                 })
                 .expect("decision mark should be emitted");
             assert_eq!(decision["selected_model"], "target/model");
+            assert_eq!(decision["selected_target"], "default");
             assert_eq!(decision["served_model"], "target/model");
+            assert_eq!(decision["served_target"], "default");
             assert_eq!(decision["fallback_used"], false);
             assert!(decision["outcome_id"].is_string());
             let response = execution.result.expect("target call should succeed");
             assert_eq!(response["object"], "response");
             assert_eq!(response["model"], "target/model");
+        }
+    }
+
+    // Falling back between efforts must remain visible even when provider IDs match.
+    #[tokio::test]
+    async fn same_model_fallback_keeps_provider_fields_and_target_details() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"reasoning_effort": "medium"})))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"model": "shared/model", "reasoning_effort": "max"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "reply", "model": "shared/model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1}
+            }))).expect(1).mount(&server).await;
+        let runner = Runner::from_toml(&format!(
+            r#"
+schema_version = 1
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{}/v1"
+max_retries = 0
+[targets.efficient]
+id = "shared/model"
+llm_client = "upstream"
+reasoning_effort = "medium"
+[targets.capable]
+id = "shared/model"
+llm_client = "upstream"
+reasoning_effort = "max"
+[routes.test]
+id = "route"
+type = "random"
+targets = ["efficient", "capable"]
+weights = [1000000, 1]
+seed = 17
+"#,
+            server.uri()
+        ))
+        .unwrap();
+        let runtime = SwitchyardRuntime {
+            runner,
+            translation: TranslationEngine::default(),
+            redactor: Arc::default(),
+        };
+        let request = runtime.decode_request(WireFormat::OpenAiChat, RelayRequest {
+            headers: Map::new(), content: json!({"model": "route", "messages": [{"role": "user", "content": "hello"}]}),
+        }, false).unwrap();
+        let execution = runtime
+            .execute_buffered(WireFormat::OpenAiChat, request)
+            .await;
+        assert_eq!(execution.result.unwrap()["model"], "shared/model");
+        let mut saw_decision = false;
+        for event in execution.events {
+            if let RoutingEvent::Mark(mark) = event {
+                if mark.name == "switchyard.routing.decision" {
+                    saw_decision = true;
+                    assert_eq!(mark.data["selected_model"], "shared/model");
+                    assert_eq!(mark.data["served_model"], "shared/model");
+                    assert_eq!(mark.data["selected_target"], "efficient");
+                    assert_eq!(mark.data["served_target"], "capable");
+                    assert_eq!(mark.data["reasoning_effort"], "max");
+                    assert_eq!(mark.data["fallback_used"], true);
+                } else if mark.name == "switchyard.routing.llm_call" {
+                    assert_eq!(mark.data["selected_model"], "shared/model");
+                }
+            }
+        }
+        assert!(saw_decision);
+    }
+
+    #[tokio::test]
+    async fn failed_routes_preserve_upstream_status_without_provider_body() {
+        for status in [401, 429, 503] {
+            let server = MockServer::start().await;
+            let private_body = "private provider error details";
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(private_body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let runtime = runtime_for_target("openai_chat", &format!("{}/v1", server.uri()));
+            let request = runtime
+                .decode_request(
+                    WireFormat::OpenAiChat,
+                    RelayRequest {
+                        headers: Map::new(),
+                        content: json!({
+                            "model": "switchyard/default",
+                            "messages": [{"role": "user", "content": "hello"}],
+                        }),
+                    },
+                    false,
+                )
+                .unwrap();
+            let execution = runtime
+                .execute_buffered(WireFormat::OpenAiChat, request)
+                .await;
+            let error = execution.result.unwrap_err();
+            assert_eq!(
+                error,
+                format!("HTTP {status}: Switchyard route execution failed")
+            );
+            assert!(!format!("{error} {:?}", execution.events).contains(private_body));
         }
     }
 
@@ -1088,6 +1244,8 @@ mod tests {
             },
         });
         let runtime = SwitchyardRuntime::new(crate::config::SwitchyardConfig {
+            capture_routing_payloads: false,
+            max_routing_payload_bytes: crate::config::DEFAULT_ROUTING_PAYLOAD_BYTES,
             priority: 0,
             switchyard_config_path: None,
             switchyard_config: Some(
@@ -1124,7 +1282,7 @@ mod tests {
                 RoutingEvent::Mark(mark) if mark.name == "switchyard.routing.error" => {
                     Some(&mark.data)
                 }
-                RoutingEvent::Mark(_) | RoutingEvent::Metric(_) => None,
+                _ => None,
             })
             .expect("error mark should be emitted");
         assert!(error["outcome_id"].is_string());
@@ -1273,6 +1431,8 @@ mod tests {
             "score": 0.9,
             "confidence": "wrong type",
             "threshold": 0.5,
+            "capable_score": 0.7,
+            "capable_threshold": 0.6,
             "verdict": "continue",
             "trigger": "turn",
             "reason_code": "x".repeat(MAX_EVIDENCE_STRING_BYTES + 1),
@@ -1286,6 +1446,8 @@ mod tests {
                 "source": "llm-classifier",
                 "score": 0.9,
                 "threshold": 0.5,
+                "capable_score": 0.7,
+                "capable_threshold": 0.6,
                 "verdict": "continue",
                 "trigger": "turn",
             }))
@@ -1299,7 +1461,7 @@ mod tests {
         runtime.emit_observations(
             &mut events,
             vec![
-                RunObservation::LlmCall(LlmCallObservation {
+                RunObservation::LlmCall(ModelCallObservation {
                     selected_model: ModelId::from("routing-model"),
                     is_success: false,
                     duration: std::time::Duration::from_millis(12),
@@ -1311,6 +1473,7 @@ mod tests {
                 RunObservation::RoutingOverhead(std::time::Duration::from_millis(3)),
             ],
             &json!({"session_id": "session"}),
+            runtime.runner.route("switchyard").unwrap(),
         );
 
         assert_eq!(events.len(), 6);
@@ -1390,7 +1553,7 @@ mod tests {
 
     #[test]
     fn token_usage_metrics_distinguish_routing_and_answer_targets() {
-        let call = LlmCallObservation {
+        let call = ModelCallObservation {
             selected_model: ModelId::from("judge-model"),
             is_success: true,
             duration: std::time::Duration::from_millis(1),
@@ -1400,6 +1563,7 @@ mod tests {
                 output_tokens: Some(7),
                 total_tokens: Some(23),
                 reasoning_tokens: Some(5),
+                provider_cost: None,
             }),
         };
 
@@ -1452,13 +1616,13 @@ mod tests {
         runtime.emit_observations(
             &mut events,
             vec![
-                RunObservation::AnswerCall(LlmCallObservation {
+                RunObservation::AnswerCall(ModelCallObservation {
                     selected_model: ModelId::from("weak-target"),
                     is_success: false,
                     duration: std::time::Duration::from_millis(2),
                     usage: None,
                 }),
-                RunObservation::AnswerCall(LlmCallObservation {
+                RunObservation::AnswerCall(ModelCallObservation {
                     selected_model: ModelId::from("strong-target"),
                     is_success: true,
                     duration: std::time::Duration::from_millis(3),
@@ -1469,6 +1633,7 @@ mod tests {
                 }),
             ],
             &json!({}),
+            runtime.runner.route("switchyard").unwrap(),
         );
 
         assert_eq!(events.len(), 3);

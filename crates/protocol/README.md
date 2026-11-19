@@ -8,7 +8,7 @@ defines contracts; it does not route, translate, or perform network calls.
 
 ```toml
 [dependencies]
-switchyard-protocol = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", tag = "v0.2.0" }
+switchyard-protocol = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", rev = "ef958a9a8099bb0493b3d42862273e09eced0f52" }
 serde_json = "1"
 ```
 
@@ -17,7 +17,7 @@ serde_json = "1"
 | Area | Types |
 |---|---|
 | Conversation | [`LlmRequest`], [`Message`], [`InstructionBlock`], [`ContentBlock`] |
-| Tools | [`ToolDefinition`], [`ToolChoice`], [`ToolCall`], [`ToolResult`] |
+| Tools | [`Tool`], [`ToolDefinition`], [`McpToolset`], [`McpToolConfig`], [`McpContent`], [`ToolChoice`], [`ToolCall`], [`ToolResult`] |
 | Response | [`AggLlmResponse`], [`ResponseOutput`], [`Usage`], [`StopReason`] |
 | Streaming | [`LlmResponse`], [`LlmResponseStream`], [`LlmResponseStreamEvent`], [`LlmResponseChunk`], [`ProviderStreamEvent`] |
 | Envelope | [`Request`], [`Response`], [`Metadata`] |
@@ -31,12 +31,12 @@ use switchyard_protocol::{ContentBlock, LlmRequest, Message, Role};
 
 let request = LlmRequest {
     model: Some("provider/model".into()),
-    messages: vec![Message {
-        role: Role::User,
-        content: vec![ContentBlock::Text {
+    messages: vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
             text: "Explain tail latency".into(),
         }],
-    }],
+    )],
     ..LlmRequest::default()
 };
 
@@ -75,7 +75,7 @@ let request = Request {
                 "required": ["name"]
             }),
             strict: Some(true),
-        }],
+        }.into()],
         tool_choice: Some(ToolChoice::Auto),
         sampling: SamplingParams {
             temperature: Some(0.2),
@@ -96,7 +96,7 @@ let request = Request {
     ..Request::default()
 };
 
-assert_eq!(request.llm_request.tools[0].name, "lookup_metric");
+assert_eq!(request.llm_request.tools[0].function().map(|tool| tool.name.as_str()), Some("lookup_metric"));
 ```
 
 ## Response forms

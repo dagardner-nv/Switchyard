@@ -3,6 +3,8 @@
 
 # Harbor Benchmarks
 
+For recorded results and their routing configs, see [Benchmarks](../docs/benchmarks.md).
+
 Use this guide to run Harbor Terminal-Bench Lite from a fresh Switchyard clone.
 It covers the two smoke paths most people need first:
 
@@ -15,6 +17,9 @@ Harbor directly at the upstream provider.
 
 For a small automated MMLU-Redux example using NeMo Gym instead of Harbor, see
 [Evaluate Switchyard routing with NeMo Gym](nemo_gym/README.md).
+
+For task-level decision-model routing, see the
+[Jev routing profile](routing-profiles/tb21-jev-opus-glm.toml).
 
 ## Prerequisites
 
@@ -267,6 +272,30 @@ bash benchmark/run-baseline.sh \
 Tune `--n-concurrent` for your machine and provider quota. Use `--task-id`, `--task-list-file`, or
 `--n-tasks` for subsets.
 
+### Run with the pi coding agent
+
+```bash
+bash benchmark/run-baseline.sh \
+  --harbor-path benchmark/datasets/openthoughts-tblite-closed-book \
+  --server-config benchmark/server-configs/tb-lite-llm-classifier-opus-kimi-gemini.toml \
+  --agent pi \
+  --model switchyard \
+  --reasoning-effort high \
+  --harbor-extra --ae --harbor-extra PI_CONTEXT_WINDOW=200000 \
+  --harbor-extra --ae --harbor-extra PI_MAX_OUTPUT_TOKENS=32000 \
+  --n-concurrent 8 \
+  --max-retries 2
+```
+
+With `--server-config`, the script passes the model label `switchyard/<route>` to Harbor's pi
+agent. The patched agent then writes `~/.pi/agent/models.json` inside the task container. That file
+defines a `switchyard` provider that points at `OPENAI_BASE_URL` and uses the `openai-completions`
+API. The agent environment variables `PI_CONTEXT_WINDOW` and `PI_MAX_OUTPUT_TOKENS` set
+`contextWindow` and `maxTokens` on that model entry. When they are unset, pi uses its defaults of
+128000 and 16384. `--reasoning-effort` sets pi's `--thinking` level, so pass one of `off`,
+`minimal`, `low`, `medium`, `high`, or `xhigh`. Without `--server-config`, pass pi's own provider
+label as `--model`, for example `openrouter/openai/gpt-5.5`.
+
 ## Inspect A Run
 
 Run directories are created under `benchmark/tb_runs/`. The most useful artifacts are:
@@ -311,6 +340,10 @@ DeepSWE uses Harbor's task format but its own runner, [Pier](https://github.com/
 (required since v1.1 for the separate-verifier/collect-hook pattern). It is not part of
 `run-baseline.sh`.
 
+See [DeepSWE results](../docs/benchmarks.md#deepswe) for task completion and cost comparisons,
+and [DeepSWE v1.1 qualification settings](DEEPSWE_V11_QUALIFICATION.md) for the exact
+versions, timeouts, scoring rules, and routing profiles used for qualification.
+
 ```bash
 git clone https://github.com/datacurve-ai/deep-swe benchmark/datasets/deep-swe
 uv tool install 'datacurve-pier>0.3.0'
@@ -349,6 +382,38 @@ pier run -p benchmark/datasets/deep-swe/tasks --agent codex \
 `host.docker.internal` requires Docker Desktop; on Linux, pass the host's Docker-bridge address
 instead. Binding port 443 needs elevated privileges on most Linux hosts (`sudo`, or
 `setcap 'cap_net_bind_service=+ep'` on the binary).
+
+Run the Advisor profile. It sets reasoning effort to `max` on both models:
+
+```bash
+export OPENROUTER_API_KEY="..."
+switchyard-server --config benchmark/routing-profiles/deepswe-v11-advisor-gate-luna-sol.toml \
+  --host 0.0.0.0 --port 443
+
+pier run -p benchmark/datasets/deep-swe/tasks --agent codex \
+  --model openai/switchyard \
+  --ae OPENAI_BASE_URL=http://host.docker.internal:443/v1 \
+  --ae OPENAI_API_KEY=unused
+```
+
+The historical Plan/Execute result used the removed standalone implementation.
+See [qualification settings](DEEPSWE_V11_QUALIFICATION.md) for its archived
+configuration. For new runs, use the
+[Plan/Execute configuration for Stage](../docs/routing_algorithms/stage_router_routing.md#plan-and-execute).
+
+Run the Stage profile. Its public route ID is `gpt-5.6-luna`:
+
+```bash
+export OPENROUTER_API_KEY="..."
+switchyard-server \
+  --config benchmark/routing-profiles/deepswe-v11-stage-router-luna-sol.toml \
+  --host 0.0.0.0 --port 443
+
+pier run -p benchmark/datasets/deep-swe/tasks --agent codex \
+  --model openai/gpt-5.6-luna \
+  --ae OPENAI_BASE_URL=http://host.docker.internal:443/v1 \
+  --ae OPENAI_API_KEY=unused
+```
 
 Smoke subset:
 

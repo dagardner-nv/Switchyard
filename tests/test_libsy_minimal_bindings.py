@@ -13,9 +13,11 @@ from switchyard.libsy import (
     Algorithm,
     ContextWindowExceededError,
     CustomClassifierConfig,
+    DeescalationConfig,
     EscalationClassifierConfig,
     LlmClassifierConfig,
     LlmResponse,
+    ModelCall,
     OutcomeMetadata,
     RoutingOutcome,
     Step,
@@ -55,6 +57,16 @@ class EchoClient:
         }
 
 
+async def ready(
+    response: LlmResponse.Agg | LlmResponse.Stream,
+) -> LlmResponse.Agg | LlmResponse.Stream:
+    return response
+
+
+async def aggregate(client: Any, request: dict[str, Any]) -> LlmResponse.Agg:
+    return LlmResponse.Agg(await client.call(request))
+
+
 async def run_algorithm(
     algorithm: Algorithm,
     clients: dict[str, Any] | None = None,
@@ -63,28 +75,26 @@ async def run_algorithm(
     request: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    async def serve(call: ModelCall) -> LlmResponse.Agg:
+        for index, target in enumerate(call.models):
+            candidate_request = {**call.request, "model": target}
+            try:
+                return await aggregate((clients or {})[target], candidate_request)
+            except ContextWindowExceededError:
+                if index + 1 == len(call.models):
+                    raise
+        raise AssertionError("model call has no candidates")
+
     runtime_models = models if models is not None else {"any": list((clients or {}).keys())}
     async for step in algorithm.run_stream(
         request or request_body(), runtime_models, headers=headers
     ):
         match step:
             case Step.CallModel(call):
-                for index, target in enumerate(call.models):
-                    candidate_request = {**call.request, "model": target}
-                    client = (clients or {})[target]
-                    try:
-                        response = await client.call(candidate_request)
-                    except ContextWindowExceededError as error:
-                        if index + 1 == len(call.models):
-                            call.fail(error)
-                    except Exception as error:
-                        call.fail(error)
-                        break
-                    else:
-                        call.respond(LlmResponse.Agg(response))
-                        break
+                await call.respond(serve(call))
             case Step.Done(outcome):
                 assert isinstance(outcome.metadata, OutcomeMetadata)
+                assert isinstance(outcome.candidate_requests, dict)
                 assert UUID(outcome.metadata.outcome_id).version == 7
                 if outcome.response is not None:
                     match outcome.response:
@@ -94,7 +104,10 @@ async def run_algorithm(
                             raise AssertionError("test helper expected an aggregate response")
                 candidates = outcome.selected_model_ids
                 for index, target in enumerate(candidates):
-                    candidate_request = {**outcome.request, "model": target}
+                    candidate_request = {
+                        **outcome.candidate_requests.get(target, outcome.request),
+                        "model": target,
+                    }
                     client = (clients or {})[target]
                     try:
                         response = await client.call(candidate_request)
@@ -166,7 +179,7 @@ async def test_routing_call_accepts_a_streamed_response() -> None:
     async for step in algorithm.run_stream(request_body(), models):
         match step:
             case Step.CallModel(call):
-                call.respond(LlmResponse.Stream(events()))
+                await call.respond(ready(LlmResponse.Stream(events())))
             case Step.Done(done):
                 outcome = done
 
@@ -221,7 +234,7 @@ async def test_classifier_config_accepts_a_prompt_override() -> None:
     async for step in algorithm.run_stream(request_body(), models):
         match step:
             case Step.CallModel(call):
-                call.respond(LlmResponse.Agg(await judge.call(call.request)))
+                await call.respond(aggregate(judge, call.request))
             case Step.Done(done):
                 outcome = done
 
@@ -241,6 +254,20 @@ async def test_classifier_config_accepts_a_prompt_override() -> None:
         "p_solve"
     ]
     assert response["model"] == "weak"
+
+
+def test_escalation_accepts_optional_deescalation_config() -> None:
+    config = EscalationClassifierConfig(
+        deescalation=DeescalationConfig(
+            strong_min_calls=3,
+            confirmations=2,
+            strong_max_calls=6,
+            weak_cooldown_calls=8,
+        )
+    )
+    algorithm = LlmClassifierConfig.escalation(config=config)
+
+    assert isinstance(algorithms.llm_classifier(algorithm), Algorithm)
 
 
 async def test_custom_classifier_routes_across_named_targets() -> None:
@@ -382,6 +409,20 @@ async def test_noop_needs_no_client() -> None:
     assert response["outputs"][0]["content"] == [{"type": "text", "text": "OK"}]
 
 
+@pytest.mark.parametrize(("method", "base"), [("model_dump", object), ("to_dict", dict)])
+def test_conversion_getter_error_propagates(method: str, base: type) -> None:
+    error = RuntimeError("conversion getter failed")
+
+    def fail(self: Any) -> Any:
+        raise error
+
+    request_type = type("Request", (base,), {method: property(fail)})
+    request = request_type(request_body()) if base is dict else request_type()
+    with pytest.raises(RuntimeError) as caught:
+        algorithms.noop().run_stream(request, {"any": ["fixture"]})
+    assert caught.value is error
+
+
 @pytest.mark.parametrize(
     ("headers", "message"),
     [
@@ -490,7 +531,7 @@ async def test_escalation_falls_back_on_first_stream_context_overflow() -> None:
         match step:
             case Step.CallModel(call):
                 calls.append(call.models)
-                call.respond(LlmResponse.Stream(overflow()))
+                await call.respond(ready(LlmResponse.Stream(overflow())))
             case Step.Done(done):
                 outcome = done
 

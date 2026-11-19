@@ -13,7 +13,7 @@ use switchyard_server::{
     ServerRunOptions, ServerState, TlsOptions, run_server,
 };
 
-const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 4000;
 
 /// Command-line arguments accepted by the Rust server binary.
@@ -29,7 +29,8 @@ pub(crate) struct ServerArgs {
     config: PathBuf,
 
     /// Host address to bind.
-    #[arg(long, default_value_t = DEFAULT_HOST)]
+    // Let a later --host override the Docker ENTRYPOINT default.
+    #[arg(long, default_value_t = DEFAULT_HOST, overrides_with = "host")]
     host: IpAddr,
 
     /// Port to bind.
@@ -52,6 +53,10 @@ pub(crate) struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     routing_log_file: Option<PathBuf>,
 
+    /// This optional TOML or JSON file replaces the entire bundled table of rates in USD per million tokens.
+    #[arg(long, value_name = "PATH", requires = "routing_log_file")]
+    pricing_file: Option<PathBuf>,
+
     /// TLS certificate path in PEM format.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -71,6 +76,9 @@ impl ServerArgs {
         let mut state = load_server_state(&self.config)?;
         if let Some(path) = self.routing_log_file {
             state = state.with_routing_log(path)?;
+        }
+        if let Some(path) = self.pricing_file {
+            state = state.with_pricing_file(path)?;
         }
         let tls = match (self.tls_cert, self.tls_key) {
             (Some(cert), Some(key)) => {
@@ -100,4 +108,33 @@ impl ServerArgs {
 pub(crate) async fn run(args: ServerArgs) -> ServerResult<()> {
     let (state, options) = args.into_runtime()?;
     run_server(state, options).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_host_is_loopback() {
+        let args = ServerArgs::try_parse_from(["switchyard-server", "--config", "routes.toml"])
+            .expect("valid arguments");
+        assert_eq!(args.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn explicit_host_overrides_the_container_default() {
+        for host in ["127.0.0.1", "::1", "0.0.0.0"] {
+            let args = ServerArgs::try_parse_from([
+                "switchyard-server",
+                "--host",
+                "0.0.0.0",
+                "--config",
+                "routes.toml",
+                "--host",
+                host,
+            ])
+            .expect("valid explicit host");
+            assert_eq!(args.host, host.parse::<IpAddr>().expect("IP address"));
+        }
+    }
 }

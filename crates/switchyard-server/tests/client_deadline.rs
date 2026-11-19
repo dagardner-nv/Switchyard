@@ -63,7 +63,7 @@ async fn upstream(
     };
     if model == "backoff" || (model == "retry-body" && attempt == 1) {
         if model == "retry-body" {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let delay = if model == "backoff" { "1" } else { "0" };
         return (
@@ -105,7 +105,7 @@ async fn upstream(
         "choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
         "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}});
     if model == "slow-body" || model == "retry-body" {
-        let delay = if model == "retry-body" { 450 } else { 3000 };
+        let delay = if model == "retry-body" { 150 } else { 3000 };
         let stream = async_stream::stream! {
             yield Ok::<_, Infallible>(Bytes::from_static(b" "));
             tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -139,6 +139,11 @@ fn app(
             "type = \"llm_classifier\"\nclassifier_target = \"judge\"\nstrong_target = \"strong\"\nweak_target = \"weak\"\nbase_threshold = 0.5"
         }
     };
+    let route = if mode == "classifier" {
+        format!("{route}\nfail_open = false")
+    } else {
+        route.to_owned()
+    };
     let mut config = tempfile::Builder::new().suffix(".toml").tempfile()?;
     write!(
         config,
@@ -148,6 +153,8 @@ schema_version = 1
 format = "openai_chat"
 base_url = "{}"
 max_retries = 1
+# Exercise the upstream deadline on every request.
+failure_cooldown_ms = 0
 timeout_ms = {timeout}
 [targets]
 judge = {{ id = "{judge}", llm_client = "http", extra_body = {{ stream = {judge_stream} }} }}
@@ -233,6 +240,7 @@ async fn check(
 async fn client_deadline_stops_routing_and_counts_attempts() -> TestResult {
     let upstream = Upstream::start().await?;
     let stalled = app(&upstream, "classifier", "stalled", "weak", 100)?;
+    let fail_open = app(&upstream, "classifier-default", "stalled", "weak", 100)?;
     let streaming = app(&upstream, "terminal", "judge", "streaming", 500)?;
     let slow_stream = app(&upstream, "terminal", "judge", "slow-body", 100)?;
     for endpoint in [
@@ -245,6 +253,13 @@ async fn client_deadline_stops_routing_and_counts_attempts() -> TestResult {
             check(&upstream, &stalled, endpoint, &["stalled"], [0., 0., 1.]).await?;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
         assert!(body.contains("100 ms"), "{body}");
+        let (calls, counts) = if endpoint == "/v1/decision" {
+            (&["stalled"][..], [0., 0., 1.])
+        } else {
+            (&["stalled", "strong"][..], [1., 0., 1.])
+        };
+        let (status, body) = check(&upstream, &fail_open, endpoint, calls, counts).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
         if endpoint == "/v1/decision" {
             continue;
         }
@@ -282,15 +297,15 @@ async fn client_deadline_stops_routing_and_counts_attempts() -> TestResult {
     for (judge, expected_calls, counts) in [
         ("slow-body", &["slow-body"][..], [0., 0., 1.]),
         ("backoff", &["backoff"][..], [0., 1., 0.]),
-        // The first attempt waits 300 ms and the retry body waits 450 ms.
-        // Each fits the 600 ms deadline alone; together they exceed it.
+        // The first attempt waits 100 ms and the retry body waits 150 ms.
+        // Each fits the 200 ms deadline alone; together they exceed it.
         (
             "retry-body",
             &["retry-body", "retry-body"][..],
             [0., 1., 1.],
         ),
     ] {
-        let app = app(&upstream, "classifier", judge, "weak", 600)?;
+        let app = app(&upstream, "classifier", judge, "weak", 200)?;
         let (status, body) = check(
             &upstream,
             &app,
@@ -300,7 +315,7 @@ async fn client_deadline_stops_routing_and_counts_attempts() -> TestResult {
         )
         .await?;
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{judge}: {body}");
-        assert!(body.contains("600 ms"), "{body}");
+        assert!(body.contains("200 ms"), "{body}");
     }
     let failed_stream = app(&upstream, "classifier", "stream-error", "weak", 100)?;
     let (status, body) = check(

@@ -10,6 +10,8 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 # .cargo/config.toml carries the workspace rustflags (target-cpu, force-frame-pointers).
 COPY .cargo ./.cargo
 COPY crates ./crates
+COPY examples/dynamo-preproc ./examples/dynamo-preproc
+COPY examples/claude ./examples/claude
 
 RUN cargo build --locked --release -p switchyard-server
 
@@ -28,4 +30,4 @@ ENV HOME=/tmp
 USER 1000:1000
 EXPOSE 4000
 
-ENTRYPOINT ["switchyard-server"]
+ENTRYPOINT ["switchyard-server", "--host", "0.0.0.0"]

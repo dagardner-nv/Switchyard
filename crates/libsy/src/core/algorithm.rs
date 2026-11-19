@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The [`Algorithm`] trait and its [`Driver`] — the orchestration contract every
-//! algorithm implements and the offload channel it uses for routing-time model calls.
+//! Routing algorithms request external work through [`Driver`] and receive typed replies.
+//! Hosts execute that work, keeping routing policy independent of transport.
 
 use std::{
     collections::HashMap, future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc,
@@ -24,9 +24,12 @@ use tracing::Instrument;
 /// [`switchyard_protocol::LlmResponseStreamEvent`] is its host/algorithm envelope; and
 /// [`switchyard_protocol::LlmResponse`] carries either a live
 /// [`switchyard_protocol::LlmResponseStream`] or the terminal aggregate.
-use switchyard_protocol::{Category, ModelId, Request, Response};
+use switchyard_protocol::{
+    AggLlmResponse, Category, ContentBlock, DecisionRequest, DecisionResponse, ModelId, Request,
+    Response, StopReason,
+};
 
-use crate::{DriverError, LibsyError, Result, observability};
+use crate::{DriverError, LibsyError, Result, State, observability};
 
 /// A boxed, `Send` stream of [`Step`]s — the output of
 /// [`Algorithm::run_stream`]. Boxed so the trait method that produces it keeps
@@ -48,6 +51,8 @@ pub struct RuntimeModels {
     /// When using subagents this is the parent agent category.
     by_category: HashMap<Category, Vec<ModelId>>,
     subagent: Option<HashMap<Category, Vec<ModelId>>>,
+    has_target_restriction: bool,
+    provider_models: HashMap<ModelId, ModelId>,
 }
 
 impl RuntimeModels {
@@ -56,13 +61,66 @@ impl RuntimeModels {
         Self {
             by_category,
             subagent: None,
+            has_target_restriction: false,
+            provider_models: HashMap::new(),
         }
+    }
+
+    /// Supplies provider identities for telemetry while routing keeps using target keys.
+    pub fn with_provider_models(mut self, models: HashMap<ModelId, ModelId>) -> Self {
+        self.provider_models = models;
+        self
+    }
+
+    /// Returns the provider model for a routing key, or the key for direct library callers.
+    pub fn provider_model<'a>(&'a self, target: &'a ModelId) -> &'a ModelId {
+        self.provider_models.get(target).unwrap_or(target)
     }
 
     /// Adds the groups used for delegated sub-agent work.
     pub fn with_subagent(mut self, models: HashMap<Category, Vec<ModelId>>) -> Self {
         self.subagent = Some(models);
         self
+    }
+
+    /// Rejects routing calls and completion candidates outside the configured model groups.
+    /// Enforced by the driver and [`drive`]; hosts bind IDs to permitted deployments.
+    pub fn with_target_restriction(mut self) -> Self {
+        self.has_target_restriction = true;
+        self
+    }
+
+    fn check_targets(&self, targets: &[ModelId]) -> Result<()> {
+        if !self.has_target_restriction {
+            return Ok(());
+        }
+        // Include delegated groups: the parent driver publishes subagent outcomes too.
+        for target in targets {
+            if !self
+                .by_category
+                .values()
+                .chain(self.subagent.iter().flat_map(HashMap::values))
+                .any(|models| models.contains(target))
+            {
+                return Err(LibsyError::TargetNotFound {
+                    target: target.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_request_targets(&self, request: &Request, targets: &[ModelId]) -> Result<()> {
+        self.check_targets(targets)?;
+        if self.has_target_restriction {
+            let selected = targets.first().ok_or(LibsyError::NoTargets)?;
+            if request.llm_request.model.as_deref() != Some(selected.as_str()) {
+                return Err(LibsyError::AlgorithmError {
+                    message: "request model does not match selected target".into(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The models in `category`, ordered best-first.
@@ -94,8 +152,8 @@ enum Scope {
 
 /// An offloaded model call, surfaced inside [`Step::CallModel`].
 ///
-/// The host reads the public fields, performs (or delegates) the model call, and fulfills it
-/// with [`respond`](Self::respond) — unblocking the algorithm's [`Driver::call_model`] on the
+/// The host reads the public fields and passes its model-call future to
+/// [`respond`](Self::respond), unblocking the algorithm's [`Driver::call_model`] on the
 /// other side. `switchyard-llm-client`'s `run` is the ready-made consumer that does this for
 /// you.
 ///
@@ -107,20 +165,150 @@ pub struct CallModel {
     pub algorithm: String,
     /// The request to serve; its `model` is stamped with the first candidate.
     pub request: Request,
-    /// Candidate models, tried in order until one answers. Never empty.
+    /// Candidate models in fallback order. Never empty.
+    ///
+    /// The host owns candidate execution and fallback. The native
+    /// `switchyard-llm-client` consumer calls only the first candidate during routing.
+    /// A failure stops its run unless [`Self::recover_errors`] is enabled, which
+    /// returns the error to the algorithm without trying later candidates.
+    /// Terminal completion fallback is handled separately.
     pub models: Vec<ModelId>,
-    // How to send the response back to the algorithm
-    reply: oneshot::Sender<Result<Response>>,
+    /// Return client errors to the algorithm so it can apply its fallback policy.
+    pub recover_errors: bool,
+    telemetry_model: ModelId,
+    /// How to send the response back to the algorithm. `None` once the call is recorded.
+    reply: Option<oneshot::Sender<Result<Response>>>,
+    started: Instant,
+    // Retain the originating span even if the waiting algorithm is cancelled first.
+    span: tracing::Span,
 }
 
 impl CallModel {
-    /// Fulfill the promise with the caller's model-call result. Pass `Err(..)` to
-    /// propagate a failed model call back to the algorithm. Consumes the promise: it
-    /// can only be fulfilled once.
-    pub fn respond(self, result: Result<Response>) -> Result<()> {
+    /// Run host work until it completes or the algorithm stops waiting for this call.
+    /// Dropping the waiting [`Driver::call_model`] future drops `work` and returns `Ok(())`.
+    /// Errors stop the host's run unless [`Self::recover_errors`] is enabled.
+    /// Use `std::future::ready(result)` for an already available response.
+    /// A delivered response stream owns its subsequent lifetime.
+    pub async fn respond(mut self, work: impl Future<Output = Result<Response>>) -> Result<()> {
+        let reply = self.reply.as_mut().ok_or(DriverError::ResponseDropped)?;
+        let result = tokio::select! {
+            biased;
+            _ = reply.closed() => return Ok(()),
+            result = work => result,
+        };
+        if self.reply.as_ref().is_some_and(oneshot::Sender::is_closed) {
+            return Ok(());
+        }
+        if !self.recover_errors
+            && let Err(error) = result
+        {
+            return self.fail(error);
+        }
+        self.record(result.is_ok());
+        if let Ok(response) = &result {
+            observability::record_llm_response(response, &self.span);
+        }
         self.reply
+            .take()
+            .ok_or(DriverError::ResponseDropped)?
             .send(result)
-            .map_err(|_| DriverError::ResponseDropped.into())
+            .ok();
+        Ok(())
+    }
+
+    /// Record a failed call and return its error to stop [`drive`].
+    /// Leaves the promise unfulfilled so the driver can cancel the algorithm.
+    pub fn fail(mut self, error: LibsyError) -> Result<()> {
+        self.reply = None;
+        self.record(false);
+        Err(error)
+    }
+
+    fn record(&self, is_ok: bool) {
+        observability::record_llm_call(
+            &self.algorithm,
+            self.telemetry_model.as_str(),
+            self.started.elapsed(),
+            is_ok,
+        );
+        self.span
+            .record("outcome", if is_ok { "ok" } else { "error" });
+    }
+}
+
+impl Drop for CallModel {
+    fn drop(&mut self) {
+        if self.reply.is_some() {
+            self.record(false);
+        }
+    }
+}
+
+/// A host-owned decision call. Dropping it without replying yields [`DriverError::ResponseDropped`].
+/// Completion or drop records one call and its duration, including time waiting for the host.
+pub struct CallDecision {
+    /// Algorithm name for attributing host telemetry.
+    pub algorithm: String,
+    /// Its model is set to [`Self::model`] before dispatch.
+    pub request: DecisionRequest,
+    /// Target ID for client lookup.
+    pub model: ModelId,
+    reply: Option<oneshot::Sender<Result<DecisionResponse>>>,
+    started: Instant,
+    // Retain the originating span even if the waiting algorithm is cancelled first.
+    span: tracing::Span,
+}
+
+impl CallDecision {
+    /// Run host work and return its response or error to the algorithm.
+    /// Dropping the waiting [`Driver::call_decision`] future drops `work` and returns `Ok(())`.
+    /// Use `std::future::ready(result)` for an already available response.
+    pub async fn respond(
+        mut self,
+        work: impl Future<Output = Result<DecisionResponse>>,
+    ) -> Result<()> {
+        let reply = self.reply.as_mut().ok_or(DriverError::ResponseDropped)?;
+        let result = tokio::select! {
+            biased;
+            _ = reply.closed() => return Ok(()),
+            result = work => result,
+        };
+        self.record(result.is_ok());
+        if let Ok(response) = &result {
+            observability::record_decision_response(response, &self.span);
+        }
+        self.reply
+            .take()
+            .ok_or(DriverError::ResponseDropped)?
+            .send(result)
+            .ok();
+        Ok(())
+    }
+
+    /// Returning this error from the host handler aborts [`drive`].
+    pub fn fail(mut self, error: LibsyError) -> Result<()> {
+        self.reply = None;
+        self.record(false);
+        Err(error)
+    }
+
+    fn record(&self, is_ok: bool) {
+        observability::record_decision_call(
+            &self.algorithm,
+            &self.model,
+            self.started.elapsed(),
+            is_ok,
+        );
+        self.span
+            .record("outcome", if is_ok { "ok" } else { "error" });
+    }
+}
+
+impl Drop for CallDecision {
+    fn drop(&mut self) {
+        if self.reply.is_some() {
+            self.record(false);
+        }
     }
 }
 
@@ -130,6 +318,12 @@ pub struct RoutingOutcome {
     pub selected_model_ids: Vec<ModelId>,
     /// The request after all routing-time rewrites, stamped with the selected model.
     pub request: Request,
+    /// The request the fallback candidates receive instead of `request`, when routing
+    /// rewrote `request` for the selected model only.
+    /// Content-policy denials do not advance to these fallback candidates.
+    pub fallback_request: Option<Request>,
+    /// Candidate-specific requests, including model-specific instructions.
+    pub candidate_requests: HashMap<ModelId, Request>,
     /// A response produced while routing, or `None` when the client must make the answer call.
     pub response: Option<Response>,
     /// Outcome identity and optional algorithm evidence.
@@ -137,6 +331,8 @@ pub struct RoutingOutcome {
     /// Constructors leave this empty; [`Algorithm::run_stream`] fills it before publishing a
     /// successful outcome.
     pub metadata: Option<crate::OutcomeMetadata>,
+    /// Routing state after the run, for hosts that store state outside the algorithm.
+    pub state: State,
 }
 
 impl RoutingOutcome {
@@ -161,8 +357,11 @@ impl RoutingOutcome {
         Self {
             selected_model_ids,
             request,
+            fallback_request: None,
+            candidate_requests: HashMap::new(),
             response: None,
             metadata: None,
+            state: State::default(),
         }
     }
 
@@ -173,13 +372,48 @@ impl RoutingOutcome {
         Self {
             selected_model_ids: vec![selected_model_id],
             request,
+            fallback_request: None,
+            candidate_requests: HashMap::new(),
             response: Some(response),
             metadata: None,
+            state: State::default(),
         }
     }
 }
 
-/// How an algorithm's [`route`](Algorithm::route) makes model calls.
+/// What the host saw of the answer it served for a routed request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnswerSummary {
+    /// The answer ended its turn with visible text and requested no tool call.
+    pub final_reply: bool,
+}
+
+impl AnswerSummary {
+    /// Summarizes a completed answer.
+    pub fn of(response: &AggLlmResponse) -> Self {
+        let final_reply = response.outputs.iter().all(|output| {
+            matches!(output.stop_reason, None | Some(StopReason::EndTurn))
+                && !output
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        }) && response.outputs.iter().any(|output| {
+            output.role == switchyard_protocol::Role::Assistant
+                && output.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()),
+                )
+        });
+        Self { final_reply }
+    }
+}
+
+#[derive(Default)]
+struct RunEvidence {
+    outcome: Option<Value>,
+    judgments: Vec<crate::JudgeDecision>,
+}
+
+/// An algorithm's handle for requesting external work and awaiting the host's typed replies.
 #[derive(Clone)]
 pub struct Driver {
     step_tx: mpsc::Sender<Result<Step>>,
@@ -188,13 +422,17 @@ pub struct Driver {
     algorithm: String,
 
     /// Run-scoped evidence shared by driver clones and attached only to a successful outcome.
-    evidence: Arc<Mutex<Option<Value>>>,
+    evidence: Arc<Mutex<RunEvidence>>,
+
+    /// Caller-supplied routing state, read and updated when a request carries no session ID.
+    state: Arc<Mutex<State>>,
 
     /// Every group this run may route over, shared by all driver clones.
     models: Arc<RuntimeModels>,
 
     /// Which of those groups this driver reads.
     scope: Scope,
+    judge: Option<ModelId>,
 }
 
 impl Driver {
@@ -213,25 +451,46 @@ impl Driver {
             Self {
                 step_tx,
                 algorithm: algorithm.to_string(),
-                evidence: Arc::new(Mutex::new(None)),
+                evidence: Arc::new(Mutex::new(RunEvidence::default())),
+                state: Arc::new(Mutex::new(State::default())),
                 models,
                 scope: Scope::Parent,
+                judge: None,
             },
             step_rx,
         )
     }
 
+    pub(crate) fn take_state(&self) -> State {
+        std::mem::take(&mut *self.state.lock())
+    }
+
+    pub(crate) fn set_state(&self, state: State) {
+        *self.state.lock() = state;
+    }
+
     /// Replace the current run's evidence when a component makes the final decision.
     pub(crate) fn set_evidence(&self, evidence: Value) {
-        *self.evidence.lock() = Some(evidence);
+        self.evidence.lock().outcome = Some(evidence);
     }
 
     /// Supply fallback evidence without replacing a decision made earlier in the cascade.
     pub(crate) fn set_evidence_if_empty(&self, evidence: Value) {
         let mut current = self.evidence.lock();
-        if current.is_none() {
-            *current = Some(evidence);
+        if current.outcome.is_none() {
+            current.outcome = Some(evidence);
         }
+    }
+
+    pub(crate) fn record_judgment(&self, selected: Option<crate::Score>, evidence: Option<Value>) {
+        let (target, category) = selected
+            .map(|score| (Some(score.target), score.category))
+            .unwrap_or_default();
+        self.evidence.lock().judgments.push(crate::JudgeDecision {
+            target,
+            category: category.map(|category| category.as_str().to_string()),
+            evidence,
+        });
     }
 
     /// Publish a model call and await the consumer's response.
@@ -239,16 +498,23 @@ impl Driver {
     /// Errors if the stream is closed or the call failed.
     /// The await is wrapped in a `libsy.llm_call` span measuring *fulfillment* as
     /// the algorithm observes it (host queueing/serving included; a streamed
-    /// response resolves when its stream handle arrives); latency, outcome, and
-    /// token usage are recorded when it resolves. The provider call itself is the
+    /// response resolves when its stream handle arrives). The host records call metrics,
+    /// outcome, and buffered token usage when it completes or drops the call, even if the
+    /// waiting algorithm has been cancelled. The provider call itself is the
     /// host's, and is instrumented by whoever makes it.
+    pub async fn call_model(&self, request: Request, models: Vec<ModelId>) -> Result<Response> {
+        self.call_model_with_error_recovery(request, models, false)
+            .await
+    }
+
+    /// Allows a routing policy to handle a failed call when recovery is enabled.
     #[tracing::instrument(
         target = "libsy",
         name = "libsy.llm_call",
         skip_all,
         fields(
             algorithm = self.algorithm,
-            selected_model = %models.first().map(ModelId::as_str).unwrap_or("NoTargets"),
+            selected_model = %models.first().map(|model| self.provider_model(model).as_str()).unwrap_or("NoTargets"),
             openinference.span.kind = "CHAIN",
             outcome = tracing::field::Empty,
             input_tokens = tracing::field::Empty,
@@ -257,45 +523,104 @@ impl Driver {
             reasoning_tokens = tracing::field::Empty,
         )
     )]
-    pub async fn call_model(&self, mut request: Request, models: Vec<ModelId>) -> Result<Response> {
-        let Some(selected_model_id) = models.first().cloned() else {
+    pub(crate) async fn call_model_with_error_recovery(
+        &self,
+        mut request: Request,
+        models: Vec<ModelId>,
+        recover_errors: bool,
+    ) -> Result<Response> {
+        let Some(selected_model_id) = models.first() else {
             return Err(LibsyError::NoTargets);
         };
+        self.models.check_targets(&models)?;
         request.llm_request.model = Some(selected_model_id.to_string());
         let started = Instant::now();
         let (reply, response) = oneshot::channel::<Result<Response>>();
         let call = CallModel {
             algorithm: self.algorithm.clone(),
             request,
+            telemetry_model: self.provider_model(selected_model_id).clone(),
             models,
-            reply,
+            recover_errors,
+            reply: Some(reply),
+            started,
+            span: tracing::Span::current(),
         };
-        let result = async {
-            self.step_tx
-                .send(Ok(Step::CallModel(Box::new(call))))
-                .await
-                .map_err(|_| DriverError::StreamClosed)?;
-            response
-                .await
-                .map_err(|_| LibsyError::from(DriverError::ResponseDropped))?
-        }
-        .await;
-        let elapsed = started.elapsed();
-        observability::record_llm_call(
-            &self.algorithm,
-            selected_model_id.as_str(),
-            elapsed,
-            &result,
-            &tracing::Span::current(),
-        );
-        result
+        self.step_tx
+            .send(Ok(Step::CallModel(Box::new(call))))
+            .await
+            .map_err(|_| DriverError::StreamClosed)?;
+        response
+            .await
+            .map_err(|_| LibsyError::from(DriverError::ResponseDropped))?
+    }
+
+    /// Override the request's model with `model` and wait for the host to reply.
+    #[tracing::instrument(
+        target = "libsy",
+        name = "libsy.decision_call",
+        skip_all,
+        fields(
+            algorithm = self.algorithm,
+            selected_model = %model,
+            openinference.span.kind = "CHAIN",
+            outcome = tracing::field::Empty,
+            input_tokens = tracing::field::Empty,
+            output_tokens = tracing::field::Empty,
+            total_tokens = tracing::field::Empty,
+            reasoning_tokens = tracing::field::Empty,
+            gen_ai.response.id = tracing::field::Empty,
+            gen_ai.response.model = tracing::field::Empty,
+        ),
+    )]
+    pub async fn call_decision(
+        &self,
+        mut request: DecisionRequest,
+        model: ModelId,
+    ) -> Result<DecisionResponse> {
+        self.models.check_targets(std::slice::from_ref(&model))?;
+        request.model = Some(model.clone());
+        let started = Instant::now();
+        let (reply, response) = oneshot::channel();
+        let call = CallDecision {
+            algorithm: self.algorithm.clone(),
+            request,
+            model,
+            reply: Some(reply),
+            started,
+            span: tracing::Span::current(),
+        };
+        self.step_tx
+            .send(Ok(Step::CallDecision(Box::new(call))))
+            .await
+            .map_err(|_| DriverError::StreamClosed)?;
+        response
+            .await
+            .map_err(|_| LibsyError::from(DriverError::ResponseDropped))?
+    }
+
+    /// Provider identity for telemetry; algorithms still route on the original target key.
+    pub fn provider_model<'a>(&'a self, target: &'a ModelId) -> &'a ModelId {
+        self.models.provider_model(target)
     }
 
     /// The available models for this category, typically ordered best-first.
     pub fn models_for(&self, category: &Category) -> &[ModelId] {
+        if *category == Category::Judge
+            && let Some(judge) = &self.judge
+        {
+            return std::slice::from_ref(judge);
+        }
         match self.scope {
             Scope::Parent => self.models.models_for(category),
             Scope::Subagent => self.models.subagent_models_for(category),
+        }
+    }
+
+    pub(crate) fn for_judge(&self, judge: ModelId) -> Self {
+        Self {
+            judge: Some(judge),
+            ..self.clone()
         }
     }
 
@@ -327,10 +652,18 @@ impl Driver {
     /// when the algorithm finishes.
     pub(crate) async fn finish(&self, result: Result<RoutingOutcome>) -> Result<()> {
         let result = result.map(|mut outcome| {
+            outcome.state = self.take_state();
+            let evidence = std::mem::take(&mut *self.evidence.lock());
             let metadata = outcome.metadata.get_or_insert_with(|| {
-                crate::OutcomeMetadata::new(self.algorithm.clone(), self.evidence.lock().take())
+                crate::OutcomeMetadata::new(self.algorithm.clone(), evidence.outcome)
             });
-            observability::record_outcome(metadata, &outcome.selected_model_ids);
+            metadata.judgments.extend(evidence.judgments);
+            let provider_models = outcome
+                .selected_model_ids
+                .iter()
+                .map(|target| self.provider_model(target).clone())
+                .collect::<Vec<_>>();
+            observability::record_outcome(metadata, &provider_models);
             outcome
         });
         let selected_model = result
@@ -343,33 +676,42 @@ impl Driver {
             .await
             .map_err(|_| DriverError::StreamClosed)?;
         if let Some(selected_model) = selected_model {
-            observability::record_decision(&self.algorithm, &selected_model);
+            observability::record_decision(&self.algorithm, self.provider_model(&selected_model));
         }
         Ok(())
     }
 }
 
-/// One item in the stream returned by [`Algorithm::run_stream`].
+/// Work requests and the terminal outcome of [`Algorithm::run_stream`].
+/// Each call carries its own reply channel, so the host can execute calls concurrently.
 pub enum Step {
     /// The algorithm needs this model call performed. The host serves it and fulfills
     /// it with [`CallModel::respond`]. Boxed: it is by far the largest variant.
     CallModel(Box<CallModel>),
+    /// The host fulfills this decision call with [`CallDecision::respond`].
+    CallDecision(Box<CallDecision>),
     /// The algorithm finished with its routing outcome — the last step of a run.
     Done(Box<RoutingOutcome>),
 }
 
-/// Drive [`Algorithm::run_stream`] to completion, handing each offloaded call to `serve`.
+/// Work dispatched through one host handler, with a typed reply channel per variant.
+/// [`drive`] handles terminal outcomes separately; the handler only executes calls.
+pub enum Call {
+    /// Fulfilled with an LLM [`Response`].
+    Model(Box<CallModel>),
+    /// Fulfilled with a [`DecisionResponse`].
+    Decision(Box<CallDecision>),
+}
+
+/// Drive [`Algorithm::run_stream`] to its routing outcome, serving calls concurrently.
 ///
-/// Returns the final [`RoutingOutcome`].
-/// `serve` owns the call: it performs it however the host likes and must fulfill the promise
-/// with [`CallModel::respond`]. A failed *model* call belongs in `respond` — the
-/// algorithm may route around it. Returning `Err` from `serve` aborts the whole run, so
-/// reserve it for infrastructure failures. Calls are served concurrently, so an algorithm
-/// that offloads several at once (hedging, fan-out) gets real parallelism.
+/// The shared execution loop lets hosts supply clients or test doubles through `serve`
+/// without reimplementing stream handling and cancellation.
 ///
-/// libsy performs no I/O; this is only the mechanics of consuming its own step stream, kept
-/// here so every host does not reimplement the same loop. `switchyard-llm-client`'s `run`
-/// is this function plus an HTTP client.
+/// `serve` owns each [`Call`] and performs its I/O. Passing an error to `respond`
+/// lets the algorithm fall back; returning an error from `serve` aborts the run.
+///
+/// Dropping this future cancels the algorithm and pending handler futures.
 pub async fn drive<F, Fut>(
     algorithm: Arc<dyn Algorithm>,
     request: Request,
@@ -377,10 +719,25 @@ pub async fn drive<F, Fut>(
     serve: F,
 ) -> Result<RoutingOutcome>
 where
-    F: Fn(CallModel) -> Fut,
+    F: Fn(Call) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let stream = algorithm.run_stream(request, models);
+    drive_with_state(algorithm, request, models, State::default(), serve).await
+}
+
+/// [`drive`] starting from caller-supplied `state`.
+pub(crate) async fn drive_with_state<F, Fut>(
+    algorithm: Arc<dyn Algorithm>,
+    request: Request,
+    models: Arc<RuntimeModels>,
+    state: State,
+    serve: F,
+) -> Result<RoutingOutcome>
+where
+    F: Fn(Call) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let stream = algorithm.run_stream(request, Arc::clone(&models), state);
     tokio::pin!(stream);
 
     let mut in_flight = futures::stream::FuturesUnordered::new();
@@ -389,15 +746,32 @@ where
     loop {
         tokio::select! {
             Some(result) = in_flight.next() => match result {
-                Ok(()) => {}, // CallModel completed successfully
-                Err(err) => return Err(err), // CallModel failed, propagate the error
+                Ok(()) => {}, // Call completed successfully
+                Err(err) => return Err(err), // Call failed, propagate the error
             },
             step = stream.next() => {
                 match step {
                     None => break, // stream has ended, no more steps
                     Some(item) => match item? {
-                        Step::CallModel(call) => in_flight.push(serve(*call)),
+                        Step::CallModel(call) => {
+                            models.check_request_targets(&call.request, &call.models)?;
+                            in_flight.push(serve(Call::Model(call)));
+                        }
+                        Step::CallDecision(call) => {
+                            models.check_targets(std::slice::from_ref(&call.model))?;
+                            if models.has_target_restriction
+                                && call.request.model.as_ref() != Some(&call.model)
+                            {
+                                return Err(LibsyError::AlgorithmError {
+                                    message: "decision payload model does not match selected target".into(),
+                                });
+                            }
+                            in_flight.push(serve(Call::Decision(call)));
+                        }
                         Step::Done(outcome) => {
+                            if outcome.response.is_none() {
+                                models.check_request_targets(&outcome.request, &outcome.selected_model_ids)?;
+                            }
                             final_outcome = Some(*outcome);
                             break;
                         }
@@ -471,10 +845,10 @@ impl RoutingIdentity {
     }
 }
 
-/// An optimization strategy. Implement [`route`](Self::route);
-/// callers drive it with [`run_stream`](Self::run_stream), serving each [`Step::CallModel`]
-/// it emits. `switchyard-llm-client`'s `run` is the ready-made consumer that does this
-/// over HTTP.
+/// Routing policy independent of how external calls are executed.
+/// Implement [`route`](Self::route), using [`Driver`] to request work from the host.
+/// Hosts can use [`drive`] for the shared execution loop or consume
+/// [`run_stream`](Self::run_stream) for custom execution.
 ///
 /// Methods take `self: Arc<Self>`: one algorithm (`Arc<dyn Algorithm>`) is shared across
 /// requests and run concurrently, so it owns its thread-safety and any shared state.
@@ -489,13 +863,16 @@ impl RoutingIdentity {
 /// # Observability
 ///
 /// [`run_stream`](Self::run_stream) creates a `libsy.run` span, and each offloaded model
-/// call creates a nested `libsy.llm_call` span. Successful outcomes record their
+/// call creates a nested span for its call kind, with outcome and available token usage.
+/// Call metrics include host queueing and count unfulfilled drops as errors.
+/// Successful outcomes record their
 /// [`OutcomeMetadata::outcome_id`](crate::OutcomeMetadata::outcome_id) on `libsy.run`,
 /// alongside `selected_model_ids` (an ordered OpenTelemetry string array).
 /// `algorithm` and `switchyard.algorithm` retain the run's [`Algorithm::name`].
 /// Optional `evidence.source`, `evidence.verdict`, `evidence.trigger`, and
-/// `evidence.reason_code` are strings; `evidence.score`, `evidence.confidence`, and
-/// `evidence.threshold` are numbers. Unknown evidence fields are not exported.
+/// `evidence.reason_code` are strings; `evidence.score`, `evidence.confidence`,
+/// `evidence.threshold`, `evidence.capable_score`, and `evidence.capable_threshold`
+/// are numbers. Unknown evidence fields are not exported.
 /// These fields are span attributes, never metric labels.
 ///
 /// The run/call observability helpers retain `outcome` status and operational metrics,
@@ -510,36 +887,57 @@ pub trait Algorithm: Send + Sync + 'static {
     /// emits for its runs.
     fn name(&self) -> &str;
 
-    /// Run one request to completion: make routing-time model calls with
-    /// [`Driver::call_model`] and return the terminal [`RoutingOutcome`].
-    /// The method an algorithm implements; [`run_stream`](Self::run_stream) drives it.
+    /// Select a route, requesting external work through [`Driver`] as needed.
+    /// [`run_stream`](Self::run_stream) runs this method and exposes its work to the host.
     async fn route(self: Arc<Self>, driver: Driver, request: Request) -> Result<RoutingOutcome>;
 
-    /// Process a request to completion, returning a stream of [`Step`]s.
+    /// Whether the host should summarize served answers for [`Self::observe_answer`].
+    fn tracks_answers(&self) -> bool {
+        false
+    }
+
+    /// Records the answer the host served for a request in `session_id`.
     ///
-    /// The consumer must fulfill every [`Step::CallModel`] before the algorithm can
-    /// continue. Every run ends with exactly one terminal item — [`Step::Done`] on
+    /// The host reports a streamed answer before forwarding its final chunk, so the
+    /// session's next request is routed with this answer already recorded.
+    async fn observe_answer(&self, _session_id: &str, _answer: AnswerSummary) {}
+
+    /// Expose work requests and the final outcome so the host can control execution.
+    ///
+    /// Each call waits for its host reply. A run ends with one terminal item — [`Step::Done`] on
     /// success, an `Err` item on failure, including when the algorithm panics. Dropping
     /// the stream aborts the spawned algorithm task.
     ///
     /// Every invocation owns a separate [`Driver`].
-    fn run_stream(self: Arc<Self>, request: Request, models: Arc<RuntimeModels>) -> StepStream {
+    fn run_stream(
+        self: Arc<Self>,
+        request: Request,
+        models: Arc<RuntimeModels>,
+        state: State,
+    ) -> StepStream {
         let (driver, step_rx) = Driver::new(self.name(), models);
+        driver.set_state(state);
         let span = observability::run_span(self.name(), &request);
         let handle = tokio::spawn(
             async move {
                 let algorithm = self.name().to_string();
                 // Catch a panicking algorithm so the run still publishes a terminal step.
                 let route = AssertUnwindSafe(self.route(driver.clone(), request)).catch_unwind();
-                let result = observability::observe_run(&algorithm, async move {
-                    route.await.unwrap_or_else(|payload| {
+                let result = observability::observe_run(&algorithm, async {
+                    let outcome = route.await.unwrap_or_else(|payload| {
                         Err(LibsyError::AlgorithmError {
                             message: format!(
                                 "algorithm task panicked: {}",
                                 panic_message(payload.as_ref())
                             ),
                         })
-                    })
+                    })?;
+                    if outcome.response.is_none() {
+                        driver
+                            .models
+                            .check_request_targets(&outcome.request, &outcome.selected_model_ids)?;
+                    }
+                    Ok(outcome)
                 })
                 .await;
 
@@ -562,11 +960,32 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::testing::{Serve, ServeResult, echo, reply, test_drive};
+    use crate::core::testing::{Serve, ServeResult, echo, reply, serve_decision, test_drive};
     use futures::StreamExt;
     use switchyard_protocol::{
         LlmResponse, LlmResponseChunk, completion_text, text_request, text_response,
     };
+
+    #[test]
+    fn a_final_answer_has_text_and_no_unfinished_or_tool_output() {
+        let mut answer = text_response(None, "done");
+        assert!(AnswerSummary::of(&answer).final_reply);
+        answer.outputs[0].stop_reason = Some(StopReason::MaxTokens);
+        assert!(!AnswerSummary::of(&answer).final_reply);
+        answer.outputs[0].stop_reason = Some(StopReason::EndTurn);
+        let mut tool = answer.outputs[0].clone();
+        tool.content = vec![ContentBlock::ToolCall(switchyard_protocol::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        })];
+        answer.outputs.push(tool);
+        assert!(!AnswerSummary::of(&answer).final_reply);
+        answer.outputs.pop();
+        answer.outputs[0].content = vec![ContentBlock::Text { text: "  ".into() }];
+        assert!(!AnswerSummary::of(&answer).final_reply);
+        assert!(!AnswerSummary::of(&AggLlmResponse::default()).final_reply);
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("{0}")]
@@ -601,6 +1020,14 @@ mod tests {
             let response = driver
                 .call_model(request.clone(), vec![target.clone()])
                 .await?;
+            driver.record_judgment(
+                Some(crate::Score {
+                    target: target.clone(),
+                    category: Some(Category::Capable),
+                    confidence: 1.0,
+                }),
+                Some(serde_json::json!({"source": "judge"})),
+            );
             driver.set_evidence(serde_json::json!({"source": "test"}));
             driver.set_evidence_if_empty(serde_json::json!({"source": "ignored"}));
             Ok(RoutingOutcome::answered(target, request, response))
@@ -665,6 +1092,222 @@ mod tests {
         names.iter().map(|name| ModelId::from(*name)).collect()
     }
 
+    enum TargetProbe {
+        Model(&'static [&'static str]),
+        Decision(&'static str),
+        Completion(&'static [&'static str]),
+        MismatchedCompletion,
+    }
+
+    #[async_trait]
+    impl Algorithm for TargetProbe {
+        fn name(&self) -> &str {
+            "target_probe"
+        }
+
+        async fn route(
+            self: Arc<Self>,
+            driver: Driver,
+            request: Request,
+        ) -> Result<RoutingOutcome> {
+            match &*self {
+                Self::Model(models) => {
+                    let response = driver
+                        .call_model(request.clone(), target_set(models))
+                        .await?;
+                    Ok(RoutingOutcome::answered(
+                        models[0].into(),
+                        request,
+                        response,
+                    ))
+                }
+                Self::Decision(model) => {
+                    driver
+                        .call_decision(
+                            DecisionRequest {
+                                model: None,
+                                input: Value::Null,
+                                questions: Default::default(),
+                            },
+                            (*model).into(),
+                        )
+                        .await?;
+                    Ok(RoutingOutcome::route_to("allowed".into(), vec![], request))
+                }
+                Self::Completion(models) => Ok(RoutingOutcome::route_to(
+                    models[0].into(),
+                    target_set(&models[1..]),
+                    request,
+                )),
+                Self::MismatchedCompletion => {
+                    let mut outcome = RoutingOutcome::route_to("allowed".into(), vec![], request);
+                    outcome.request.llm_request.model = Some("outside".into());
+                    Ok(outcome)
+                }
+            }
+        }
+    }
+
+    struct RewrittenSteps(Arc<TargetProbe>, fn(&mut Step));
+
+    #[async_trait]
+    impl Algorithm for RewrittenSteps {
+        fn name(&self) -> &str {
+            "rewritten_steps"
+        }
+
+        async fn route(
+            self: Arc<Self>,
+            driver: Driver,
+            request: Request,
+        ) -> Result<RoutingOutcome> {
+            Arc::clone(&self.0).route(driver, request).await
+        }
+
+        fn run_stream(
+            self: Arc<Self>,
+            request: Request,
+            models: Arc<RuntimeModels>,
+            state: State,
+        ) -> StepStream {
+            Box::pin(
+                Arc::clone(&self.0)
+                    .run_stream(request, models, state)
+                    .map(move |step| {
+                        step.map(|mut step| {
+                            (self.1)(&mut step);
+                            step
+                        })
+                    }),
+            )
+        }
+    }
+
+    fn restricted_models() -> RuntimeModels {
+        RuntimeModels::new(HashMap::from([
+            (Category::Any, target_set(&["allowed", "fallback"])),
+            (Category::Judge, target_set(&["judge"])),
+        ]))
+        .with_target_restriction()
+        .with_subagent(HashMap::from([(Category::Any, target_set(&["subagent"]))]))
+    }
+
+    #[tokio::test]
+    async fn target_restriction_checks_default_streams() {
+        for probe in [
+            TargetProbe::Model(&["outside"]),
+            TargetProbe::Model(&["allowed", "outside"]),
+            TargetProbe::Decision("outside"),
+            TargetProbe::Completion(&["outside"]),
+            TargetProbe::Completion(&["allowed", "outside"]),
+        ] {
+            let mut stream = Arc::new(probe).run_stream(
+                request(),
+                Arc::new(restricted_models()),
+                State::default(),
+            );
+            assert!(matches!(
+                stream.next().await,
+                Some(Err(LibsyError::TargetNotFound { target })) if target == "outside"
+            ));
+            assert!(stream.next().await.is_none());
+        }
+        let mut stream = Arc::new(TargetProbe::MismatchedCompletion).run_stream(
+            request(),
+            Arc::new(restricted_models()),
+            State::default(),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(LibsyError::AlgorithmError { .. }))
+        ));
+
+        let mut stream = Arc::new(TargetProbe::Model(&["outside"])).run_stream(
+            request(),
+            Arc::new(RuntimeModels::default()),
+            State::default(),
+        );
+        assert!(matches!(stream.next().await, Some(Ok(Step::CallModel(_)))));
+    }
+
+    #[tokio::test]
+    async fn target_restriction_rechecks_rewritten_steps() {
+        for probe in [
+            TargetProbe::Model(&["allowed"]),
+            TargetProbe::Decision("judge"),
+            TargetProbe::Completion(&["allowed"]),
+        ] {
+            let probe = Arc::new(probe);
+            let run = |rewrite| {
+                drive(
+                    Arc::new(RewrittenSteps(Arc::clone(&probe), rewrite)),
+                    request(),
+                    Arc::new(restricted_models()),
+                    |_| async { panic!("invalid work must not reach the host") },
+                )
+            };
+            let result = run(|step| match step {
+                Step::CallModel(call) => call.models.push("outside".into()),
+                Step::CallDecision(call) => call.model = "outside".into(),
+                Step::Done(outcome) => outcome.selected_model_ids.push("outside".into()),
+            })
+            .await;
+            assert!(
+                matches!(result, Err(LibsyError::TargetNotFound { target }) if target == "outside")
+            );
+
+            let result = run(|step| match step {
+                Step::CallModel(call) => call.request.llm_request.model = Some("outside".into()),
+                Step::CallDecision(call) => call.request.model = Some("allowed".into()),
+                Step::Done(outcome) => outcome.request.llm_request.model = Some("outside".into()),
+            })
+            .await;
+            assert!(matches!(result, Err(LibsyError::AlgorithmError { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn target_restriction_preserves_allowed_work() -> Result<()> {
+        for (probe, expected) in [
+            (
+                TargetProbe::Model(&["allowed", "fallback"]),
+                &["allowed"][..],
+            ),
+            (TargetProbe::Model(&["judge"]), &["judge"][..]),
+            (TargetProbe::Decision("judge"), &["allowed"][..]),
+            (
+                TargetProbe::Completion(&["allowed", "fallback"]),
+                &["allowed", "fallback"][..],
+            ),
+            (TargetProbe::Completion(&["subagent"]), &["subagent"][..]),
+        ] {
+            let outcome = drive(
+                Arc::new(probe),
+                request(),
+                Arc::new(restricted_models()),
+                |call| async move {
+                    match call {
+                        Call::Model(call) => {
+                            call.respond(std::future::ready(Ok(reply("ok")))).await
+                        }
+                        Call::Decision(call) => serve_decision(*call).await,
+                    }
+                },
+            )
+            .await?;
+            assert_eq!(outcome.selected_model_ids, target_set(expected));
+        }
+        let outcome = drive(
+            Arc::new(crate::Noop {}),
+            request(),
+            Arc::new(RuntimeModels::default().with_target_restriction()),
+            |_| async { panic!("Noop must not request model calls") },
+        )
+        .await?;
+        assert!(outcome.response.is_some());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn typed_driver_preserves_call_and_stream_boundaries() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -705,11 +1348,11 @@ mod tests {
             calls
                 .remove("second")
                 .ok_or_else(|| test_error("missing second call"))?
-                .respond(Ok(reply("second response")))?;
+                .respond(std::future::ready(Ok(reply("second response")))).await?;
             calls
                 .remove("first")
                 .ok_or_else(|| test_error("missing first call"))?
-                .respond(Ok(reply("first response")))?;
+                .respond(std::future::ready(Ok(reply("first response")))).await?;
 
             let first_response = first
                 .await
@@ -754,6 +1397,135 @@ mod tests {
                 .await;
             assert!(matches!(
                 result,
+                Err(LibsyError::Driver(DriverError::StreamClosed))
+            ));
+
+            fn decision_request() -> DecisionRequest {
+                DecisionRequest {
+                    model: Some("overwritten".into()),
+                    input: serde_json::json!({"task": "choose a route"}),
+                    questions: Default::default(),
+                }
+            }
+
+            fn decision_response() -> DecisionResponse {
+                DecisionResponse {
+                    id: Some("decision-1".to_string()),
+                    model: Some("provider-model".into()),
+                    answers: [(
+                        "p_solve".to_string(),
+                        switchyard_protocol::DecisionAnswer {
+                            value: switchyard_protocol::DecisionValue::Boolean(
+                                switchyard_protocol::BooleanEstimate::ProbabilityTrue(
+                                    switchyard_protocol::Probability(0.8),
+                                ),
+                            ),
+                            provider_confidence: None,
+                        },
+                    )]
+                    .into(),
+                    usage: Default::default(),
+                }
+            }
+
+            struct MixedCalls(&'static str);
+
+            #[async_trait]
+            impl Algorithm for MixedCalls {
+                fn name(&self) -> &str {
+                    "mixed"
+                }
+
+                async fn route(
+                    self: Arc<Self>,
+                    driver: Driver,
+                    request: Request,
+                ) -> Result<RoutingOutcome> {
+                    let (llm, decision) = tokio::join!(
+                        driver.call_model(request.clone(), vec!["llm".into()]),
+                        driver.call_decision(decision_request(), "decision".into()),
+                    );
+                    assert_eq!(
+                        llm?.llm_response.as_agg().map(completion_text),
+                        Some("llm reply".into())
+                    );
+                    match self.0 {
+                        "mock" => assert_eq!(decision?, DecisionResponse {
+                            id: None,
+                            model: Some("decision".into()),
+                            answers: Default::default(),
+                            usage: Default::default(),
+                        }),
+                        "reply" => assert_eq!(decision?, decision_response()),
+                        "error" => assert!(matches!(
+                            decision,
+                            Err(LibsyError::AlgorithmError { message }) if message == "provider failed"
+                        )),
+                        "drop" => assert!(matches!(
+                            decision,
+                            Err(LibsyError::Driver(DriverError::ResponseDropped))
+                        )),
+                        "abort" => return std::future::pending().await,
+                        _ => unreachable!(),
+                    }
+                    Ok(RoutingOutcome::route_to("answer".into(), vec![], request))
+                }
+            }
+
+            for mode in ["mock", "reply", "error", "drop", "abort"] {
+                // Serial dispatch would deadlock here and fail the enclosing timeout.
+                let barrier = Arc::new(tokio::sync::Barrier::new(2));
+                let outcome = drive(
+                    Arc::new(MixedCalls(mode)),
+                    request(),
+                    Arc::new(RuntimeModels::default()),
+                    move |call| {
+                        let barrier = barrier.clone();
+                        async move {
+                            barrier.wait().await;
+                            let call = match call {
+                                Call::Model(call) => return call.respond(std::future::ready(Ok(reply("llm reply")))).await,
+                                Call::Decision(call) => *call,
+                            };
+                            assert_eq!(call.algorithm, "mixed");
+                            assert_eq!(call.model, "decision");
+                            assert_eq!(call.request.model, Some("decision".into()));
+                            assert_eq!(call.request.input, decision_request().input);
+                            match mode {
+                                "mock" => serve_decision(call).await,
+                                "reply" => call.respond(std::future::ready(Ok(decision_response()))).await,
+                                "error" => call.respond(std::future::ready(Err(LibsyError::AlgorithmError {
+                                    message: "provider failed".into(),
+                                }))).await,
+                                "drop" => {
+                                    drop(call);
+                                    Ok(())
+                                }
+                                "abort" => call.fail(test_error("host aborted")),
+                                _ => unreachable!(),
+                            }
+                        }
+                    },
+                )
+                .await;
+                if mode == "abort" {
+                    assert!(matches!(outcome, Err(LibsyError::External { .. })));
+                } else {
+                    assert_eq!(outcome?.selected_model_id()?, "answer");
+                }
+            }
+
+            let (driver, mut steps) = Driver::new("test", Arc::new(RuntimeModels::default()));
+            let mut pending = Box::pin(driver.call_decision(decision_request(), "decision".into()));
+            assert!(futures::poll!(&mut pending).is_pending());
+            let Some(Ok(Step::CallDecision(call))) = steps.recv().await else {
+                return Err(test_error("expected a decision call"));
+            };
+            drop(pending);
+            call.respond(async { panic!("cancelled work must not be polled") }).await?;
+            drop(steps);
+            assert!(matches!(
+                driver.call_decision(decision_request(), "decision".into()).await,
                 Err(LibsyError::Driver(DriverError::StreamClosed))
             ));
             Ok(())
@@ -851,26 +1623,31 @@ mod tests {
     async fn run_offloads_via_promise_then_finishes() -> Result<()> {
         // Every call is offloaded via a promise the orchestrator surfaces as a
         // `CallModel` step for us to fulfill.
-        let stream = orch(target_set(&["offload/model"]))
-            .run_stream(request(), Arc::new(RuntimeModels::default()));
+        let stream = orch(target_set(&["offload/model"])).run_stream(
+            request(),
+            Arc::new(RuntimeModels::default()),
+            State::default(),
+        );
         tokio::pin!(stream);
 
         let mut saw_call = false;
         let mut final_completion = None;
         while let Some(step) = stream.next().await {
             match step? {
+                Step::CallDecision(_) => return Err(test_error("unexpected decision call")),
                 Step::CallModel(call) => {
                     saw_call = true;
                     assert_eq!(call.models, vec![ModelId::from("offload/model")]);
                     // Fulfilling the promise is the "real" model call the caller makes.
-                    call.respond(Ok(Response {
+                    call.respond(std::future::ready(Ok(Response {
                         llm_response: LlmResponse::Agg(text_response(
                             None,
                             "fulfilled".to_string(),
                         )),
                         metadata: None,
                         upstream_headers: http::HeaderMap::new(),
-                    }))?;
+                    })))
+                    .await?;
                 }
                 Step::Done(outcome) => {
                     let metadata = outcome
@@ -887,6 +1664,10 @@ mod tests {
                     assert_eq!(
                         metadata.evidence,
                         Some(serde_json::json!({"source": "test"}))
+                    );
+                    assert_eq!(
+                        metadata.judgments[0].evidence,
+                        Some(serde_json::json!({"source": "judge"}))
                     );
                     let response = outcome
                         .response
@@ -965,15 +1746,23 @@ mod tests {
         // A client-less target offloads its call; we fulfill the promise with an
         // Err, which must flow back through `call_model_target` into the algorithm and
         // out as an error step — not a response.
-        let stream = orch(target_set(&["offload/model"]))
-            .run_stream(request(), Arc::new(RuntimeModels::default()));
+        let stream = orch(target_set(&["offload/model"])).run_stream(
+            request(),
+            Arc::new(RuntimeModels::default()),
+            State::default(),
+        );
         tokio::pin!(stream);
 
         let mut saw_error = false;
         while let Some(step) = stream.next().await {
             match step {
-                Ok(Step::CallModel(call)) => {
-                    call.respond(Err(test_error("upstream model call failed")))?;
+                Ok(Step::CallDecision(_)) => return Err(test_error("unexpected decision call")),
+                Ok(Step::CallModel(mut call)) => {
+                    call.recover_errors = true;
+                    call.respond(std::future::ready(Err(test_error(
+                        "upstream model call failed",
+                    ))))
+                    .await?;
                 }
                 Ok(Step::Done(..)) => {
                     return Err(test_error(
@@ -1038,7 +1827,11 @@ mod tests {
             dropped: dropped.clone(),
         });
 
-        let stream = algo.run_stream(request(), Arc::new(RuntimeModels::default()));
+        let stream = algo.run_stream(
+            request(),
+            Arc::new(RuntimeModels::default()),
+            State::default(),
+        );
         started_rx
             .recv()
             .await
@@ -1075,7 +1868,11 @@ mod tests {
         }
 
         let algo: Arc<dyn Algorithm> = Arc::new(Panicky);
-        let stream = algo.run_stream(request(), Arc::new(RuntimeModels::default()));
+        let stream = algo.run_stream(
+            request(),
+            Arc::new(RuntimeModels::default()),
+            State::default(),
+        );
         tokio::pin!(stream);
 
         let mut saw_error = false;

@@ -176,7 +176,7 @@ The default unit test suite runs with no network access and no API keys. Live, e
 
 ## Architecture
 
-See [Architecture](docs/architecture.md) for the request lifecycle and
+See [Mechanics of Libsy](docs/mechanics_of_libsy.md) for the request lifecycle and
 [Agents](AGENTS.md) for crate boundaries and repository conventions. The
 supported serving path is native Rust:
 
@@ -197,10 +197,6 @@ Before making a change, identify the surface that owns it:
 - Put translated HTTP calls in `crates/libsy-llm-client`.
 - Put wire-format conversion in `crates/switchyard-translation`.
 - Put HTTP serving and deployment configuration in `crates/switchyard-server`.
-- Put source-neutral skill-distillation records and port traits in
-  `crates/switchyard-skill-distillation`; that crate does not own workflow
-  orchestration. Test its public contracts in
-  `crates/switchyard-skill-distillation/tests/contracts.rs`.
 - Put native Python bindings in `crates/switchyard-py`; keep Python wrappers in
   `switchyard/libsy` or `switchyard_rust`.
 
@@ -213,7 +209,15 @@ public symbols from the owning crate or package rather than the top-level
 - **Code comments** — explain the *why*, not the *what*. One line max unless complex.
 - **Docstrings** — include for public APIs. Format: one-line summary, blank line, details, examples.
 - **README** — keep in sync with CLI surface (commands, flags, new subcommands).
-- **docs/** — architecture, design decisions, advanced usage.
+- **[PyPI description](crates/switchyard-py/pypi.md)** — keep in sync with Python API, project, and documentation link changes.
+- **Official docs** — product usage, integration, configuration, and software behavior. Keep repository CI, docs publishing, release procedures, and maintainer workflows here or in excluded internal docs.
+
+### Documentation previews
+
+The Documentation workflow publishes a preview for same-repository pull
+requests. Open the workflow's **Deploy PR preview** summary to find its preview
+URL. The preview includes generated Rust crate documentation. The **docs-site**
+build artifact contains the same site and Rustdoc output for one day.
 
 ## Questions?
 

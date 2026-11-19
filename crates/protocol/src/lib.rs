@@ -6,8 +6,11 @@
 
 pub mod category;
 pub mod client;
+pub mod codex_namespaces;
+pub mod decision;
 pub mod envelope;
 pub mod format;
+pub mod infra;
 pub mod llm;
 pub mod metadata;
 pub mod model_id;
@@ -15,8 +18,10 @@ pub mod stream;
 
 pub use category::*;
 pub use client::*;
+pub use decision::*;
 pub use envelope::*;
 pub use format::*;
+pub use infra::*;
 pub use llm::*;
 pub use metadata::*;
 pub use model_id::*;
@@ -32,20 +37,6 @@ pub fn text_request(model: Option<String>, prompt: impl Into<String>) -> LlmRequ
         messages: vec![Message::text(Role::User, prompt)],
         ..LlmRequest::default()
     }
-}
-
-/// Returns a lossy text view of all user messages, joined by newlines.
-///
-/// Only text and refusal blocks are included. Instructions, tool content,
-/// reasoning, and media are omitted. Returns an empty string when no user text exists.
-pub fn prompt_text(request: &LlmRequest) -> String {
-    request
-        .messages
-        .iter()
-        .filter(|message| message.role == Role::User)
-        .filter_map(|message| message.text_content("\n"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Builds a single-turn response: one assistant message carrying `completion`, for `model`.
@@ -94,10 +85,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_round_trips_prompt_text() {
+    fn text_request_builds_one_user_message() {
         let req = text_request(Some("m".to_string()), "hello world");
         assert_eq!(req.model.as_deref(), Some("m"));
-        assert_eq!(prompt_text(&req), "hello world");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(
+            req.messages[0].text_content("\n").as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]
@@ -107,8 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_text_helpers_are_empty_strings() {
-        assert_eq!(prompt_text(&LlmRequest::default()), "");
+    fn empty_completion_text_is_empty_string() {
         assert_eq!(completion_text(&AggLlmResponse::default()), "");
     }
 }

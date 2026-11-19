@@ -17,12 +17,38 @@ use crate::codecs::stream::{
 use crate::format::{FormatId, WireFormat};
 use crate::llm::Usage;
 
+use super::buffered::encode_responses_usage;
+
 /// Stream codec for OpenAI Responses API events.
 pub struct OpenAiResponsesStreamCodec;
 
 impl StreamCodec for OpenAiResponsesStreamCodec {
     fn format(&self) -> FormatId {
         WireFormat::OpenAiResponses.into()
+    }
+
+    fn is_terminal_event(&self, event: &Value) -> bool {
+        matches!(
+            event
+                .get("type")
+                .or_else(|| event.get("event"))
+                .and_then(Value::as_str),
+            Some("response.completed" | "response.incomplete" | "response.failed")
+        )
+    }
+
+    fn stops_at_terminal_event(&self) -> bool {
+        true
+    }
+
+    fn sse_done_is_terminal(&self) -> bool {
+        true
+    }
+
+    fn stamp_streamed_response_model(&self, event: &mut Value, served_model: &str) {
+        if let Some(response) = event.get_mut("response").and_then(Value::as_object_mut) {
+            response.insert("model".to_string(), Value::String(served_model.to_string()));
+        }
     }
 
     fn decode_event(
@@ -130,10 +156,13 @@ fn decode_responses_stream(
                 model: state.model.clone(),
             }]
         }
-        Some("response.output_text.delta") => event
+        Some("response.output_text.delta" | "response.refusal.delta") => event
             .get("delta")
             .and_then(Value::as_str)
             .map(|text| {
+                if event_type == Some("response.refusal.delta") {
+                    state.stop_reason = Some("refusal".to_string());
+                }
                 let index = event
                     .get("output_index")
                     .and_then(Value::as_u64)
@@ -155,6 +184,20 @@ fn decode_responses_stream(
                 }]
             })
             .unwrap_or_default(),
+        Some("response.refusal.done") => {
+            let Some(text) = event.get("refusal").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            let index = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let content_index = event
+                .get("content_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            decode_responses_refusal(state, index, content_index, text)
+        }
         Some("response.reasoning_text.delta") | Some("response.reasoning_summary_text.delta") => {
             event
                 .get("delta")
@@ -188,6 +231,13 @@ fn decode_responses_stream(
             event
                 .get("delta")
                 .and_then(Value::as_str)
+                // The decoder reads a custom call's input only from its completed item.
+                .filter(|_| {
+                    !state
+                        .tool_states
+                        .get(&(output_index as usize))
+                        .is_some_and(|tool| tool.decoded_custom_call)
+                })
                 .map(|delta| {
                     state.decoded_tool_call = true;
                     // Recorded so `response.output_item.done`, which repeats
@@ -257,7 +307,7 @@ fn decode_responses_stream(
                 })
                 .unwrap_or_default()
         }
-        Some("response.completed") => {
+        Some("response.completed" | "response.incomplete") => {
             let mut out = Vec::new();
             // Some providers send output only in the final snapshot. Reconcile it with
             // decoded deltas before emitting the stop, without repeating streamed content.
@@ -269,36 +319,36 @@ fn decode_responses_stream(
                 for (position, item) in items.iter().enumerate() {
                     if let Some(item) = item.as_object() {
                         out.extend(decode_responses_completed_item(item, position, state));
-                        if matches!(out.last(), Some(LlmResponseChunk::StreamError { .. })) {
+                        if matches!(out.last(), Some(LlmResponseChunk::DecodeError { .. })) {
                             return out;
                         }
                     }
                 }
             }
-            if let Some(usage) = event
-                .get("response")
-                .and_then(Value::as_object)
-                .and_then(|response| response.get("usage"))
-                .and_then(Value::as_object)
-            {
-                let usage = responses_usage(usage);
-                state.usage = usage.clone();
-                state.saw_backend_usage = true;
-                out.push(LlmResponseChunk::Usage(usage));
-            }
+            decode_terminal_usage(state, event, &mut out);
             // A completed response that produced a tool call ended the turn to run that
             // tool, not because the assistant was done. The buffered decoder reports tool
             // use for such output; the stream must too, or stop-reason-driven tool loops
             // (Anthropic `tool_use`, Chat `tool_calls`) stop without running the tool.
             // Carries the Anthropic spelling because every encoder already maps it.
-            let reason = state.decoded_tool_call.then(|| "tool_use".to_string());
+            let reason = if event_type == Some("response.incomplete") {
+                let reason = match event
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                {
+                    Some("content_filter") => "content_filter",
+                    _ => "max_tokens",
+                };
+                Some(reason.to_string())
+            } else {
+                state
+                    .stop_reason
+                    .clone()
+                    .or_else(|| state.decoded_tool_call.then(|| "tool_use".to_string()))
+            };
             out.push(LlmResponseChunk::MessageStop { reason });
             out
         }
-        // Carries the Anthropic spelling because every encoder already maps it.
-        Some("response.incomplete") => vec![LlmResponseChunk::MessageStop {
-            reason: Some("max_tokens".to_string()),
-        }],
         Some("response.failed") => vec![LlmResponseChunk::StreamError {
             message: event
                 .get("response")
@@ -355,7 +405,7 @@ fn encode_responses_stream(
                         .push_str(signature);
                 }
             }
-            match encrypted_reasoning_item_id(&details) {
+            match reasoning_details_item_id(&details) {
                 Some(id) if item.started && item.item_id.as_deref() != Some(id.as_str()) => {
                     // The item already opened under another id; the payload would fail
                     // verification under it, so drop the payload rather than poison the replay.
@@ -372,6 +422,13 @@ fn encode_responses_stream(
                         item.encrypted = data;
                     }
                 }
+            }
+            // A summary that arrives before its item id would open the item under a synthesized
+            // id, and the encrypted payload that follows binds only to the provider's id. Hold
+            // the text until that id arrives, or until later output shows none is coming.
+            if !item.started && item.item_id.is_none() && summary_lacks_item_id(&details) {
+                item.pending_text.push_str(&text);
+                return ensure_responses_created(state);
             }
             let mut out = ensure_responses_reasoning_started(state, index);
             if !text.is_empty() {
@@ -418,7 +475,12 @@ fn finish_responses_stream(state: &mut StreamTranslationState) -> Vec<Value> {
         ("response.completed", "completed")
     };
     let incomplete_details = is_truncated.then(|| json!({ "reason": "max_output_tokens" }));
-    let mut out = ensure_responses_created(state);
+    let mut out = open_held_reasoning(state, None);
+    out.extend(ensure_responses_created(state));
+    if state.stop_reason.as_deref() == Some("refusal") {
+        out.extend(ensure_responses_message_started(state));
+    }
+    let mut content = Vec::new();
     if state.response_text_started
         && let Some(output_index) = state.response_text_output_index
     {
@@ -438,20 +500,62 @@ fn finish_responses_stream(state: &mut StreamTranslationState) -> Vec<Value> {
             "content_index": 0,
             "part": {"type": "output_text", "text": state.response_text, "annotations": [], "logprobs": []},
         }));
+        content.push(json!({"type": "output_text", "text": state.response_text, "annotations": [], "logprobs": []}));
+    }
+    if state.stop_reason.as_deref() == Some("refusal") {
+        // Text was already emitted; this empty part retains only the refusal signal.
+        let refusal = "";
+        let output_index = state.response_text_output_index.unwrap_or(0);
+        let item_id = responses_item_id(state, "msg", output_index);
+        let content_index = content.len();
+        let part = json!({"type": "refusal", "refusal": refusal});
         out.push(json!({
-            "type": "response.output_item.done",
+            "type": "response.content_part.added",
+            "item_id": item_id,
             "output_index": output_index,
-            "item": {
-                "type": "message",
-                "id": item_id,
-                "role": "assistant",
-                "status": status,
-                "content": [{"type": "output_text", "text": state.response_text, "annotations": [], "logprobs": []}],
-            },
+            "content_index": content_index,
+            "part": {"type": "refusal", "refusal": ""},
         }));
+        out.push(json!({
+            "type": "response.refusal.delta",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "delta": refusal,
+        }));
+        out.push(json!({
+            "type": "response.refusal.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "refusal": refusal,
+        }));
+        out.push(json!({
+            "type": "response.content_part.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "part": part,
+        }));
+        content.push(part);
     }
 
     let mut final_items: Vec<(usize, Value)> = Vec::new();
+    if let Some(output_index) = state.response_text_output_index {
+        let item = json!({
+            "type": "message",
+            "id": responses_item_id(state, "msg", output_index),
+            "role": "assistant",
+            "status": status,
+            "content": content,
+        });
+        out.push(json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        }));
+        final_items.push((output_index, item));
+    }
     let mut reasoning_items: Vec<(usize, usize)> = state
         .response_reasoning
         .iter()
@@ -504,21 +608,6 @@ fn finish_responses_stream(state: &mut StreamTranslationState) -> Vec<Value> {
         }));
         final_items.push((output_index, item));
     }
-    if state.response_text_started
-        && let Some(output_index) = state.response_text_output_index
-    {
-        final_items.push((
-            output_index,
-            json!({
-                "type": "message",
-                "id": responses_item_id(state, "msg", output_index),
-                "role": "assistant",
-                "status": status,
-                "content": [{"type": "output_text", "text": state.response_text, "annotations": [], "logprobs": []}],
-            }),
-        ));
-    }
-
     for tool in state.tool_states.values() {
         if !tool.started {
             continue;
@@ -662,15 +751,14 @@ fn decode_responses_output_item_added(
         .or_else(|| item.get("id"))
         .and_then(Value::as_str);
     let name = item.get("name").and_then(Value::as_str);
-    state
-        .tool_states
-        .entry(index)
-        .or_default()
-        .has_decoded_identity |=
+    let tool = state.tool_states.entry(index).or_default();
+    tool.has_decoded_identity |=
         id.is_some_and(|id| !id.is_empty()) && name.is_some_and(|name| !name.is_empty());
+    let custom = item_type == Some("custom_tool_call");
+    tool.decoded_custom_call |= custom;
     // A freeform call's `input` becomes the single `input` argument; it is only complete on
     // the done event, so nothing is emitted for it here beyond id and name.
-    let arguments_delta = if item_type == Some("custom_tool_call") {
+    let arguments_delta = if custom {
         None
     } else {
         item.get("arguments")
@@ -679,12 +767,7 @@ fn decode_responses_output_item_added(
             .map(ToOwned::to_owned)
     };
     if let Some(arguments) = arguments_delta.as_deref() {
-        state
-            .tool_states
-            .entry(index)
-            .or_default()
-            .decoded_arguments
-            .push_str(arguments);
+        tool.decoded_arguments.push_str(arguments);
     }
     vec![LlmResponseChunk::ToolCallDelta {
         index,
@@ -721,10 +804,20 @@ fn decode_responses_completed_item(
         let mut out = Vec::new();
         if let Some(content) = item.get("content").and_then(Value::as_array) {
             for (content_index, part) in content.iter().enumerate() {
-                if part.get("type").and_then(Value::as_str) != Some("output_text") {
-                    continue;
-                }
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                let text = match part.get("type").and_then(Value::as_str) {
+                    Some("output_text") => part.get("text"),
+                    Some("refusal") => {
+                        if let Some(text) = part.get("refusal").and_then(Value::as_str) {
+                            out.extend(decode_responses_refusal(state, index, content_index, text));
+                            if matches!(out.last(), Some(LlmResponseChunk::DecodeError { .. })) {
+                                return out;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if let Some(text) = text.and_then(Value::as_str) {
                     let decoded = state
                         .decoded_response_text
                         .entry(index)
@@ -781,13 +874,34 @@ fn decode_responses_completed_item(
     Vec::new()
 }
 
-// A snapshot may extend streamed content, but cannot retract content already sent.
+fn decode_responses_refusal(
+    state: &mut StreamTranslationState,
+    index: usize,
+    content_index: usize,
+    text: &str,
+) -> Vec<LlmResponseChunk> {
+    state.stop_reason = Some("refusal".to_string());
+    let decoded = state
+        .decoded_response_text
+        .entry(index)
+        .or_default()
+        .entry(content_index)
+        .or_default();
+    match snapshot_suffix(decoded, text) {
+        Ok(Some(text)) => vec![LlmResponseChunk::TextDelta { index, text }],
+        Ok(None) => Vec::new(),
+        Err(error) => vec![error],
+    }
+}
+
+// A snapshot may extend streamed content, but cannot retract content already sent. A
+// conflict is invalid provider data, so it is a `DecodeError`.
 fn snapshot_suffix(
     decoded: &mut String,
     snapshot: &str,
 ) -> Result<Option<String>, LlmResponseChunk> {
     let Some(suffix) = snapshot.strip_prefix(decoded.as_str()) else {
-        return Err(LlmResponseChunk::StreamError {
+        return Err(LlmResponseChunk::DecodeError {
             message: "Responses snapshot conflicts with streamed content".to_string(),
         });
     };
@@ -840,7 +954,7 @@ fn responses_stream_response(
         tool_choice: "auto",
         tools: Vec::new(),
         top_p: None,
-        usage: responses_usage_value(&state.usage),
+        usage: encode_responses_usage(&state.usage),
     }
 }
 
@@ -858,11 +972,11 @@ fn add_sequence_numbers(state: &mut StreamTranslationState, mut events: Vec<Valu
     events
 }
 
-// Accumulates assistant text and emits Responses text delta events.
-fn encode_responses_text_delta(state: &mut StreamTranslationState, text: String) -> Vec<Value> {
-    let mut out = ensure_responses_created(state);
-    if !state.response_text_started {
-        state.response_text_started = true;
+// Text and refusal parts share one assistant message output item.
+fn ensure_responses_message_started(state: &mut StreamTranslationState) -> Vec<Value> {
+    let mut out = open_held_reasoning(state, None);
+    out.extend(ensure_responses_created(state));
+    if state.response_text_output_index.is_none() {
         let output_index = state.next_response_output_index;
         state.next_response_output_index += 1;
         state.response_text_output_index = Some(output_index);
@@ -877,6 +991,16 @@ fn encode_responses_text_delta(state: &mut StreamTranslationState, text: String)
                 "content": [],
             },
         }));
+    }
+    out
+}
+
+// Accumulates assistant text and emits Responses text delta events.
+fn encode_responses_text_delta(state: &mut StreamTranslationState, text: String) -> Vec<Value> {
+    let mut out = ensure_responses_message_started(state);
+    if !state.response_text_started {
+        state.response_text_started = true;
+        let output_index = state.response_text_output_index.unwrap_or(0);
         out.push(json!({
             "type": "response.content_part.added",
             "item_id": responses_item_id(state, "msg", output_index),
@@ -897,8 +1021,65 @@ fn encode_responses_text_delta(state: &mut StreamTranslationState, text: String)
     out
 }
 
-// The id of the reasoning item encoded for a source index: the provider's own id when
-// encrypted reasoning binds to it, else synthesized from the emitted output index.
+// The provider item id named by a delta's reasoning details. The encrypted payload's id wins
+// because a replay verifies against it; a summary or text detail names the same item when it
+// arrives first.
+fn reasoning_details_item_id(details: &[Value]) -> Option<String> {
+    encrypted_reasoning_item_id(details).or_else(|| {
+        details
+            .iter()
+            .filter_map(Value::as_object)
+            .filter(|detail| {
+                matches!(
+                    detail.get("type").and_then(Value::as_str),
+                    Some("reasoning.summary" | "reasoning.text")
+                )
+            })
+            .find_map(|detail| {
+                detail
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+            })
+            .map(ToOwned::to_owned)
+    })
+}
+
+// True when a `reasoning.summary` detail arrived without the id of the item it belongs to.
+fn summary_lacks_item_id(details: &[Value]) -> bool {
+    details.iter().filter_map(Value::as_object).any(|detail| {
+        detail.get("type").and_then(Value::as_str) == Some("reasoning.summary")
+            && detail
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+    })
+}
+
+// Opens every reasoning item still holding summary text, under a synthesized id. Output that
+// is about to open another item proves no provider id is coming for them, and they must keep
+// their place ahead of it. When that output is itself a reasoning item, `before` limits the
+// flush to held items at earlier indices; the item's own later details can still name its id.
+fn open_held_reasoning(state: &mut StreamTranslationState, before: Option<usize>) -> Vec<Value> {
+    let held: Vec<usize> = state
+        .response_reasoning
+        .iter()
+        .filter(|(index, item)| {
+            before.is_none_or(|bound| **index < bound)
+                && !item.started
+                && !item.pending_text.is_empty()
+        })
+        .map(|(index, _)| *index)
+        .collect();
+    let mut out = Vec::new();
+    for index in held {
+        out.extend(ensure_responses_reasoning_started(state, index));
+    }
+    out
+}
+
+// The id of the reasoning item encoded for a source index: the provider's own id when a
+// reasoning detail named one, else synthesized from the emitted output index.
 fn responses_reasoning_item_id(state: &StreamTranslationState, index: usize) -> String {
     let item = state.response_reasoning.get(&index);
     item.and_then(|item| item.item_id.clone())
@@ -921,11 +1102,14 @@ fn ensure_responses_reasoning_started(
     {
         return out;
     }
+    // Held summaries of earlier items open first, so they keep their place in the output.
+    out.extend(open_held_reasoning(state, Some(index)));
     let output_index = state.next_response_output_index;
     state.next_response_output_index += 1;
     let item = state.response_reasoning.entry(index).or_default();
     item.started = true;
     item.output_index = Some(output_index);
+    let pending = std::mem::take(&mut item.pending_text);
     let item_id = responses_reasoning_item_id(state, index);
     // Standard Responses shape: reasoning text lives in `summary` as `summary_text`
     // parts. Clients such as Codex record reasoning items only in this shape.
@@ -939,6 +1123,10 @@ fn ensure_responses_reasoning_started(
             "summary": [],
         },
     }));
+    // Summary text held for the item's id streams now, under the id it opened with.
+    if !pending.is_empty() {
+        out.extend(encode_responses_reasoning_delta(state, index, pending));
+    }
     out
 }
 
@@ -972,6 +1160,14 @@ fn encode_responses_reasoning_delta(
     index: usize,
     text: String,
 ) -> Vec<Value> {
+    // Text for an item still waiting on its id joins the held summary.
+    if let Some(item) = state.response_reasoning.get_mut(&index)
+        && !item.started
+        && !item.pending_text.is_empty()
+    {
+        item.pending_text.push_str(&text);
+        return Vec::new();
+    }
     // An empty delta carries nothing to show and must not open a part that would never close.
     if text.is_empty() {
         return ensure_responses_reasoning_started(state, index);
@@ -1016,8 +1212,11 @@ fn encode_responses_tool_delta(
         let Some(name) = tool.name.clone() else {
             return out;
         };
+        // The call opens its item next; held reasoning opens first to keep its place.
+        out.extend(open_held_reasoning(state, None));
         let output_index = state.next_response_output_index;
         state.next_response_output_index += 1;
+        let tool = state.tool_states.entry(index).or_default();
         tool.response_output_index = Some(output_index);
         tool.response_item_id = Some(responses_item_id_from(&resp_id, "fc", output_index));
         tool.started = true;
@@ -1059,6 +1258,25 @@ fn encode_responses_tool_delta(
     out
 }
 
+// Both completed and token-limited Responses events can carry final usage and provider cost.
+fn decode_terminal_usage(
+    state: &mut StreamTranslationState,
+    event: &Value,
+    out: &mut Vec<LlmResponseChunk>,
+) {
+    if let Some(usage) = event
+        .get("response")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("usage"))
+        .and_then(Value::as_object)
+    {
+        let usage = responses_usage(usage);
+        state.usage = usage.clone();
+        state.saw_backend_usage = true;
+        out.push(LlmResponseChunk::Usage(usage));
+    }
+}
+
 // Normalizes OpenAI Responses token usage fields.
 fn responses_usage(usage: &serde_json::Map<String, Value>) -> Usage {
     let aggregate_input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
@@ -1077,8 +1295,13 @@ fn responses_usage(usage: &serde_json::Map<String, Value>) -> Usage {
     });
     let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
     Usage {
+        provider_cost: crate::codecs::common::provider_cost(usage),
         input_tokens,
-        cache: Usage::cache_details(cached_input_tokens, cache_creation_input_tokens),
+        cache: crate::codecs::common::cache_usage_details(
+            usage,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        ),
         output_tokens,
         total_tokens: usage
             .get("total_tokens")
@@ -1094,27 +1317,6 @@ fn responses_usage(usage: &serde_json::Map<String, Value>) -> Usage {
             })
             .and_then(Value::as_u64),
     }
-}
-
-// Builds OpenAI Responses usage payloads from normalized usage.
-fn responses_usage_value(usage: &Usage) -> Value {
-    let input_tokens = usage.input_tokens.unwrap_or(0)
-        + usage.cached_input_tokens().unwrap_or(0)
-        + usage.cache_creation_input_tokens().unwrap_or(0);
-    // Both detail objects are always present, for the same reason as the buffered encoder: the
-    // Responses schema types them as required, so a missing breakdown serializes as zero.
-    json!({
-        "input_tokens": input_tokens,
-        "output_tokens": usage.output_tokens.unwrap_or(0),
-        "total_tokens": usage.total_tokens.unwrap_or_else(|| {
-            input_tokens + usage.output_tokens.unwrap_or(0)
-        }),
-        "input_tokens_details": {
-            "cached_tokens": usage.cached_input_tokens().unwrap_or(0),
-            "cache_write_tokens": usage.cache_creation_input_tokens().unwrap_or(0),
-        },
-        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
-    })
 }
 
 // Longest response-id discriminator embedded verbatim in a synthesized item id. OpenAI rejects
@@ -1148,14 +1350,46 @@ fn fnv1a_64(text: &str) -> u64 {
     })
 }
 
-// Converts any upstream message ID into a Responses-looking response ID.
+// Keep the response ID aligned with buffered responses and stored conversation history.
 fn responses_id(state: &StreamTranslationState) -> String {
-    let Some(id) = target_message_id_or_source_message_id(state) else {
-        return "resp_switchyard".to_string();
-    };
-    if id.starts_with("resp_") {
-        id.to_string()
-    } else {
-        format!("resp_{id}")
+    target_message_id_or_source_message_id(state)
+        .unwrap_or("resp_switchyard")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_stream_completion() {
+        let codec = OpenAiResponsesStreamCodec;
+        assert!(codec.sse_done_is_terminal());
+        for kind in [
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+        ] {
+            assert!(codec.is_terminal_event(&json!({"type": kind})));
+            assert!(codec.is_terminal_event(&json!({"event": kind})));
+        }
+        assert!(!codec.is_terminal_event(&json!({"type": "response.created"})));
+    }
+
+    #[test]
+    fn responses_replay_stamps_the_served_model_inside_response() {
+        let mut event = json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_1",
+                "model": "provider/model",
+                "provider_extension": true,
+            },
+        });
+
+        OpenAiResponsesStreamCodec.stamp_streamed_response_model(&mut event, "served/model");
+
+        assert_eq!(event["response"]["model"], "served/model");
+        assert_eq!(event["response"]["provider_extension"], true);
     }
 }

@@ -33,6 +33,7 @@ pub(crate) fn safe_error_summary(error: &LibsyError) -> String {
         // from static text today, but nothing stops one embedding a response or an
         // upstream error, so only the class is reported.
         LibsyError::AlgorithmError { .. } => "algorithm error".to_string(),
+        LibsyError::InvalidDecision { .. } => "invalid decision answer".to_string(),
         LibsyError::Driver(_) => "algorithm driver failed".to_string(),
         // The operation is a static label, but the boxed source comes from a user
         // extension and is unvetted.
@@ -48,8 +49,8 @@ pub(crate) fn safe_error_summary(error: &LibsyError) -> String {
 /// The client half of [`safe_error_summary`].
 ///
 /// `UpstreamHttp` is the sharp edge: its `Display` interpolates the raw upstream
-/// body, which routinely quotes the request back. Boxed transport, decode, and FFI
-/// sources are reduced for the same reason.
+/// body, which routinely quotes the request back. Boxed error sources are reduced
+/// for the same reason.
 pub(crate) fn safe_client_error(error: &LlmClientError) -> String {
     match error {
         LlmClientError::UpstreamHttp { status, .. } => format!("upstream HTTP {status}"),
@@ -59,6 +60,7 @@ pub(crate) fn safe_client_error(error: &LlmClientError) -> String {
         LlmClientError::Timeout { .. } => "upstream request timed out".to_string(),
         LlmClientError::Transport { .. } => "upstream transport error".to_string(),
         LlmClientError::InvalidResponse { .. } => "invalid upstream response".to_string(),
+        LlmClientError::Host { .. } => "host client error".to_string(),
         LlmClientError::Ffi { .. } => "foreign function interface error".to_string(),
         LlmClientError::InvalidRequest { .. } => "invalid request".to_string(),
         LlmClientError::RequestTranslation(_) => "request translation failed".to_string(),
@@ -84,12 +86,20 @@ mod tests {
     const SECRET: &str = "patient name is Jane Doe";
 
     #[test]
+    fn invalid_decision_details_are_redacted() {
+        let error = LibsyError::invalid_decision("judge", SECRET);
+        assert_eq!(safe_error_summary(&error), "invalid decision answer");
+        assert!(error.to_string().contains(SECRET));
+    }
+
+    #[test]
     fn an_upstream_body_never_reaches_the_summary() {
         let error = LibsyError::ClientCall {
             target: ModelId::new("weak"),
             source: LlmClientError::UpstreamHttp {
                 status: http::StatusCode::BAD_REQUEST,
                 body: format!(r#"{{"error":{{"message":"bad request: {SECRET}"}}}}"#),
+                headers: Box::default(),
             },
         };
 
@@ -113,6 +123,9 @@ mod tests {
                 source: std::io::Error::other(SECRET).into(),
             },
             LlmClientError::Timeout {
+                source: std::io::Error::other(SECRET).into(),
+            },
+            LlmClientError::Host {
                 source: std::io::Error::other(SECRET).into(),
             },
         ] {

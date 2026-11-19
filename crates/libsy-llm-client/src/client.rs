@@ -1,33 +1,33 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`TranslatingLlmClient`] — the crate's single public entry point: encode a neutral
+//! [`TranslatingLlmClient`]: encode a neutral
 //! request, call the configured backend over HTTP, decode the neutral response.
 
-use std::collections::{BTreeMap, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::ready;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use http::StatusCode;
 use reqwest::RequestBuilder;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use serde_json::{Map, Value, json};
 use switchyard_protocol::{
     LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
     ModelId, Request, Response, RoutedLlmClient,
 };
-use switchyard_translation::{
-    TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
-    encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
-};
+use switchyard_translation::{TranslationError, WireFormat, decode_stream};
+use tokio::time::Instant;
 use tracing::Instrument;
 
 use crate::backend::{Backend, openai_url};
 use crate::error::{LlmClientError, Result};
 use crate::metrics;
-use crate::raw::RawResponse;
+use crate::observed_translation;
 
 // Caller headers safe to send when caller auth forwarding is disabled.
 const ALLOWED_METADATA_HEADERS: &[&str] = &["x-request-id"];
@@ -56,28 +56,45 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
-/// How one model is served: the `default_backend` used when the request does not
-/// pin a wire format, plus any `other_backends` reachable over additional formats.
+/// A named target's provider model and backends.
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
-    model_name: ModelId,
+    target_name: ModelId,
+    provider_model: Option<ModelId>,
     default_backend: Backend,
     other_backends: Option<Vec<Backend>>,
+    responses_reasoning: crate::ResponsesReasoningPolicy,
 }
 
 impl ModelConfig {
-    /// A model named `model_name` served by `default_backend`, optionally reachable
-    /// over additional wire formats via `other_backends`.
+    /// Configures a target. Its name is also the provider model ID unless overridden.
     pub fn new(
-        model_name: impl Into<ModelId>,
+        target_name: impl Into<ModelId>,
         default_backend: Backend,
         other_backends: Option<Vec<Backend>>,
     ) -> Self {
         Self {
-            model_name: model_name.into(),
+            target_name: target_name.into(),
+            provider_model: None,
             default_backend,
             other_backends,
+            responses_reasoning: crate::ResponsesReasoningPolicy::default(),
         }
+    }
+
+    /// Sets how Responses reasoning items are replayed to this target.
+    #[must_use]
+    pub fn with_responses_reasoning(mut self, policy: crate::ResponsesReasoningPolicy) -> Self {
+        self.responses_reasoning = policy;
+        self
+    }
+
+    /// Sends `provider_model` upstream in place of `target_name`. The client is still
+    /// called with `target_name`, so several entries can serve one provider model with
+    /// different backend settings.
+    pub fn with_provider_model(mut self, provider_model: impl Into<ModelId>) -> Self {
+        self.provider_model = Some(provider_model.into());
+        self
     }
 }
 
@@ -114,31 +131,36 @@ impl AuxiliaryOperation {
     }
 }
 
-/// A client that dispatches neutral-IR requests to per-model HTTP backends.
+/// A client that dispatches neutral-IR requests to named targets.
 ///
-/// Construct it with a list of [`ModelConfig`]s — one per model, each naming a
-/// default [`Backend`] and any additional per-format backends. Each call resolves
-/// the model and wire format, encodes the request to that backend's wire format,
+/// Each [`ModelConfig`] defines a target's provider model and backends.
+/// Each call resolves the target and wire format, encodes the request,
 /// applies auth and forwarded headers, sends the HTTP request with a shared
 /// [`reqwest::Client`], and decodes the response back to the neutral IR (buffered
 /// or streamed).
 pub struct TranslatingLlmClient {
-    model_to_config: HashMap<ModelId, ModelConfig>,
+    configs_by_target: HashMap<ModelId, ModelConfig>,
     client: reqwest::Client,
     forward_auth_client: reqwest::Client,
+    is_rate_limit_cooldown_enabled: bool,
+    cooldown_epoch: Instant,
+    // Milliseconds since cooldown_epoch. Each atomic is independent, so relaxed ordering suffices.
+    unavailable_until: HashMap<ModelId, AtomicU64>,
 }
 
 impl TranslatingLlmClient {
     /// Builds a client over the given [`ModelConfig`]s, with a fresh shared HTTP
     /// client and the built-in translation codecs.
     pub fn new(model_configs: &[ModelConfig]) -> Result<Self> {
+        // Pre-populate so concurrent calls update only atomics and keep map access lock-free.
+        let mut unavailable_until = HashMap::new();
         for config in model_configs {
-            config
-                .default_backend
-                .validate_extra_headers(&config.model_name)?;
-            for backend in config.other_backends.iter().flatten() {
-                backend.validate_extra_headers(&config.model_name)?;
+            for backend in std::iter::once(&config.default_backend)
+                .chain(config.other_backends.iter().flatten())
+            {
+                backend.validate_configured_headers(&config.target_name)?;
             }
+            unavailable_until.insert(config.target_name.clone(), AtomicU64::new(0));
         }
         let build_client = |builder: reqwest::ClientBuilder| {
             builder.build().map_err(|error| LlmClientError::Transport {
@@ -150,23 +172,30 @@ impl TranslatingLlmClient {
         // Forwarded credentials are sent only to the configured URL.
         let forward_auth_client =
             build_client(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()))?;
-        let model_to_config = model_configs
+        let configs_by_target = model_configs
             .iter()
-            .map(|config| (config.model_name.clone(), config.clone()))
+            .map(|config| (config.target_name.clone(), config.clone()))
             .collect();
 
         Ok(Self {
-            model_to_config,
+            configs_by_target,
             client,
             forward_auth_client,
+            is_rate_limit_cooldown_enabled: true,
+            cooldown_epoch: Instant::now(),
+            unavailable_until,
         })
     }
 
-    /// The backend serving `model` over `format` — the default backend when its
-    /// format matches, otherwise a matching entry in `other_backends`; `None` when
-    /// the model is unknown or has no backend for `format`.
-    pub fn backend_for(&self, model: &ModelId, format: WireFormat) -> Option<&Backend> {
-        self.model_to_config.get(model).and_then(|config| {
+    /// Disable HTTP 429 cooldown so subsequent calls can receive the upstream error.
+    pub fn without_rate_limit_cooldown(mut self) -> Self {
+        self.is_rate_limit_cooldown_enabled = false;
+        self
+    }
+
+    /// The target's backend for `format`, or `None` if no matching backend exists.
+    pub fn backend_for(&self, target_name: &ModelId, format: WireFormat) -> Option<&Backend> {
+        self.configs_by_target.get(target_name).and_then(|config| {
             if config.default_backend.wire_format() == format {
                 Some(&config.default_backend)
             } else {
@@ -178,9 +207,68 @@ impl TranslatingLlmClient {
         })
     }
 
-    /// Whether `model` has a backend for `operation`.
-    pub fn supports_auxiliary(&self, model: &ModelId, operation: AuxiliaryOperation) -> bool {
-        self.backend_for(model, operation.wire_format()).is_some()
+    /// The target's provider model ID, falling back to its name when none is configured.
+    pub fn provider_model<'a>(&'a self, target_name: &'a ModelId) -> &'a ModelId {
+        self.configs_by_target
+            .get(target_name)
+            .and_then(|config| config.provider_model.as_ref())
+            .unwrap_or(target_name)
+    }
+
+    /// Whether the target has a backend for `operation`.
+    pub fn supports_auxiliary(&self, target_name: &ModelId, operation: AuxiliaryOperation) -> bool {
+        self.backend_for(target_name, operation.wire_format())
+            .is_some()
+    }
+
+    /// Reads llama.cpp model properties through the backend's configured auth and headers.
+    ///
+    /// Redirects are disabled so credentials cannot move to another origin.
+    pub async fn get_model_properties(
+        &self,
+        target_name: &ModelId,
+        format: WireFormat,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let backend =
+            self.backend_for(target_name, format)
+                .ok_or_else(|| LlmClientError::Configuration {
+                    message: format!("model {target_name} has no backend for {format:?}"),
+                })?;
+        let mut url = reqwest::Url::parse(backend.base_url()).map_err(|error| {
+            LlmClientError::Configuration {
+                message: format!("model {target_name} has an invalid backend URL: {error}"),
+            }
+        })?;
+        let root = url.path().trim_end_matches('/');
+        let root = root
+            .strip_suffix("/chat/completions")
+            .or_else(|| root.strip_suffix("/responses"))
+            .unwrap_or(root);
+        let path = format!(
+            "{}/props",
+            root.strip_suffix("/v1")
+                .unwrap_or(root)
+                .trim_end_matches('/')
+        );
+        url.set_path(&path);
+        url.set_query(None);
+
+        let builder = self.forward_auth_client.get(url).timeout(timeout);
+        let builder = apply_extra_headers(builder, backend);
+        let response = backend
+            .apply_auth(builder)
+            .send()
+            .await
+            .map_err(convert_reqwest_error)?
+            .error_for_status()
+            .map_err(convert_reqwest_error)?;
+        response
+            .json()
+            .await
+            .map_err(|source| LlmClientError::InvalidResponse {
+                source: Box::new(source),
+            })
     }
 
     /// Calls a model-bearing auxiliary provider operation.
@@ -189,29 +277,29 @@ impl TranslatingLlmClient {
     /// request fails or returns invalid JSON.
     pub async fn call_auxiliary(
         &self,
-        model: &ModelId,
+        target_name: &ModelId,
         request: Request,
         operation: AuxiliaryOperation,
     ) -> Result<Value> {
         let wire_format = operation.wire_format();
-        let backend =
-            self.backend_for(model, wire_format)
-                .ok_or_else(|| LlmClientError::Configuration {
-                    message: format!("model {model} has no backend for {operation:?}"),
-                })?;
+        let backend = self.backend_for(target_name, wire_format).ok_or_else(|| {
+            LlmClientError::Configuration {
+                message: format!("model {target_name} has no backend for {operation:?}"),
+            }
+        })?;
         let Request {
             mut llm_request,
             metadata,
             ..
         } = request;
-        llm_request.model = Some(model.to_string());
+        llm_request.model = Some(self.provider_model(target_name).to_string());
         let http_response = self
             .send_encoded(
                 backend,
                 wire_format,
                 llm_request,
                 metadata.as_ref(),
-                model,
+                target_name,
                 UpstreamEndpoint::Auxiliary(operation),
             )
             .await?;
@@ -242,15 +330,29 @@ impl TranslatingLlmClient {
         wire_format: WireFormat,
         llm_request: LlmRequest,
         metadata: Option<&Metadata>,
-        model: &ModelId,
+        target_name: &ModelId,
         endpoint: UpstreamEndpoint,
     ) -> Result<EncodedResponse> {
-        let mut body = encode_request(&llm_request, wire_format)
+        let cooldown = backend.failure_cooldown();
+        let unavailable_until =
+            if matches!(endpoint, UpstreamEndpoint::Completion) && !cooldown.is_zero() {
+                self.unavailable_until.get(target_name)
+            } else {
+                None
+            };
+        if let Some(until) = unavailable_until
+            && until.load(Ordering::Relaxed) > duration_millis(self.cooldown_epoch.elapsed())
+        {
+            tracing::debug!(model = %target_name, wire_format = %wire_format, "skipping backend during failure cooldown");
+            return Err(LlmClientError::TemporarilyUnavailable);
+        }
+
+        let mut body = observed_translation::encode_request(&llm_request, wire_format)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
-        // which keeps the caller's original `model`; force the resolved model so
-        // the upstream always sees the target id.
-        set_json_model(&mut body, model);
+        // which keeps the caller's original `model`. Set the provider model explicitly.
+        let provider_model_id = self.provider_model(target_name);
+        set_json_model(&mut body, provider_model_id);
         if matches!(backend, Backend::OpenAiResponses(_)) {
             sanitize_openai_responses_provider_body(&mut body);
         }
@@ -260,12 +362,45 @@ impl TranslatingLlmClient {
             strip_anthropic_incompatible_fields(&mut body);
             strip_unsigned_thinking_blocks(&mut body);
         }
+        omit_configured_body_fields(&mut body, backend.omit_body_fields());
         merge_extra_body(&mut body, backend.extra_body());
+        if matches!(backend, Backend::OpenAiResponses(_)) {
+            let outbound_model_id = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(provider_model_id)
+                .to_owned();
+            self.configs_by_target
+                .get(target_name)
+                .map(|config| config.responses_reasoning)
+                .unwrap_or_default()
+                .normalize(&mut body, backend.base_url(), &outbound_model_id);
+        }
         // After the merge on purpose: the effort override must win over both the caller's
-        // value and any `reasoning` default a target set through `extra_body`.
-        apply_reasoning_effort(&mut body, backend);
+        // value and any `reasoning` default a target set through `extra_body`. Token counting
+        // does not depend on effort, and Anthropic's count endpoint may reject the field.
+        if matches!(endpoint, UpstreamEndpoint::Completion) {
+            apply_reasoning_effort(&mut body, backend);
+        }
+        if matches!(backend, Backend::OpenAiResponses(_)) {
+            normalize_codex_string_input(&backend.url(), &mut body);
+        }
         if matches!(backend, Backend::Anthropic(_)) {
-            enable_anthropic_prompt_caching(&mut body);
+            if nvidia_inference_api_backend(backend) {
+                strip_anthropic_tool_strict(&mut body);
+            }
+            enable_anthropic_prompt_caching(&mut body, llm_request.temporary_note_count);
+        }
+        if matches!(
+            backend,
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_)
+        ) {
+            enable_openai_guidance_caching(
+                &mut body,
+                wire_format,
+                provider_model_id,
+                llm_request.temporary_note_count,
+            );
         }
         if matches!(backend, Backend::OpenAiChat(_)) {
             ensure_openai_stream_usage(&mut body);
@@ -273,10 +408,23 @@ impl TranslatingLlmClient {
         let streaming = endpoint.allows_streaming()
             && body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let url = endpoint.url(backend);
-        record_gen_ai_request(&url, model, streaming);
+        record_gen_ai_request(&url, provider_model_id, streaming);
 
-        self.send_with_retries(&url, backend, &body, metadata, model, streaming)
-            .await
+        let result = self
+            .send_with_retries(&url, backend, &body, metadata, target_name, streaming)
+            .await;
+        // Keep quota failures request-local when forwarding auth or returning 429 to callers.
+        if let Some(until) = unavailable_until
+            && let Err(error) = &result
+            && is_transient_failure(error)
+            && !((backend.is_forwarding_auth() || !self.is_rate_limit_cooldown_enabled)
+                && matches!(error, LlmClientError::UpstreamHttp { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS))
+        {
+            let deadline = duration_millis(self.cooldown_epoch.elapsed().saturating_add(cooldown));
+            until.fetch_max(deadline, Ordering::Relaxed);
+        }
+        // Let cooldown expire naturally; a successful in-flight call may overlap a newer failure.
+        result
     }
 
     // Sends the encoded body, retrying retryable failures within the backend's retry budget.
@@ -286,11 +434,18 @@ impl TranslatingLlmClient {
         backend: &Backend,
         body: &Value,
         metadata: Option<&Metadata>,
-        model: &ModelId,
+        target_name: &ModelId,
         streaming: bool,
     ) -> Result<EncodedResponse> {
         let max_retries = u64::from(backend.max_retries());
-        let max_attempts = max_retries + 1;
+        let max_attempts = max_retries
+            + 1
+            + u64::from(
+                matches!(backend, Backend::OpenAiChat(_))
+                    && body.get("chat_template_kwargs").is_some(),
+            );
+        let mut body = Cow::Borrowed(body);
+        let mut template_retry = false;
         let expires_at = backend
             .timeout()
             .map(|timeout| (tokio::time::sleep(timeout).deadline(), timeout));
@@ -314,11 +469,11 @@ impl TranslatingLlmClient {
             let span = tracing::debug_span!(
                 target: "libsy",
                 "libsy.upstream_attempt",
-                model = %model,
+                model = %target_name,
                 wire_format = %backend.wire_format(),
-                attempt = attempt + 1,
+                attempt = attempt + 1 + u64::from(template_retry),
                 max_attempts,
-                retry = attempt > 0,
+                retry = attempt > 0 || template_retry,
                 openinference.span.kind = "CHAIN",
                 outcome = tracing::field::Empty,
                 status_code = tracing::field::Empty,
@@ -338,7 +493,7 @@ impl TranslatingLlmClient {
                 }
                 result = async {
                     attempt_started = true;
-                    self.send_once(url, backend, body, metadata, model, streaming).await
+                    self.send_once(url, backend, body.as_ref(), metadata, target_name, streaming).await
                 }.instrument(span.clone()) => result,
             };
             // The retained handle updates this same attempt span with its outcome.
@@ -347,7 +502,7 @@ impl TranslatingLlmClient {
                     span.record("outcome", "ok");
                     span.record("status_code", response.status());
                     span.record("will_retry", false);
-                    if attempt > 0 {
+                    if attempt > 0 || template_retry {
                         metrics::record_retry_recovered();
                     }
                     return Ok(match response {
@@ -364,7 +519,12 @@ impl TranslatingLlmClient {
                     });
                 }
                 Err(failure) => {
-                    let will_retry = attempt < max_retries && failure.is_retryable();
+                    let retry_without_template = matches!(backend, Backend::OpenAiChat(_))
+                        && body.get("chat_template_kwargs")
+                            == Some(&json!({"enable_thinking": false}))
+                        && rejects_template_options(&failure.error);
+                    let will_retry =
+                        retry_without_template || (attempt < max_retries && failure.is_retryable());
                     span.record("outcome", "error");
                     if let Some(status) = failure.status {
                         span.record("status_code", status.as_u16());
@@ -374,6 +534,14 @@ impl TranslatingLlmClient {
                         return Err(failure.error);
                     }
 
+                    if retry_without_template {
+                        if let Some(object) = body.to_mut().as_object_mut() {
+                            object.remove("chat_template_kwargs");
+                        }
+                        template_retry = true;
+                        span.record("retry_delay_ms", 0_u64);
+                        continue;
+                    }
                     let delay = retry_delay(attempt, failure.retry_after);
                     span.record("retry_delay_ms", duration_millis(delay));
                     // Close the attempt span before sleeping so backoff is not attempt latency.
@@ -396,7 +564,7 @@ impl TranslatingLlmClient {
         backend: &Backend,
         body: &Value,
         metadata: Option<&Metadata>,
-        model: &ModelId,
+        target_name: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
         let client = if backend.is_forwarding_auth() {
@@ -410,7 +578,15 @@ impl TranslatingLlmClient {
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder);
 
-        let response = match builder.send().await {
+        let response = match async {
+            let request = builder.build()?;
+            if let Some(body) = request.body().and_then(reqwest::Body::as_bytes) {
+                crate::payload_capture::record("request", || String::from_utf8_lossy(body));
+            }
+            client.execute(request).await
+        }
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 metrics::record_upstream_attempt(None);
@@ -425,7 +601,7 @@ impl TranslatingLlmClient {
         if status.is_success() {
             if streaming {
                 let upstream_headers = response.headers().clone();
-                let chunks = match prepare_response_stream(response, backend, model).await {
+                let chunks = match prepare_response_stream(response, backend, target_name).await {
                     Ok(chunks) => chunks,
                     Err(error) => {
                         metrics::record_upstream_attempt(None);
@@ -456,6 +632,7 @@ impl TranslatingLlmClient {
                 }
             };
             metrics::record_upstream_attempt(Some(status.as_u16()));
+            crate::payload_capture::record("response", || String::from_utf8_lossy(&body));
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
                 body: body.to_vec(),
@@ -464,6 +641,7 @@ impl TranslatingLlmClient {
         }
 
         let retry_after = retry_after_delay(response.headers());
+        let headers = Box::new(response.headers().clone());
         let body = match response.text().await {
             Ok(body) => body,
             Err(error) => {
@@ -480,11 +658,15 @@ impl TranslatingLlmClient {
         let error =
             if status == reqwest::StatusCode::BAD_REQUEST && backend.is_context_overflow(&body) {
                 LlmClientError::ContextWindowExceeded {
-                    model: model.clone(),
+                    model: target_name.clone(),
                     message: body,
                 }
             } else {
-                LlmClientError::UpstreamHttp { status, body }
+                LlmClientError::UpstreamHttp {
+                    status,
+                    body,
+                    headers,
+                }
             };
         Err(AttemptFailure {
             error,
@@ -493,18 +675,13 @@ impl TranslatingLlmClient {
         })
     }
 
-    /// Calls the backend for `model_name` (or the request's own model), over the
-    /// wire format the request pins in its metadata (else the model's default
-    /// backend), and returns the neutral response.
-    ///
-    /// Resolution: `model_name` wins over `request.llm_request.model`; the
-    /// resolved name is both the outer map key and the model id written into the
-    /// request before translation. Missing models are invalid requests; unknown
-    /// models or wire formats are configuration errors.
+    /// Calls the selected target using its configured provider model and backend.
+    /// `target_name` takes precedence over the request's model field.
+    /// Request metadata selects the wire format, falling back to the target's default.
     pub async fn call_rewrite_model(
         &self,
         request: Request,
-        model_name: Option<&ModelId>,
+        target_name: Option<&ModelId>,
     ) -> Result<Response> {
         let Request {
             mut llm_request,
@@ -512,28 +689,30 @@ impl TranslatingLlmClient {
             ..
         } = request;
 
-        let model_id = model_name
+        let selected_target = target_name
             .cloned()
             .or_else(|| llm_request.model.map(ModelId::from))
             .ok_or_else(|| LlmClientError::InvalidRequest {
                 message: "no model given".to_string(),
             })?;
-        llm_request.model = Some(model_id.to_string());
+        llm_request.model = Some(self.provider_model(&selected_target).to_string());
 
         let orig_format = metadata.as_ref().and_then(|m| m.wire_format);
         let wire_format = orig_format.unwrap_or(
-            self.model_to_config
-                .get(&model_id)
+            self.configs_by_target
+                .get(&selected_target)
                 .map(|config| config.default_backend.wire_format())
                 .ok_or_else(|| LlmClientError::Configuration {
-                    message: format!("no backend configured for model {model_id:?}"),
+                    message: format!("no backend configured for model {selected_target:?}"),
                 })?,
         );
-        let backend = self.backend_for(&model_id, wire_format).ok_or_else(|| {
-            LlmClientError::Configuration {
-                message: format!("model {model_id:?} has no backend for format {wire_format}"),
-            }
-        })?;
+        let backend = self
+            .backend_for(&selected_target, wire_format)
+            .ok_or_else(|| LlmClientError::Configuration {
+                message: format!(
+                    "model {selected_target:?} has no backend for format {wire_format}"
+                ),
+            })?;
 
         let http_response = self
             .send_encoded(
@@ -541,7 +720,7 @@ impl TranslatingLlmClient {
                 wire_format,
                 llm_request,
                 metadata.as_ref(),
-                &model_id,
+                &selected_target,
                 UpstreamEndpoint::Completion,
             )
             .await?;
@@ -562,9 +741,9 @@ impl TranslatingLlmClient {
                 })?;
                 // Map a provider's failed generation to 502, even under HTTP 200.
                 // Redact forwarded credentials before returning the provider error.
-                let agg =
-                    decode_aggregated_response(&body, wire_format).map_err(
-                        |error| match error {
+                let mut agg =
+                    observed_translation::decode_response(&body, wire_format).map_err(|error| {
+                        match error {
                             TranslationError::UpstreamFailure { error } => {
                                 LlmClientError::UpstreamHttp {
                                     status: StatusCode::BAD_GATEWAY,
@@ -573,11 +752,20 @@ impl TranslatingLlmClient {
                                         metadata.as_ref(),
                                         backend.is_forwarding_auth(),
                                     ),
+                                    headers: Box::new(upstream_headers.clone()),
                                 }
                             }
                             error => LlmClientError::ResponseTranslation(error.to_string()),
-                        },
-                    )?;
+                        }
+                    })?;
+                // The gateway may report a buffered charge only in its response header.
+                if agg.usage.provider_cost.is_none() {
+                    agg.usage.provider_cost = upstream_headers
+                        .get("x-litellm-response-cost")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.trim().parse::<f64>().ok())
+                        .filter(|usd| usd.is_finite() && *usd >= 0.0);
+                }
                 (LlmResponse::Agg(agg), upstream_headers)
             }
         };
@@ -588,82 +776,14 @@ impl TranslatingLlmClient {
             upstream_headers,
         })
     }
-
-    /// The whole decode → call → encode path a wire endpoint needs, in one call.
-    ///
-    /// Decodes `raw_http_request` from `wire_format` to the neutral IR, serves it via
-    /// [`call_rewrite_model`](Self::call_rewrite_model) — the *upstream* wire format is
-    /// resolved there from the model's backend, independently of `wire_format` — then
-    /// encodes the neutral response back into `wire_format`. The result is a buffered
-    /// [`RawResponse::Buffered`] JSON body or a streamed [`RawResponse::Stream`] of
-    /// wire events (the caller frames the stream as SSE). The response's `model` is
-    /// restamped with the model that actually served the call, so the body names the
-    /// model that answered rather than the route the caller addressed.
-    ///
-    /// `http_headers` are carried through as the request's
-    /// [`Metadata::http_headers`]. Backends with `forward_auth` disabled forward only
-    /// allowed metadata headers; `forward_auth` backends forward all application
-    /// headers. All backends reachable through a forwarding route must use the same
-    /// provider. Transport headers are always rebuilt. Pass `None` to forward nothing.
-    pub async fn call_rewrite_model_raw(
-        &self,
-        raw_http_request: Value,
-        http_headers: Option<http::HeaderMap>,
-        model: Option<&ModelId>,
-        wire_format: WireFormat,
-    ) -> Result<RawResponse> {
-        let llm_request = decode_request(wire_format, &raw_http_request)
-            .map_err(|error| LlmClientError::RequestTranslation(error.to_string()))?;
-        let request_extensions = llm_request.extensions.clone();
-        // The model that serves the call — the rewrite target when the caller pinned
-        // one, else the request's own model. Mirrors `call_rewrite_model`'s own
-        // resolution so the response names whoever answered.
-        let served_model = model
-            .map(ModelId::to_string)
-            .or_else(|| llm_request.model.clone());
-
-        let request = Request {
-            llm_request,
-            raw_request: None,
-            metadata: Some(Metadata {
-                session_id: None,
-                agent_id: None,
-                task_id: None,
-                correlation_id: None,
-                extra_metadata: None,
-                http_headers,
-                wire_format: None,
-                ..Default::default()
-            }),
-        };
-        let response = self.call_rewrite_model(request, model).await?;
-
-        match response.llm_response {
-            LlmResponse::Agg(agg) => {
-                let body = encode_aggregated_response_with_extensions(
-                    &agg,
-                    wire_format,
-                    served_model.as_deref(),
-                    &request_extensions,
-                )
-                .map_err(|error| LlmClientError::ResponseTranslation(error.to_string()))?;
-                Ok(RawResponse::Buffered(body))
-            }
-            LlmResponse::Stream(chunks) => {
-                let events = encode_stream_with_extensions(
-                    chunks,
-                    wire_format,
-                    served_model,
-                    &request_extensions,
-                )?;
-                Ok(RawResponse::Stream(events))
-            }
-        }
-    }
 }
 
 #[async_trait]
 impl RoutedLlmClient for TranslatingLlmClient {
+    fn provider_model<'a>(&'a self, target: &'a ModelId) -> &'a ModelId {
+        TranslatingLlmClient::provider_model(self, target)
+    }
+
     async fn call(&self, request: Request) -> Result<Response> {
         self.call_rewrite_model(request, None).await
     }
@@ -732,13 +852,17 @@ fn deadline_error(timeout: Duration) -> LlmClientError {
 
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
-        match &self.error {
-            LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
-            LlmClientError::UpstreamHttp { status, .. } => {
-                metrics::is_retryable_http_status(status.as_u16())
-            }
-            _ => false,
+        is_transient_failure(&self.error)
+    }
+}
+
+fn is_transient_failure(error: &LlmClientError) -> bool {
+    match error {
+        LlmClientError::Transport { .. } | LlmClientError::Timeout { .. } => true,
+        LlmClientError::UpstreamHttp { status, .. } => {
+            metrics::is_retryable_http_status(status.as_u16())
         }
+        _ => false,
     }
 }
 
@@ -765,7 +889,7 @@ fn stream_with_deadline(
 async fn prepare_response_stream(
     response: reqwest::Response,
     backend: &Backend,
-    model: &ModelId,
+    target_name: &ModelId,
 ) -> Result<LlmResponseStream> {
     let bytes = response.bytes_stream().map(|chunk| {
         chunk
@@ -783,7 +907,7 @@ async fn prepare_response_stream(
             // An in-band context overflow skips retries and advances to another candidate.
             if let Some(message) = first_event_overflow(&first, backend) {
                 return Err(LlmClientError::ContextWindowExceeded {
-                    model: model.clone(),
+                    model: target_name.clone(),
                     message,
                 });
             }
@@ -855,11 +979,18 @@ fn record_gen_ai_request(url: &str, model: &str, streaming: bool) {
     }
 }
 
-fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
+pub(crate) fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     // Reqwest labels truncated or otherwise unreadable response bodies as decode
     // errors, so distinguish them from serde JSON failures at the call site.
     let error = error.without_url();
-    if error.is_timeout() {
+    // reqwest reports a connect-phase timeout as both `is_connect()` and
+    // `is_timeout()`. Check connect first: no request was sent on the failed
+    // connection, so it is a transport failure like a refused connection.
+    if error.is_connect() {
+        LlmClientError::Transport {
+            source: Box::new(error),
+        }
+    } else if error.is_timeout() {
         LlmClientError::Timeout {
             source: Box::new(error),
         }
@@ -899,12 +1030,16 @@ fn forward_metadata_headers(
     builder.headers(forwarded)
 }
 
-// Adds the backend's custom per-call headers.
-fn apply_extra_headers(mut builder: RequestBuilder, backend: &Backend) -> RequestBuilder {
+// Configured headers replace existing values for the same case-insensitive name.
+fn apply_extra_headers(builder: RequestBuilder, backend: &Backend) -> RequestBuilder {
+    let mut headers = HeaderMap::with_capacity(backend.extra_headers().len());
+    // Names and values are validated by TranslatingLlmClient::new.
     for (name, value) in backend.extra_headers() {
-        builder = builder.header(name, value);
+        let name = HeaderName::from_bytes(name.as_bytes()).expect("validated header name");
+        let value = HeaderValue::from_bytes(value.as_bytes()).expect("validated header value");
+        headers.insert(name, value);
     }
-    builder
+    builder.headers(headers)
 }
 
 // Overwrites the outbound body's `model` field with the resolved model id.
@@ -914,10 +1049,66 @@ fn set_json_model(body: &mut Value, model: &str) {
     }
 }
 
+// The Codex Responses endpoint requires item-list input even on the preserved-body path.
+fn normalize_codex_string_input(url: &str, body: &mut Value) {
+    let codex = reqwest::Url::parse(url).ok().is_some_and(|url| {
+        url.path()
+            .trim_end_matches('/')
+            .ends_with("/backend-api/codex/responses")
+    });
+    if codex && let Some(input @ Value::String(_)) = body.get_mut("input") {
+        let text = input.take();
+        *input = json!([{"type": "message", "role": "user", "content": text}]);
+    }
+}
+
+fn rejects_template_options(error: &LlmClientError) -> bool {
+    let LlmClientError::UpstreamHttp { status, body, .. } = error else {
+        return false;
+    };
+    if !matches!(
+        *status,
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let error = parsed.as_ref().and_then(|value| value.get("error"));
+    let message = match &parsed {
+        Some(_) => error
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        None => body,
+    }
+    .to_ascii_lowercase();
+    let field = error
+        .and_then(|error| error.get("param"))
+        .and_then(Value::as_str);
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str);
+    (field == Some("chat_template_kwargs") || message.contains("chat_template_kwargs"))
+        && (matches!(code, Some("unknown_parameter" | "unsupported_parameter"))
+            || [
+                "unrecognized request argument",
+                "unknown parameter",
+                "unsupported parameter",
+                "unexpected keyword argument",
+                "unknown field",
+                "unsupported field",
+                "extra inputs are not permitted",
+            ]
+            .iter()
+            .any(|phrase| message.contains(phrase)))
+}
+
 const CODEX_NAMESPACE_SEPARATOR: &str = "__";
 
-// Codex extends Responses with namespace containers and namespaced function
-// calls. OpenAI-compatible providers expect a flat Responses tool namespace.
+/// Rewrites a Responses body into the shape OpenAI-compatible providers accept.
+///
+/// Codex extends Responses with namespace containers and namespaced function calls, and
+/// OpenAI-compatible providers expect a flat Responses tool namespace.
 fn sanitize_openai_responses_provider_body(body: &mut Value) {
     let Value::Object(object) = body else {
         return;
@@ -1043,6 +1234,36 @@ fn strip_anthropic_incompatible_fields(body: &mut Value) {
     if let Value::Object(object) = body {
         object.remove("reasoning_effort");
         object.remove("context_management");
+        // `strict: false` is the default, and Bedrock rejects the field outright.
+        if let Some(Value::Array(tools)) = object.get_mut("tools") {
+            for tool in tools {
+                if let Value::Object(tool) = tool
+                    && tool.get("strict") == Some(&Value::Bool(false))
+                {
+                    tool.remove("strict");
+                }
+            }
+        }
+    }
+}
+
+// NVIDIA Inference API's Anthropic-compatible schema rejects the strict tool-use
+// extension that native Anthropic accepts.
+fn nvidia_inference_api_backend(backend: &Backend) -> bool {
+    reqwest::Url::parse(backend.base_url())
+        .ok()
+        .is_some_and(|url| {
+            url.host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("inference-api.nvidia.com"))
+        })
+}
+
+fn strip_anthropic_tool_strict(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools.iter_mut().filter_map(Value::as_object_mut) {
+        tool.remove("strict");
     }
 }
 
@@ -1108,20 +1329,9 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
         return;
     };
     match backend {
-        Backend::OpenAiResponses(_) => {
-            // Responses nests effort under `reasoning` next to fields the caller may have set
-            // (`summary`, for example), so only the `effort` key is replaced. A `reasoning`
-            // value that is not an object is malformed and is replaced whole.
-            let reasoning = object
-                .entry("reasoning".to_string())
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-            if !reasoning.is_object() {
-                *reasoning = Value::Object(serde_json::Map::new());
-            }
-            if let Value::Object(reasoning) = reasoning {
-                reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
-            }
-        }
+        // Responses nests effort under `reasoning`, Anthropic under `output_config`.
+        Backend::OpenAiResponses(_) => set_nested_effort(object, "reasoning", effort),
+        Backend::Anthropic(_) => set_nested_effort(object, "output_config", effort),
         Backend::OpenAiChat(_) => {
             // Chat Completions takes effort as a top-level field.
             object.insert(
@@ -1129,9 +1339,20 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
                 Value::String(effort.to_string()),
             );
         }
-        // Anthropic has no effort field (thinking is a token budget); the runner rejects the
-        // setting on Anthropic clients at load time, so this arm is unreachable in practice.
-        Backend::Anthropic(_) => {}
+    }
+}
+
+// Replaces only `effort` inside `key`, keeping fields the caller set next to it (`summary` or
+// `format`, for example). A non-object value there is malformed and is replaced whole.
+fn set_nested_effort(object: &mut serde_json::Map<String, Value>, key: &str, effort: &str) {
+    let container = object
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !container.is_object() {
+        *container = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(container) = container {
+        container.insert("effort".to_string(), Value::String(effort.to_string()));
     }
 }
 
@@ -1142,6 +1363,15 @@ fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     };
     for (key, value) in extra_body {
         object.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+fn omit_configured_body_fields(body: &mut Value, omit_body_fields: &BTreeSet<String>) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    for key in omit_body_fields {
+        object.remove(key);
     }
 }
 
@@ -1162,44 +1392,135 @@ fn count_cache_control_blocks(value: &Value) -> usize {
     }
 }
 
-// Marks the final message content block as the Anthropic prompt-cache breakpoint.
-fn enable_anthropic_prompt_caching(body: &mut Value) {
-    // Top-level cache control manages the final breakpoint and its TTL.
-    if body.get("cache_control").is_some() {
-        return;
-    }
-    // Abstain once the caller has spent the budget itself. Adding a fifth marker
-    // turns a request that was valid on arrival into an upstream HTTP 400, and a
-    // caller that placed four breakpoints deliberately needs them more than we
-    // need a fifth. When the final block is already marked this returns early
-    // and changes nothing, which is what the insert below would have done.
+// This helper marks the final caller content block before any temporary notes, if policy permits.
+fn enable_anthropic_prompt_caching(body: &mut Value, temporary_note_count: usize) {
+    // Anthropic rejects a fifth cache marker with HTTP 400.
+    // This check preserves the caller's markers when the request has reached that limit.
     if count_cache_control_blocks(body) >= MAX_CACHE_CONTROL_BLOCKS {
         return;
     }
-    let Some(content) = body
-        .get_mut("messages")
-        .and_then(Value::as_array_mut)
-        .and_then(|messages| messages.last_mut())
-        .and_then(|message| message.get_mut("content"))
-    else {
+    // Requests with only a top-level `1h` policy can return HTTP 400.
+    // New block markers match the caller's TTL on turns with or without notes.
+    let marker = body
+        .get("cache_control")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type":"ephemeral"}));
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    match content {
-        Value::String(text) => {
-            *content = serde_json::json!([{
-                "type": "text",
-                "text": std::mem::take(text),
-                "cache_control": {"type": "ephemeral"}
-            }]);
-        }
-        Value::Array(blocks) => {
-            if let Some(block) = blocks.last_mut().and_then(Value::as_object_mut) {
-                block
-                    .entry("cache_control".to_string())
-                    .or_insert_with(|| serde_json::json!({"type": "ephemeral"}));
+    let mut remaining = temporary_note_count;
+    // Temporary guidance is absent next turn, so the breakpoint must precede it.
+    for message in messages.iter_mut().rev() {
+        match message.get_mut("content") {
+            Some(content @ Value::String(_)) if remaining == 0 => {
+                let text = std::mem::take(content);
+                *content = serde_json::json!([{
+                    "type": "text", "text": text, "cache_control": marker
+                }]);
+                return;
             }
+            Some(Value::String(_)) => remaining = remaining.saturating_sub(1),
+            Some(Value::Array(blocks)) => {
+                if remaining >= blocks.len() {
+                    remaining -= blocks.len();
+                    continue;
+                }
+                let index = blocks.len() - remaining - 1;
+                if let Some(block) = blocks[index].as_object_mut() {
+                    block.entry("cache_control".to_string()).or_insert(marker);
+                }
+                return;
+            }
+            _ => {}
         }
-        _ => {}
+    }
+}
+
+// GPT-5.6 and GPT-6 cache writes end at selected message or content boundaries.
+// A temporary suffix needs a separate cache entry before it so the next request can reuse the prefix.
+fn enable_openai_guidance_caching(
+    body: &mut Value,
+    format: WireFormat,
+    model: &ModelId,
+    suffix: usize,
+) {
+    let name = model.as_str().rsplit('/').next().unwrap_or_default();
+    let supported = name == "gpt-5.6"
+        || name.starts_with("gpt-5.6-")
+        || name == "gpt-6"
+        || name.starts_with("gpt-6-")
+        || name.starts_with("gpt-6.");
+    // Explicit-only callers choose their write locations.
+    // This helper adds markers only for names recognized by its model-name check.
+    if suffix == 0
+        || !supported
+        || body
+            .pointer("/prompt_cache_options/mode")
+            .and_then(Value::as_str)
+            == Some("explicit")
+    {
+        return;
+    }
+    let key = if format == WireFormat::OpenAiResponses {
+        "input"
+    } else {
+        "messages"
+    };
+    let Some(items) = body.get_mut(key).and_then(Value::as_array_mut) else {
+        return;
+    };
+    let marker_count = items
+        .iter()
+        .map(|item| {
+            ["content", "output"]
+                .iter()
+                .filter_map(|key| item.get(key).and_then(Value::as_array))
+                .flatten()
+                .filter(|block| block.get("prompt_cache_breakpoint").is_some())
+                .count()
+        })
+        .sum::<usize>();
+    // Implicit mode reserves one of the four write slots for the provider's final breakpoint.
+    if marker_count >= 3 {
+        return;
+    }
+    let Some(prefix_len) = items.len().checked_sub(suffix) else {
+        return;
+    };
+    for item in items[..prefix_len].iter_mut().rev() {
+        let field = if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+            "output"
+        } else if matches!(
+            item.get("role").and_then(Value::as_str),
+            Some("user" | "tool" | "developer" | "system")
+        ) {
+            "content"
+        } else {
+            continue;
+        };
+        let Some(content) = item.get_mut(field) else {
+            continue;
+        };
+        if let Value::String(text) = content {
+            let text = std::mem::take(text);
+            let kind = if format == WireFormat::OpenAiResponses {
+                "input_text"
+            } else {
+                "text"
+            };
+            *content = serde_json::json!([{"type":kind,"text":text}]);
+        }
+        // Empty content arrays have no block to mark, so the search continues through earlier items.
+        if let Some(block) = content
+            .as_array_mut()
+            .and_then(|blocks| blocks.last_mut())
+            .and_then(Value::as_object_mut)
+        {
+            block
+                .entry("prompt_cache_breakpoint".to_string())
+                .or_insert_with(|| serde_json::json!({"mode":"explicit"}));
+            return;
+        }
     }
 }
 
@@ -1287,6 +1608,31 @@ mod tests {
     use super::*;
     use crate::backend::HttpBackendConfig;
 
+    /// Decodes a wire body into a request, as a server endpoint does before calling the client.
+    fn wire_request(
+        body: Value,
+        http_headers: Option<http::HeaderMap>,
+        wire_format: WireFormat,
+    ) -> switchyard_translation::Result<Request> {
+        Ok(Request {
+            llm_request: switchyard_translation::decode_request(wire_format, &body)?,
+            raw_request: None,
+            metadata: Some(Metadata {
+                http_headers,
+                ..Default::default()
+            }),
+        })
+    }
+
+    fn assert_tool_call_name(agg: &switchyard_protocol::AggLlmResponse, name: &str) {
+        let Some(switchyard_protocol::ContentBlock::ToolCall(call)) =
+            agg.outputs[0].content.first()
+        else {
+            panic!("expected a tool call, got {:?}", agg.outputs[0].content);
+        };
+        assert_eq!(call.name, name);
+    }
+
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
             base_url: base_url.to_string(),
@@ -1294,8 +1640,10 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
             max_retries: 0,
+            failure_cooldown: Duration::ZERO,
             timeout: None,
         }
     }
@@ -1402,6 +1750,15 @@ mod tests {
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
+    fn chat_map_with_omit_body_fields(
+        base_url: &str,
+        omit_body_fields: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.omit_body_fields = omit_body_fields;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
     fn chat_map_with_effort(base_url: &str, effort: &str) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.reasoning_effort = Some(effort.to_string());
@@ -1424,6 +1781,43 @@ mod tests {
             Backend::Anthropic(config(base_url)),
             None,
         )]
+    }
+
+    #[tokio::test]
+    async fn model_properties_uses_configured_auth_and_backend_path()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        for (base_path, props_path) in [
+            ("/v1", "/props"),
+            ("/v1/", "/props"),
+            ("/v1/chat/completions", "/props"),
+            ("/v1/responses/", "/props"),
+            ("/prefix/v1", "/prefix/props"),
+            ("/prefix/v1/chat/completions", "/prefix/props"),
+            ("/prefix/v1/responses", "/prefix/props"),
+            ("/prefix/", "/prefix/props"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(props_path))
+                .and(wiremock::matchers::header("authorization", "Bearer secret"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "default_generation_settings": {"n_ctx": 65_536}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client =
+                TranslatingLlmClient::new(&chat_map(&format!("{}{base_path}", server.uri())))?;
+            let properties = client
+                .get_model_properties(
+                    &ModelId::from("gpt"),
+                    WireFormat::OpenAiChat,
+                    Duration::from_secs(1),
+                )
+                .await?;
+            assert_eq!(properties["default_generation_settings"]["n_ctx"], 65_536);
+        }
+        Ok(())
     }
 
     fn chat_map_with_retries(base_url: &str, max_retries: u32) -> Vec<ModelConfig> {
@@ -1519,6 +1913,26 @@ mod tests {
         assert!(!convert_reqwest_error(error).to_string().contains("CANARY"));
     }
 
+    #[tokio::test]
+    async fn captured_request_build_failure_remains_a_configuration_error() {
+        let client = TranslatingLlmClient::new(&chat_map("://invalid")).unwrap();
+        let result =
+            crate::with_payload_capture(client.call(request_for(Some("gpt"), false))).await;
+        assert!(matches!(result, Err(LlmClientError::Configuration { .. })));
+    }
+
+    #[test]
+    fn nvidia_anthropic_tools_drop_unsupported_strict_field() {
+        let backend = Backend::Anthropic(config("https://inference-api.nvidia.com"));
+        assert!(nvidia_inference_api_backend(&backend));
+        assert!(!nvidia_inference_api_backend(&Backend::Anthropic(config(
+            "https://inference-api.nvidia.com.example.test"
+        ))));
+        let mut body = json!({"tools": [{"name": "a", "input_schema": {}, "strict": true}]});
+        strip_anthropic_tool_strict(&mut body);
+        assert!(body["tools"][0].get("strict").is_none());
+    }
+
     #[test]
     fn anthropic_prompt_caching_marks_final_message() {
         let caller_managed = json!({
@@ -1526,14 +1940,21 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         });
         let mut body = caller_managed.clone();
-        enable_anthropic_prompt_caching(&mut body);
-        assert_eq!(body, caller_managed);
+        enable_anthropic_prompt_caching(&mut body, 0);
+        assert_eq!(body["cache_control"], caller_managed["cache_control"]);
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{
+                "type": "text", "text": "hello",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }])
+        );
 
         let mut body = json!({
             "messages": [{"role": "user", "content": "hello"}]
         });
 
-        enable_anthropic_prompt_caching(&mut body);
+        enable_anthropic_prompt_caching(&mut body, 0);
 
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"],
@@ -1573,7 +1994,7 @@ mod tests {
         let mut body = body_at_the_cache_control_limit();
         assert_eq!(cache_control_blocks(&body), 4);
 
-        enable_anthropic_prompt_caching(&mut body);
+        enable_anthropic_prompt_caching(&mut body, 0);
 
         // Anthropic and Bedrock both reject a fifth marker with HTTP 400, which
         // would fail a request that was valid before it reached us.
@@ -1592,7 +2013,7 @@ mod tests {
         body["system"].as_array_mut().unwrap().pop();
         assert_eq!(cache_control_blocks(&body), 3);
 
-        enable_anthropic_prompt_caching(&mut body);
+        enable_anthropic_prompt_caching(&mut body, 0);
 
         assert_eq!(cache_control_blocks(&body), 4);
         assert_eq!(
@@ -1700,7 +2121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_name_arg_wins_over_request_model()
+    async fn target_name_arg_wins_over_request_model()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let client = TranslatingLlmClient::new(&[])?;
         // Arg "b" is looked up (and reported), not the request's "a".
@@ -1951,15 +2372,17 @@ mod tests {
             "max",
         ))?;
         client
-            .call_rewrite_model_raw(
-                json!({
-                    "model": "client-facing",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "reasoning_effort": "high"
-                }),
-                None,
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "client-facing",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "reasoning_effort": "high"
+                    }),
+                    None,
+                    WireFormat::OpenAiChat,
+                )?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
 
@@ -1991,15 +2414,327 @@ mod tests {
             "max",
         ))?;
         client
-            .call_rewrite_model_raw(
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "client-facing",
+                        "input": [{"role": "user", "content": "hi"}],
+                        "reasoning": {"effort": "high", "summary": "auto"}
+                    }),
+                    None,
+                    WireFormat::OpenAiResponses,
+                )?,
+                Some(&ModelId::from("gpt")),
+            )
+            .await?;
+        Ok(())
+    }
+
+    // Covers both a translated request and an Anthropic caller's body sent as is.
+    #[tokio::test]
+    async fn anthropic_requests_drop_tool_strict_false()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(config(&server.uri())),
+            None,
+        )])?;
+        let schema = json!({"type": "object"});
+        let requests = [
+            (
+                WireFormat::OpenAiChat,
                 json!({
                     "model": "client-facing",
-                    "input": [{"role": "user", "content": "hi"}],
-                    "reasoning": {"effort": "high", "summary": "auto"}
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [
+                        {"type": "function", "function": {"name": "loose", "parameters": schema, "strict": false}},
+                        {"type": "function", "function": {"name": "exact", "parameters": schema, "strict": true}}
+                    ]
                 }),
-                None,
+            ),
+            (
+                WireFormat::AnthropicMessages,
+                json!({
+                    "model": "client-facing",
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [
+                        {"name": "loose", "input_schema": schema, "strict": false},
+                        {"name": "exact", "input_schema": schema, "strict": true}
+                    ]
+                }),
+            ),
+        ];
+        for (format, request) in requests {
+            client
+                .call_rewrite_model(
+                    wire_request(request, None, format)?,
+                    Some(&ModelId::from("claude")),
+                )
+                .await?;
+        }
+        for received in server.received_requests().await.unwrap_or_default() {
+            let body: Value = serde_json::from_slice(&received.body)?;
+            assert!(body["tools"][0].get("strict").is_none(), "{body}");
+            assert_eq!(body["tools"][1]["strict"], true, "{body}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_rejection_retries_once_without_changing_other_fields()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send>> {
+        for (message, reject_retry, omit) in [
+            (
+                "Unrecognized request argument supplied: chat_template_kwargs",
+                false,
+                false,
+            ),
+            (
+                "Unrecognized request argument supplied: chat_template_kwargs",
+                true,
+                false,
+            ),
+            (
+                "Invalid temperature for chat_template_kwargs request",
+                false,
+                false,
+            ),
+            (
+                "Unrecognized request argument supplied: chat_template_kwargs",
+                false,
+                true,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body: Value = serde_json::from_slice(&request.body).expect("request JSON");
+                    if body.get("chat_template_kwargs").is_some() || reject_retry {
+                        ResponseTemplate::new(400).set_body_json(json!({"error": {"message": message}}))
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "id": "1", "model": "gpt", "choices": [{"index": 0,
+                                "message": {"role": "assistant", "content": "yes"}, "finish_reason": "stop"}],
+                            "usage": {}
+                        }))
+                    }
+                }).mount(&server).await;
+            let fields = if omit {
+                BTreeSet::from(["chat_template_kwargs".into()])
+            } else {
+                BTreeSet::new()
+            };
+            let client = TranslatingLlmClient::new(&chat_map_with_omit_body_fields(
+                &format!("{}/v1", server.uri()),
+                fields,
+            ))?;
+            let raw = json!({"model": "gpt", "messages": [{"role": "user", "content": "judge"}],
+                "reasoning_effort": "none", "logprobs": true, "top_logprobs": 8,
+                "chat_template_kwargs": {"enable_thinking": false}});
+            let result = client
+                .call_rewrite_model(
+                    wire_request(raw.clone(), None, WireFormat::OpenAiChat)?,
+                    Some(&ModelId::from("gpt")),
+                )
+                .await;
+            let rejects_field = message.starts_with("Unrecognized");
+            assert_eq!(result.is_ok(), omit || (rejects_field && !reject_retry));
+            let calls = server.received_requests().await.ok_or("missing requests")?;
+            assert_eq!(calls.len(), if !omit && rejects_field { 2 } else { 1 });
+            for (index, call) in calls.iter().enumerate() {
+                let mut expected = raw.clone();
+                if omit || index > 0 {
+                    expected
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("chat_template_kwargs");
+                }
+                assert_eq!(serde_json::from_slice::<Value>(&call.body)?, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_compatibility_preserves_the_transient_retry_budget()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send>> {
+        let server = MockServer::start().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&count);
+        Mock::given(method("POST"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("request JSON");
+                match observed.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        assert!(body.get("chat_template_kwargs").is_some());
+                        ResponseTemplate::new(422).set_body_json(json!({"error": {
+                            "code": "unsupported_parameter", "param": "chat_template_kwargs"
+                        }}))
+                    }
+                    1 => {
+                        assert!(body.get("chat_template_kwargs").is_none());
+                        ResponseTemplate::new(503).insert_header("retry-after", "0")
+                    }
+                    _ => ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "1", "model": "gpt", "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "yes"}, "finish_reason": "stop"}],
+                        "usage": {}
+                    })),
+                }
+            }).mount(&server).await;
+        let client =
+            TranslatingLlmClient::new(&chat_map_with_retries(&format!("{}/v1", server.uri()), 1))?;
+        client
+            .call_rewrite_model(
+                wire_request(
+                    json!({"model": "gpt", "messages": [{"role": "user", "content": "judge"}],
+                "chat_template_kwargs": {"enable_thinking": false}}),
+                    None,
+                    WireFormat::OpenAiChat,
+                )?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiResponses,
+            )
+            .await?;
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserved_codex_string_input_is_normalized_at_the_client_boundary()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send>> {
+        for root in ["/backend-api/codex", "/v1"] {
+            for input in [
+                json!("hello"),
+                json!([{"role": "user", "content": "hello"}]),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path(format!("{root}/responses")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "resp_1", "object": "response", "model": "gpt", "status": "completed", "output": [], "usage": {}
+                    }))).expect(1).mount(&server).await;
+                let client =
+                    TranslatingLlmClient::new(&responses_map(&format!("{}{root}", server.uri())))?;
+                let raw = json!({"model": "client-name", "input": input,
+                    "instructions": "Be brief.", "store": false, "metadata": {"task": "judge"},
+                    "custom_field": {"keep": true}});
+                client
+                    .call_rewrite_model(
+                        wire_request(raw.clone(), None, WireFormat::OpenAiResponses)?,
+                        Some(&ModelId::from("gpt")),
+                    )
+                    .await?;
+                let mut expected = raw;
+                expected["model"] = json!("gpt");
+                if root == "/backend-api/codex" && input.is_string() {
+                    expected["input"] =
+                        json!([{"type": "message", "role": "user", "content": input}]);
+                }
+                let calls = server.received_requests().await.ok_or("missing requests")?;
+                assert_eq!(serde_json::from_slice::<Value>(&calls[0].body)?, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_counting_does_not_send_the_effort_override()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 3})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut backend = config(&server.uri());
+        backend.reasoning_effort = Some("max".to_string());
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(backend),
+            None,
+        )])?;
+        let llm_request = switchyard_translation::decode_request(
+            WireFormat::AnthropicMessages,
+            &json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}]}),
+        )?;
+        let request = Request {
+            llm_request,
+            raw_request: None,
+            metadata: None,
+        };
+        client
+            .call_auxiliary(
+                &ModelId::from("claude"),
+                request,
+                AuxiliaryOperation::AnthropicCountTokens,
+            )
+            .await?;
+        let received = server.received_requests().await.unwrap_or_default();
+        let body: Value = serde_json::from_slice(&received[0].body)?;
+        assert!(body.get("output_config").is_none(), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_override_sets_anthropic_output_config_effort()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let format = json!({"type": "json_schema", "schema": {"type": "object"}});
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "claude",
+                "output_config": {"effort": "max", "format": format}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut backend = config(&server.uri());
+        backend.reasoning_effort = Some("max".to_string());
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(backend),
+            None,
+        )])?;
+        client
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "client-facing",
+                        "max_tokens": 7,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "output_config": {"effort": "high", "format": format}
+                    }),
+                    None,
+                    WireFormat::AnthropicMessages,
+                )?,
+                Some(&ModelId::from("claude")),
             )
             .await?;
         Ok(())
@@ -2044,11 +2779,51 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiChat)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn omit_body_fields_strips_a_field_extra_body_cannot_override()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                body.get("max_tokens").is_none()
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_omit_body_fields(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["max_tokens".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 7
+        });
+
+        client
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiChat)?,
+                Some(&ModelId::from("gpt")),
             )
             .await?;
         Ok(())
@@ -2118,13 +2893,178 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::AnthropicMessages)?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_policy_preserves_replay_history()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        use crate::ResponsesReasoningPolicy::{Auto, Drop, PreserveEncrypted, PreservePlaintext};
+        let summary = json!([{"type": "summary_text", "text": "Check the parser."}]);
+        let history = json!([
+            {"type": "message", "role": "user", "content": "continue"},
+            {"type": "reasoning", "encrypted_content": "opaque", "content": [{"type": "reasoning_text", "text": "private"}]},
+            {"type": "reasoning", "id": "rs_stored", "status": "completed", "summary": []},
+            // GLM's plaintext forms, as Codex replays them.
+            {"type": "reasoning", "id": "rs_glm", "summary": summary, "encrypted_content": null},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "Run the tests."}], "encrypted_content": ""},
+            {"type": "reasoning"},
+            {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+        ]);
+        // An explicit policy wins over the target. `Auto` follows the target.
+        let cases = [
+            (Auto, "openai/gpt-5", PreserveEncrypted),
+            (Auto, "nvidia/zai-org/glm-5.3-flash", PreservePlaintext),
+            (
+                PreserveEncrypted,
+                "nvidia/zai-org/glm-5.3-flash",
+                PreserveEncrypted,
+            ),
+            (Drop, "openai/gpt-5", Drop),
+        ];
+        for store in [Some(true), Some(false), None] {
+            for (policy, model, behavior) in cases {
+                for has_input_override in [false, true] {
+                    let server = MockServer::start().await;
+                    Mock::given(method("POST"))
+                        .and(path("/v1/responses"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                            "id": "resp_1", "object": "response", "model": "gpt",
+                            "status": "completed", "output": [],
+                            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                        })))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    let mut backend = config(&format!("{}/v1", server.uri()));
+                    if has_input_override {
+                        backend.omit_body_fields.insert("input".to_string());
+                        backend
+                            .extra_body
+                            .insert("input".to_string(), history.clone());
+                    }
+                    let client = TranslatingLlmClient::new(&[ModelConfig::new(
+                        model,
+                        Backend::OpenAiResponses(backend),
+                        None,
+                    )
+                    .with_responses_reasoning(policy)])?;
+                    let mut request = json!({"model": "switchyard", "input": history});
+                    if let Some(store) = store {
+                        request["store"] = json!(store);
+                    }
+                    client
+                        .call_rewrite_model(
+                            wire_request(request, None, WireFormat::OpenAiResponses)?,
+                            Some(&ModelId::from(model)),
+                        )
+                        .await?;
+                    let requests = server.received_requests().await.ok_or("missing requests")?;
+                    let body: Value = serde_json::from_slice(&requests[0].body)?;
+                    let stored = store != Some(false);
+                    let mut expected = vec![history[0].clone()];
+                    match behavior {
+                        // OpenAI reads its own payload and stored IDs, but rejects plaintext.
+                        PreserveEncrypted => {
+                            let indexes: &[usize] = if stored { &[1, 2, 3] } else { &[1] };
+                            for &index in indexes {
+                                let mut item = history[index].clone();
+                                item["content"] = json!([]);
+                                expected.push(item);
+                            }
+                        }
+                        // Other targets keep plaintext and lose payloads of unknown origin.
+                        PreservePlaintext => {
+                            let mut item = history[1].clone();
+                            item.as_object_mut()
+                                .ok_or("object")?
+                                .remove("encrypted_content");
+                            expected.push(item);
+                            if stored {
+                                expected.push(history[2].clone());
+                            }
+                            expected.extend([history[3].clone(), history[4].clone()]);
+                        }
+                        _ => {}
+                    }
+                    expected.extend([history[6].clone(), history[7].clone()]);
+                    assert_eq!(
+                        body["input"],
+                        json!(expected),
+                        "store={store:?}, policy={policy:?}, model={model}, replace={has_input_override}"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nvidia_anthropic_requests_strip_strict_from_extra_body()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut backend = config(&format!(
+            "http://inference-api.nvidia.com:{}",
+            server.address().port()
+        ));
+        backend.extra_body.insert(
+            "tools".into(),
+            json!([{
+                "name": "lookup",
+                "input_schema": {"type": "object", "properties": {}},
+                "strict": true
+            }]),
+        );
+        let mut client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(backend),
+            None,
+        )])?;
+        client.client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("inference-api.nvidia.com", *server.address())
+            .build()?;
+        client
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "claude",
+                        "max_tokens": 7,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    }),
+                    None,
+                    WireFormat::AnthropicMessages,
+                )?,
+                Some(&ModelId::from("claude")),
+            )
+            .await?;
+
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body)?;
+        assert_eq!(body["tools"][0]["name"], "lookup");
+        assert!(body["tools"][0].get("strict").is_none());
         Ok(())
     }
 
@@ -2165,11 +3105,9 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::AnthropicMessages)?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
         Ok(())
@@ -2232,14 +3170,12 @@ mod tests {
         });
 
         let response = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiChat)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
-        assert!(matches!(response, RawResponse::Stream(_)));
+        assert!(matches!(response.llm_response, LlmResponse::Stream(_)));
         Ok(())
     }
 
@@ -2328,10 +3264,56 @@ mod tests {
             error,
             LlmClientError::UpstreamHttp {
                 status: StatusCode::UNAUTHORIZED,
-                body
+                body,
+                ..
             } if body == "invalid key"
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cooldown_depends_on_shared_credentials()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        for forward_auth in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+                .expect(if forward_auth { 6 } else { 3 })
+                .mount(&server)
+                .await;
+            let backend = HttpBackendConfig {
+                forward_auth,
+                failure_cooldown: Duration::from_secs(60),
+                ..config_with_retries(&format!("{}/v1", server.uri()), 2)
+            };
+            let client = TranslatingLlmClient::new(&[ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(backend),
+                None,
+            )])?;
+            for credential in ["Bearer first-user", "Bearer second-user"] {
+                let mut headers = http::HeaderMap::new();
+                headers.insert("authorization", http::HeaderValue::from_static(credential));
+                let result = client
+                    .call_rewrite_model(request_with_headers("gpt", headers), None)
+                    .await;
+                if !forward_auth && credential == "Bearer second-user" {
+                    assert!(matches!(
+                        result,
+                        Err(LlmClientError::TemporarilyUnavailable)
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(LlmClientError::UpstreamHttp {
+                            status: StatusCode::TOO_MANY_REQUESTS,
+                            ..
+                        })
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2364,10 +3346,46 @@ mod tests {
             error,
             LlmClientError::UpstreamHttp {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
-                body
+                body,
+                ..
             } if body == "attempt 3"
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    // The error keeps every header of the last attempt; consumers choose what to forward.
+    #[tokio::test]
+    async fn upstream_error_carries_headers_from_the_last_attempt()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        // A zero `retry-after` keeps the retry from sleeping.
+        let reply = |id: &str| {
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .insert_header("x-request-id", id)
+                .insert_header("set-cookie", "a=b")
+        };
+        Mock::given(method("POST"))
+            .respond_with(reply("first"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(reply("second"))
+            .mount(&server)
+            .await;
+        let client =
+            TranslatingLlmClient::new(&chat_map_with_retries(&format!("{}/v1", server.uri()), 1))?;
+        let Err(LlmClientError::UpstreamHttp { headers, .. }) = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await
+        else {
+            panic!("expected an upstream HTTP error");
+        };
+        assert_eq!(headers["x-request-id"], "second");
+        assert_eq!(headers["retry-after"], "0");
+        assert_eq!(headers["set-cookie"], "a=b");
         Ok(())
     }
 
@@ -2474,6 +3492,7 @@ mod tests {
                 error: LlmClientError::UpstreamHttp {
                     status,
                     body: String::new(),
+                    headers: Box::default(),
                 },
                 status: Some(status),
                 retry_after: None,
@@ -2491,6 +3510,7 @@ mod tests {
                 error: LlmClientError::UpstreamHttp {
                     status,
                     body: String::new(),
+                    headers: Box::default(),
                 },
                 status: Some(status),
                 retry_after: None,
@@ -2565,13 +3585,53 @@ mod tests {
         Ok(())
     }
 
+    // A connect that never completes sends nothing, like a refused connection.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn context_overflow_400_is_mapped()
+    async fn connect_timeout_is_a_transport_error()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        // Linux drops SYNs once a listener's accept queue is full, so later
+        // connects hang like an upstream behind a dropping firewall.
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind("127.0.0.1:0".parse()?)?;
+        let listener = socket.listen(0)?;
+        let addr = listener.local_addr()?;
+        let _queued: Vec<_> = (0..2)
+            .map(|_| {
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
+            })
+            .collect();
+
+        let mut client = TranslatingLlmClient::new(&chat_map(&format!("http://{addr}/v1")))?;
+        // Stands in for the OS connect timeout (30 s on Linux via reqwest's default
+        // TCP_USER_TIMEOUT); both surface as `is_connect() && is_timeout()`.
+        client.client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .build()?;
+
+        let Err(error) = client.call(request_for(Some("gpt"), false)).await else {
+            panic!("expected the connect to fail");
+        };
+        let LlmClientError::Transport { source } = error else {
+            panic!("expected Transport, got {error:?}");
+        };
+        let Some(source) = source.downcast_ref::<reqwest::Error>() else {
+            panic!("expected the reqwest connect-timeout source");
+        };
+        assert!(source.is_connect());
+        assert!(source.is_timeout());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_context_overflow_400_is_mapped()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "error": {"code": "context_length_exceeded", "message": "too big"}
+                "error": {
+                    "message": "request (6016 tokens) exceeds the available context size (4096 tokens), try increasing it"
+                }
             })))
             .mount(&server)
             .await;
@@ -2618,6 +3678,7 @@ mod tests {
         let LlmClientError::UpstreamHttp {
             status,
             body: actual,
+            ..
         } = error
         else {
             panic!("expected the upstream HTTP error, got {error:?}");
@@ -2704,6 +3765,8 @@ mod tests {
             "x-goog-api-key",
             http::HeaderValue::from_static("client-google-key"),
         );
+        headers.append("x-custom", http::HeaderValue::from_static("caller-first"));
+        headers.append("x-custom", http::HeaderValue::from_static("caller-second"));
         headers.insert("host", http::HeaderValue::from_static("client.example"));
         headers.insert("content-type", http::HeaderValue::from_static("text/plain"));
         headers.insert("connection", http::HeaderValue::from_static("x-hop-by-hop"));
@@ -2712,7 +3775,11 @@ mod tests {
             http::HeaderValue::from_static("client-only"),
         );
         let request = request_with_headers("gpt", headers);
-        let backend_config = forwarding_config(&format!("{}/v1", server.uri()));
+        let mut backend_config = forwarding_config(&format!("{}/v1", server.uri()));
+        backend_config.extra_headers = BTreeMap::from([
+            ("X-Custom".into(), "configured".into()),
+            ("X-Configured-Only".into(), "static".into()),
+        ]);
         let client = TranslatingLlmClient::new(&[ModelConfig::new(
             "gpt",
             Backend::OpenAiChat(backend_config),
@@ -2729,6 +3796,9 @@ mod tests {
         assert_eq!(received.headers["content-type"], "application/json");
         assert!(!received.headers.contains_key("connection"));
         assert!(!received.headers.contains_key("x-hop-by-hop"));
+        assert_eq!(received.headers.get_all("x-custom").iter().count(), 1);
+        assert_eq!(received.headers["x-custom"], "configured");
+        assert_eq!(received.headers["x-configured-only"], "static");
         Ok(())
     }
 
@@ -2787,11 +3857,9 @@ mod tests {
         });
 
         let Err(LlmClientError::UpstreamHttp { body, .. }) = client
-            .call_rewrite_model_raw(
-                raw,
-                Some(headers),
+            .call_rewrite_model(
+                wire_request(raw, Some(headers), WireFormat::AnthropicMessages)?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await
         else {
@@ -2829,77 +3897,9 @@ mod tests {
         Ok(())
     }
 
+    // A Codex namespace is folded into the upstream tool name.
     #[tokio::test]
-    async fn invalid_raw_request_is_a_request_translation_error()
-    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
-        let client = TranslatingLlmClient::new(&[])?;
-        let Err(error) = client
-            .call_rewrite_model_raw(
-                json!("invalid"),
-                None,
-                Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
-            )
-            .await
-        else {
-            panic!("expected request translation to fail");
-        };
-
-        assert!(matches!(
-            error,
-            LlmClientError::RequestTranslation(message) if !message.is_empty()
-        ));
-        Ok(())
-    }
-
-    // Raw path, buffered: decode an OpenAI Chat body -> call -> encode back to OpenAI
-    // Chat JSON, with the served `model` restamped over the id the caller addressed.
-    #[tokio::test]
-    async fn call_rewrite_model_raw_round_trips_buffered_json()
-    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-1",
-                "model": "gpt",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "Hi there"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-            })))
-            .mount(&server)
-            .await;
-
-        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
-        let raw = json!({
-            "model": "client-facing",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let RawResponse::Buffered(body) = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
-                Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
-            )
-            .await?
-        else {
-            panic!("expected a buffered response");
-        };
-
-        assert_eq!(body["choices"][0]["message"]["content"], "Hi there");
-        // The client sees the model that answered, not the "client-facing" route id.
-        assert_eq!(body["model"], "gpt");
-        Ok(())
-    }
-
-    // A Codex namespace is folded into the upstream tool name, then split back
-    // into name and namespace on the Responses call that returns to Codex.
-    #[tokio::test]
-    async fn call_rewrite_model_raw_restores_codex_mcp_namespace()
+    async fn chat_backend_folds_codex_mcp_namespace_into_the_tool_name()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2950,23 +3950,15 @@ mod tests {
             }]
         });
 
-        let RawResponse::Buffered(body) = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+        let response = client
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiResponses)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiResponses,
             )
-            .await?
-        else {
-            panic!("expected a buffered response");
-        };
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
 
-        assert_eq!(body["output"][0]["type"], "function_call");
-        assert_eq!(body["output"][0]["name"], "search");
-        assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch");
-        // Arguments are parsed and re-serialized, so the spacing is normalized.
-        assert_eq!(body["output"][0]["arguments"], "{\"q\": \"rust\"}");
+        assert_tool_call_name(&agg, "mcp__open_websearch__search");
         Ok(())
     }
 
@@ -3020,17 +4012,13 @@ mod tests {
             }]
         });
 
-        let RawResponse::Buffered(body) = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+        let response = client
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiResponses)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiResponses,
             )
-            .await?
-        else {
-            panic!("expected a buffered response");
-        };
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
 
         let received = server
             .received_requests()
@@ -3056,64 +4044,188 @@ mod tests {
             "mcp__open_websearch__search"
         );
         assert!(request_body["input"][0].get("namespace").is_none());
-
-        assert_eq!(body["output"][0]["type"], "function_call");
-        assert_eq!(body["output"][0]["name"], "search");
-        assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch");
+        assert_tool_call_name(&agg, "mcp__open_websearch__search");
         Ok(())
     }
 
-    // Raw path, streaming: an inbound `stream: true` request yields an unframed stream
-    // of OpenAI Chat chunk objects whose deltas reassemble the completion.
+    // A stage route can answer early steps of a Codex turn from Claude and a later step from
+    // GPT, and Codex replays Claude's reasoning items on every step. OpenAI returns 400 for two
+    // kinds: items with an ID but no `encrypted_content` when the request sets `store: false`,
+    // and items whose `encrypted_content` holds Anthropic thinking that Switchyard packed for
+    // the client. The Responses leg must drop both and keep GPT's own encrypted reasoning.
+    // A non-OpenAI target instead keeps the plaintext and drops both payloads.
     #[tokio::test]
-    async fn call_rewrite_model_raw_streams_wire_events()
+    async fn openai_responses_backend_drops_reasoning_the_provider_cannot_read()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
-        use futures::TryStreamExt;
-
         let server = MockServer::start().await;
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
-             data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
-             data: [DONE]\n\n";
         Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_1",
+                "model": "gpt",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            })))
             .mount(&server)
             .await;
 
-        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
-        let raw = json!({
-            "model": "client-facing",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true
+        let mut claude_reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_b99feb9a-763d-4f7f-b6b2-2c0199b47ded",
+            "summary": [{"type": "summary_text", "text": "Read the files first."}],
+            "encrypted_content": null
         });
-        let RawResponse::Stream(stream) = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
-                Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
-            )
-            .await?
-        else {
-            panic!("expected a streamed response");
-        };
+        // Build the item the way Switchyard does when it returns a Claude reply to a Responses
+        // client, so the test follows any change to that format.
+        let claude_reply = switchyard_translation::TranslationEngine::default()
+            .translate_response(
+                WireFormat::AnthropicMessages,
+                WireFormat::OpenAiResponses,
+                &json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude",
+                    "content": [
+                        {"type": "thinking", "thinking": "Plan the edit.", "signature": "sig-abc"},
+                        {"type": "text", "text": "ok"}
+                    ],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+                &switchyard_translation::TranslationPolicy::default(),
+            )?
+            .body;
+        let switchyard_reasoning = claude_reply["output"]
+            .as_array()
+            .and_then(|output| output.iter().find(|item| item["type"] == "reasoning"))
+            .cloned()
+            .ok_or("translated Claude reply should contain a reasoning item")?;
+        assert!(switchyard_translation::is_anthropic_thinking_envelope(
+            switchyard_reasoning["encrypted_content"]
+                .as_str()
+                .unwrap_or_default()
+        ));
+        let mut gpt_reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_gpt",
+            "summary": [],
+            "encrypted_content": "opaque-encrypted-reasoning"
+        });
+        let mut empty_reasoning =
+            json!({"type": "reasoning", "id": "rs_empty", "summary": [], "encrypted_content": ""});
+        let user = json!({"type": "message", "role": "user", "content": "fix the build"});
+        let call = json!({"type": "function_call", "call_id": "call_1", "name": "exec", "arguments": "{}"});
+        let output = json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"});
+        let input = json!([
+            user,
+            claude_reasoning,
+            switchyard_reasoning,
+            call,
+            output,
+            gpt_reasoning,
+            empty_reasoning
+        ]);
 
-        let events: Vec<Value> = stream.try_collect().await?;
-        assert!(!events.is_empty(), "expected at least one wire event");
-        let content: String = events
+        let models = ["openai/gpt-5", "nvidia/zai-org/glm-5.3-flash"].map(|model| {
+            ModelConfig::new(
+                model,
+                Backend::OpenAiResponses(config(&format!("{}/v1", server.uri()))),
+                None,
+            )
+        });
+        let client = TranslatingLlmClient::new(&models)?;
+        for model in ["openai/gpt-5", "nvidia/zai-org/glm-5.3-flash"] {
+            for store in [json!(false), json!(true)] {
+                let raw = json!({"model": "client-facing", "store": store, "input": input.clone()});
+                client
+                    .call_rewrite_model(
+                        wire_request(raw, None, WireFormat::OpenAiResponses)?,
+                        Some(&ModelId::from(model)),
+                    )
+                    .await?;
+            }
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let sent: Vec<Value> = received
             .iter()
-            .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
-            .collect();
-        assert_eq!(content, "Hello world");
-        // The mock frames carry no `model`, so every chunk's model comes from the
-        // served id rather than the "unknown" fallback or the caller's route id.
-        assert!(events.iter().all(|event| event["model"] == "gpt"));
+            .map(|request| serde_json::from_slice::<Value>(&request.body))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(sent.len(), 4);
+        for request in &sent {
+            assert!(
+                request["input"]
+                    .as_array()
+                    .ok_or("expected input array")?
+                    .iter()
+                    .all(|item| !item["encrypted_content"]
+                        .as_str()
+                        .is_some_and(switchyard_translation::is_anthropic_thinking_envelope)),
+                "provider cannot read translated Anthropic reasoning"
+            );
+        }
+
+        // GLM keeps the plaintext beside the Anthropic envelope and drops GPT's payload.
+        let mut switchyard_plaintext = switchyard_reasoning.clone();
+        switchyard_plaintext
+            .as_object_mut()
+            .ok_or("object")?
+            .remove("encrypted_content");
+        assert_eq!(
+            sent[2]["input"],
+            json!([user, claude_reasoning, switchyard_plaintext, call, output])
+        );
+        assert_eq!(
+            sent[3]["input"],
+            json!([
+                user,
+                claude_reasoning,
+                switchyard_plaintext,
+                call,
+                output,
+                empty_reasoning
+            ])
+        );
+
+        for item in [
+            &mut claude_reasoning,
+            &mut gpt_reasoning,
+            &mut empty_reasoning,
+        ] {
+            item["content"] = json!([]);
+        }
+        // With `store: false`, only GPT's own encrypted reasoning survives.
+        assert_eq!(sent[0]["input"], json!([user, call, output, gpt_reasoning]));
+        // With `store: true`, IDs can refer to stored reasoning, but OpenAI still cannot
+        // decrypt the Switchyard item.
+        assert_eq!(
+            sent[1]["input"],
+            json!([
+                user,
+                claude_reasoning,
+                call,
+                output,
+                gpt_reasoning,
+                empty_reasoning
+            ])
+        );
         Ok(())
     }
 
-    // Raw path forwards allowed caller headers to the upstream.
+    // Allowed caller headers reach the upstream.
     #[tokio::test]
-    async fn call_rewrite_model_raw_forwards_headers()
+    async fn call_rewrite_model_forwards_caller_headers()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3140,11 +4252,9 @@ mod tests {
         // The allowed request id survives and caller authorization cannot replace
         // the backend's credential.
         client
-            .call_rewrite_model_raw(
-                raw,
-                Some(headers),
+            .call_rewrite_model(
+                wire_request(raw, Some(headers), WireFormat::OpenAiChat)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
         Ok(())

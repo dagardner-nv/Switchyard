@@ -13,8 +13,12 @@ from switchyard_rust._native import load_native
 _EXPORTS = frozenset(
     {
         "Algorithm",
+        "AlgorithmFactory",
+        "ConfiguredAlgorithm",
         "ContextWindowExceededError",
         "CustomClassifierConfig",
+        "DecisionCall",
+        "DeescalationConfig",
         "EscalationClassifierConfig",
         "LibsyError",
         "LlmClassifierConfig",
@@ -34,7 +38,7 @@ _EXPORTS = frozenset(
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Sequence
     from typing import ClassVar, Literal, final
 
     class LibsyError(RuntimeError): ...
@@ -79,6 +83,25 @@ if TYPE_CHECKING:
         ) -> None: ...
 
     @final
+    class DeescalationConfig:
+        """Configure when an escalated session may return to the efficient tier.
+
+        ``strong_min_calls`` and ``confirmations`` must be positive.
+        ``strong_max_calls``, when set, must not be lower than
+        ``strong_min_calls``. Values are validated when the classifier is built,
+        and invalid values raise ``ValueError``.
+        """
+
+        def __init__(
+            self,
+            *,
+            strong_min_calls: int,
+            confirmations: int,
+            strong_max_calls: int | None = None,
+            weak_cooldown_calls: int = 0,
+        ) -> None: ...
+
+    @final
     class EscalationClassifierConfig:
         """Configure response-based escalation between two targets.
 
@@ -92,6 +115,7 @@ if TYPE_CHECKING:
             confirmations: int = 2,
             recent_turn_window: int = 28,
             window_message_chars: int = 500,
+            deescalation: DeescalationConfig | None = None,
             max_output_tokens: int = 4096,
             prompt: str | None = None,
             response_format_type: Literal["json_schema", "json_object"] = "json_schema",
@@ -108,9 +132,24 @@ if TYPE_CHECKING:
         @property
         def models(self) -> list[str]: ...
 
-        def respond(self, response: LlmResponse.Agg | LlmResponse.Stream) -> None: ...
+        async def respond(self, work: Awaitable[LlmResponse.Agg | LlmResponse.Stream]) -> None: ...
 
-        def fail(self, error: BaseException) -> None: ...
+        async def fail(self, error: BaseException) -> None: ...
+
+    @final
+    class DecisionCall:
+        @property
+        def algorithm(self) -> str: ...
+
+        @property
+        def request(self) -> dict[str, object]: ...
+
+        @property
+        def model(self) -> str: ...
+
+        async def respond(self, work: Awaitable[Mapping[str, object]]) -> None: ...
+
+        async def fail(self, error: BaseException) -> None: ...
 
     @final
     class OutcomeMetadata:
@@ -137,6 +176,12 @@ if TYPE_CHECKING:
         def request(self) -> dict[str, object]: ...
 
         @property
+        def fallback_request(self) -> dict[str, object] | None: ...
+
+        @property
+        def candidate_requests(self) -> dict[str, dict[str, object]]: ...
+
+        @property
         def response(self) -> LlmResponse.Agg | LlmResponse.Stream | None: ...
 
     class Step:
@@ -144,6 +189,11 @@ if TYPE_CHECKING:
         class CallModel:
             __match_args__: ClassVar[tuple[Literal["call"]]] = ("call",)
             call: ModelCall
+
+        @final
+        class CallDecision:
+            __match_args__: ClassVar[tuple[Literal["call"]]] = ("call",)
+            call: DecisionCall
 
         @final
         class Done:
@@ -158,6 +208,22 @@ if TYPE_CHECKING:
         positive, and ``message_hash_fallback`` requires ``session_affinity``.
         """
 
+        @staticmethod
+        def decision(
+            *,
+            cutoff: float | None = None,
+            instructions: str | None = None,
+            choices: Sequence[Mapping[str, str]] | None = None,
+            apply_cutoff_to: str | None = None,
+        ) -> TaskClassifierConfig:
+            """Route capable when the ``apply_cutoff_to`` choice probability exceeds ``cutoff``.
+
+            Omitted values use the library defaults: cutoff ``0.6`` and the
+            ``capable`` and ``efficient`` choices. Each choice has an ``id`` and a
+            ``description``.
+            """
+            ...
+
         def __init__(
             self,
             base_threshold: float,
@@ -167,6 +233,7 @@ if TYPE_CHECKING:
             message_hash_fallback: bool = False,
             recent_turn_window: int | None = None,
             max_output_tokens: int = 4096,
+            judge_deadline_ms: int | None = None,
             prompt: str | None = None,
             response_format_type: Literal["json_schema", "json_object"] = "json_schema",
         ) -> None: ...
@@ -225,7 +292,57 @@ if TYPE_CHECKING:
             models: Mapping[str, Sequence[str]],
             subagent_models: Mapping[str, Sequence[str]] | None = None,
             headers: Mapping[str, str] | None = None,
-        ) -> AsyncIterator[Step.CallModel | Step.Done]: ...
+        ) -> AsyncIterator[Step.CallModel | Step.CallDecision | Step.Done]: ...
+
+    @final
+    class AlgorithmFactory:
+        """Build deployment algorithms without provider clients or credential access."""
+
+        @staticmethod
+        def from_toml(source: str) -> AlgorithmFactory:
+            """Parse a full deployment, raising ValueError for invalid configuration."""
+            ...
+
+        def build(self) -> dict[str, ConfiguredAlgorithm]:
+            """Build independent handles keyed by the public route IDs."""
+            ...
+
+        def build_configured(self) -> dict[str, ConfiguredAlgorithm]:
+            """Build handles that check target requirements before yielding host calls."""
+            ...
+
+    @final
+    class ConfiguredAlgorithm:
+        """LLM calls and outcomes use target names; the host resolves provider IDs and settings.
+
+        Decision calls use provider IDs.
+        """
+
+        def target_models(self) -> dict[str, dict[str, str]]:
+            """Map every possible target key to its ``client`` and provider ``id``.
+
+            Requires ``build_configured()``. This includes ineligible targets;
+            execute only candidates returned by a call or final outcome.
+            """
+            ...
+
+        def run_stream(
+            self,
+            request: Mapping[str, object],
+            *,
+            headers: Mapping[str, str] | None = None,
+            required_labels: Sequence[str] | None = None,
+            task_id: str | None = None,
+        ) -> AsyncIterator[Step.CallModel | Step.CallDecision | Step.Done]:
+            """Yield host calls; target requirements need a ``build_configured()`` handle.
+
+            Omitted labels mean no assessment; ``[]`` supplies no new requirements.
+            Reuse the handle for retained task requirements. The host authorizes
+            ``task_id``, which overrides a task ID from headers. Libsy's per-run
+            State is not carried forward. Answers and fallbacks must use the
+            returned candidates.
+            """
+            ...
 
     def noop() -> Algorithm: ...
 
